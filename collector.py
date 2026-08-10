@@ -25,6 +25,11 @@ import database
 KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 
+def _api_symbol(symbol: str) -> str:
+    """Binance's raw REST API wants 'BTCUSDT', not 'BTC/USDT'."""
+    return symbol.replace("/", "")
+
+
 def _to_rows(raw: list) -> list:
     """Convert Binance's raw kline arrays into our dict format."""
     rows = []
@@ -52,7 +57,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 1000) -> list:
     """
     resp = requests.get(
         KLINES_URL,
-        params={"symbol": symbol, "interval": interval, "limit": limit},
+        params={"symbol": _api_symbol(symbol), "interval": interval, "limit": limit},
         timeout=15,
     )
     resp.raise_for_status()  # raise an error if the request failed
@@ -70,7 +75,7 @@ def backfill(conn, symbol: str, interval: str, days: int) -> None:
 
     print(f"Backfilling {symbol} {interval} (last {days} days)...")
     while True:
-        params = {"symbol": symbol, "interval": interval, "limit": 1000}
+        params = {"symbol": _api_symbol(symbol), "interval": interval, "limit": 1000}
         if end_ms:
             params["endTime"] = end_ms
         resp = requests.get(KLINES_URL, params=params, timeout=15)
