@@ -19,8 +19,14 @@ import config
 
 
 def connect() -> sqlite3.Connection:
-    """Open (and create if needed) the SQLite database file."""
-    conn = sqlite3.connect(config.DB_PATH)
+    """
+    Open (and create if needed) the SQLite database file.
+
+    check_same_thread=False: Streamlit runs the app script in a new thread
+    on every rerun, so the module-level connection must be usable from any
+    thread. Safe here because WAL mode handles concurrent access.
+    """
+    conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row  # access rows by column name
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
