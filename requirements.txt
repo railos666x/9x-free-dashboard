@@ -1,0 +1,9 @@
+# Core dependencies for the cryptoautomation terminal
+# Install with:  pip install -r requirements.txt
+
+streamlit          # the dashboard (terminal-style app)
+pandas             # data wrangling + indicators
+plotly             # interactive candlestick charts
+requests           # Binance REST API + CryptoPanic
+feedparser         # RSS news feeds
+python-dotenv      # read the API key from .env

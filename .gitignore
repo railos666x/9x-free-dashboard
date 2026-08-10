@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Data + local files
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# Streamlit
+.streamlit/
+
+# OS
+Thumbs.db
+.DS_Store
