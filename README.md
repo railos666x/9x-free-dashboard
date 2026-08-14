@@ -1,171 +1,114 @@
-# SATS - High-Performance Trading Dashboard
+# 📡 SATS — CryptoAutomation
 
-A professional-grade trading dashboard with real-time Binance WebSocket data, Heikin Ashi charts, signal zone highlighting, and auto support/resistance detection.
+A Python-based crypto trading automation platform:
 
-## Features Implemented
+- **Real-time data** from Binance (REST + WebSocket-ready): candles, funding rates, macro — 87 symbols, 7 timeframes
+- **Mathematical signal engine** — Bayesian fusion, Kelly Criterion, regime detection (ADX), confluence scoring
+- **5 academic factors** — Trend, Momentum, Carry, Reversal, Value
+- **Bloomberg-style dashboard** — FastAPI + ECharts, dark terminal aesthetic
+- **Backtesting v2** — walk-forward validation, Monte Carlo, Wilson confidence intervals
+- **News sentiment overlay** — 23 RSS/CryptoPanic sources, rule-based + optional LLM review
 
-### 1. **Heikin Ashi Charts** (`src/charts/heikinashi.ts`)
-- Smoothes price action by averaging open/high/low/close
-- Filters market noise for clearer trend identification
-- Toggle between regular candles and Heikin Ashi
-- Built-in trend detection (bullish/bearish/neutral)
+---
 
-### 2. **Signal Zone Highlighting** (`src/charts/zones.ts`)
-- **Green zones**: Entry → Take Profit (profit potential)
-- **Red zones**: Entry → Stop Loss (risk area)
-- Visual trade setup at a glance
-- Configurable opacity and colors
-
-### 3. **Auto Support/Resistance** (`src/charts/zones.ts`)
-- Swing high/low detection with configurable lookback
-- Price level clustering for cleaner levels
-- Strength scoring based on touch count
-- Visual dashed lines with labels
-
-### 4. **Real-time Binance WebSocket** (`src/ws/BinanceWebSocket.ts`)
-- Connects to `wss://stream.binance.com:9443/ws`
-- Subscribes to kline/candlestick streams
-- Auto-reconnection with exponential backoff
-- Ping/pong keepalive
-- Only processes closed candles (x=true)
-
-### 5. **High-Performance Canvas Renderer** (`src/charts/ChartRenderer.ts`)
-- Device pixel ratio aware for crisp rendering
-- Efficient candle drawing (no allocations in render loop)
-- Grid, price/time scales, trend indicator
-- Responsive resize handling
-
-### 6. **Dashboard UI** (`src/components/DashboardApp.ts`, `index.html`, `styles.css`)
-- Symbol/timeframe selectors
-- Feature toggles (HA, Zones, S/R, Signals)
-- Connection status indicator
-- Demo signal generator
-- S/R detection button
-- Sidebar with signals, S/R levels, market info
-
-## Project Structure
-
-```
-omniroute2/
-├── index.html              # Main HTML entry point
-├── styles.css              # Complete styling
-├── package.json            # Dependencies & scripts
-├── tsconfig.json           # TypeScript config
-├── vite.config.ts          # Vite build config
-├── CLAUDE.md               # This file
-└── src/
-    ├── main.ts             # App entry point
-    ├── utils/
-    │   └── types.ts        # TypeScript interfaces
-    ├── charts/
-    │   ├── heikinashi.ts   # HA calculation & trend detection
-    │   ├── zones.ts        # Signal zones & S/R detection
-    │   └── ChartRenderer.ts # Canvas rendering engine
-    ├── ws/
-    │   └── BinanceWebSocket.ts # Real-time data connection
-    └── components/
-        └── DashboardApp.ts # Main application controller
-```
-
-## Development
+## Quick start (fresh clone)
 
 ```bash
-# Install dependencies
-npm install
+# 1. Install dependencies (Python 3.11+)
+python -m venv .venv
+.venv/Scripts/activate            # Windows  |  source .venv/bin/activate on macOS/Linux
+pip install -r backend/requirements.txt
 
-# Start dev server (hot reload)
-npm run dev
+# 2. Fetch market data (candles + funding + macro) — ~1.2M candles
+python backend/fetch_all.py --fast
 
-# Build for production
-npm run build
+# 3. Start the server
+cd backend && python server.py
 
-# Preview production build
-npm run preview
-
-# Run tests
-npm test
-
-# Lint code
-npm run lint
+# 4. Open the dashboard
+#    http://localhost:8000   → dashboard (/)
 ```
 
-## Usage
+Windows users can also use the one-click launchers in `scripts/` (`go.bat`, `start.bat`, `test.bat`, `backtest.bat`).
 
-1. **Start the dev server**: `npm run dev`
-2. **Open** `http://localhost:3000`
-3. **Click "Connect"** to establish WebSocket connection
-4. **Select symbol/timeframe** from dropdowns
-5. **Toggle features**:
-   - Heikin Ashi: Smoothed trend candles
-   - Zones: Trade entry/TP/SL visualization
-   - S/R: Auto-detected support/resistance
-   - Signals: Buy/sell markers
-6. **Click "Detect S/R"** to auto-detect levels
-7. **Click "Demo Signal"** to add a sample trade zone
+### Data fetch options
 
-## Architecture Highlights
+| Command | What it does |
+|---|---|
+| `python backend/fetch_all.py --fast` | Candles + funding + macro, skips 1m/5m (recommended first run) |
+| `python backend/fetch_all.py` | Everything, including 1m/5m backfill |
+| `python backend/collector.py live` | Keep prices fresh continuously (polling loop) |
 
-### Performance
-- **Zero-allocation render loop**: Reuses objects, no GC pressure
-- **Object pooling ready**: Structure supports pooling for high-frequency updates
-- **WebGL upgrade path**: Canvas 2D renderer can be swapped for WebGL
-- **Web Workers ready**: Heavy computation (HA, S/R) can move off main thread
+The SQLite database (`crypto_data.db`, gitignored) lives at the repo root.
 
-### Data Flow
-```
-Binance WS → DashboardApp → historicalData[] → ChartRenderer → Canvas
-                    ↓
-              calculateHeikinAshi() → haData[]
-                    ↓
-              detectSupportResistance() → srLevels[]
-                    ↓
-              calculateSignalZones() → zones[]
+### Tests
+
+```bash
+python tests/test_system.py      # math engine, factors, indicators, signals
+python tests/test_strategy.py    # mean-reversion strategy, risk, backtester (41 checks)
 ```
 
-### Extensibility
-- Add new chart types via `ChartRenderer` strategy pattern
-- Custom indicators via `heikinashi.ts` pattern
-- New data sources via `BinanceWebSocket` interface
-- Signal types via `SignalMarker` extensions
+Both are self-contained (synthetic data) and run in CI on every push.
+`tests/test_backtest.py` is a local smoke test that needs a populated `crypto_data.db`.
 
-## API Reference
+### Database backups
 
-### ChartRenderer
-```typescript
-new ChartRenderer(canvas, config)
-renderer.setData(marketData[])
-renderer.setConfig({ showHeikinAshi, showZones, ... })
-renderer.addSignalZone(entry, tp, sl, startTime, endTime?)
-renderer.addSignalMarker(marker)
-renderer.autoDetectSR()
-renderer.destroy()
+The database holds ~1.2M+ candles and is not in git. Snapshot it anytime with:
+
+```bash
+python scripts/backup_db.py          # keeps newest 10 snapshots in backups/
+python scripts/backup_db.py 30       # ...or keep 30
 ```
 
-### BinanceWebSocket
-```typescript
-new BinanceWebSocket({ url, symbol, timeframe })
-ws.connect()
-ws.disconnect()
-ws.onData(callback)
-ws.onStatus(callback)
-ws.onError(callback)
-ws.isConnected()
+Snapshots use SQLite's online backup API, so they're consistent even while
+the collector is writing. Add `python scripts/backup_db.py` to a scheduled
+task / cron if you want regular backups.
+
+---
+
+## Project layout
+
+```
+backend/            Python engine + FastAPI server (the whole platform)
+  collector.py      Binance candles → SQLite (backfill + live loop)
+  fetch_all.py      One-shot fetcher: candles + funding + macro
+  math_engine.py    Bayesian fusion, regime detection, Kelly sizing
+  factors.py        5 academic factors with weights + hit rates
+  signals.py        Live per-coin signal generation
+  strategy.py       Mean-reversion strategy v2 (z-score + trend filter)
+  risk.py           Position sizing, slippage tiers, micro-price rounding
+  backtester.py     Walk-forward / Monte Carlo / Wilson CI backtesting
+  macro_data.py     42 macro instruments (metals, energy, forex, indices, rates)
+  news.py           RSS + CryptoPanic collection (23 sources)
+  reviewer.py       News sentiment scoring (rule-based + optional LLM)
+  server.py         FastAPI app — JSON API + dashboard + background threads
+  config.py         Symbols, intervals, refresh cadence, API keys
+web/dashboard/      The dashboard (HTML/CSS/JS + ECharts)
+tests/              Self-contained test suites
+documentation/      ADRs, directives, data-source research
+docs/updates/       Changelog + development notes
+legacy/             Retired terminal/dashboard pages (recoverable)
+scripts/            Windows launchers + db backup
 ```
 
-### Heikin Ashi
-```typescript
-calculateHeikinAshi(marketData[]) → HeikinAshiData[]
-detectTrend(haData[], lookback?) → 'bullish' | 'bearish' | 'neutral'
+## Configuration
+
+- **Symbols / intervals / refresh cadence** — `backend/config.py` (87 coins across 8 categories)
+- **API keys (all optional)** — copy `.env.example` to `.env`:
+
+```bash
+CRYPTOPANIC_API_KEY=your_key_here     # news sentiment votes
+LLM_ENABLED=false                     # optional AI news reviewer
+LLM_API_KEY=
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
 ```
 
-### Zones & S/R
-```typescript
-calculateSignalZones(entry, tp, sl, startTime, endTime?) → SignalZone[]
-detectSupportResistance(data[], lookback?, minTouches?, threshold?) → SupportResistanceLevel[]
-```
+The platform runs fully without any keys (RSS-only news, no LLM overlay).
 
-## Next Steps (Roadmap)
+## API (FastAPI)
 
+<<<<<<< HEAD
 1. **WebSocket Server** - Custom backend for signal generation
 2. **Signal Markers** - Arrow markers with tooltip reasons
 3. **News Integration** - Fundamental catalysts on chart
@@ -174,3 +117,21 @@ detectSupportResistance(data[], lookback?, minTouches?, threshold?) → SupportR
 6. **Web Workers** - Offload HA/S/R calculations
 7. **Persistence** - LocalStorage for settings/layout
 8. **Tests** - Unit tests for calculations, integration for WS
+=======
+| Endpoint | Purpose |
+|---|---|
+| `/api/candles?symbol=&interval=&limit=` | OHLCV candles |
+| `/api/signals` | Factor scores + trade signals |
+| `/api/watchlist` | Live watchlist across all symbols |
+| `/api/news` | Recent news with sentiment |
+| `/api/macro` | Macro instruments |
+| `/api/portfolio` | Demo/exchange portfolio |
+| `/api/backtest?symbol=BTC/USDT` | Run the v2 backtester |
+
+## Status (2026-08)
+
+- ✅ 87 coins configured, 1.2M+ candles in DB, 42 macro instruments, 23 news sources
+- ✅ Backtester v2: walk-forward + Monte Carlo + Wilson CI; strategy v2 with trend filter
+- 🔨 Strategy win rate still below the 60–70% target → parameter optimization workstream
+  (see `documentation/directives/DIRECTIVE-001-parameter-optimization.md`)
+>>>>>>> 030d678 (Add CI, DB backup script, and accurate README)

@@ -12,6 +12,9 @@ __pycache__/
 # Runtime artifacts (logs, optimizer output)
 data/
 
+# Database snapshots (scripts/backup_db.py)
+backups/
+
 # Streamlit
 .streamlit/
 

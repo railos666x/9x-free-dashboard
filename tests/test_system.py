@@ -130,6 +130,7 @@ def main():
     try:
         import database
         conn = database.connect()
+        database.init_db(conn)  # create schema if the DB is fresh (e.g. CI)
         n = database.count_candles(conn)
         print(f"   Candles in DB: {n}")
         n_news = conn.execute("SELECT COUNT(*) FROM news").fetchone()[0]
