@@ -1,4 +1,4 @@
-# OmniRoute2 - High-Performance Trading Dashboard
+# SATS - High-Performance Trading Dashboard
 
 A professional-grade trading dashboard with real-time Binance WebSocket data, Heikin Ashi charts, signal zone highlighting, and auto support/resistance detection.
 
