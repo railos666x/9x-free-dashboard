@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OmniRoute2 - Trading Dashboard</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon">⚡</span>
+        <span class="logo-text">OmniRoute2</span>
+      </div>
+      <div class="header-controls">
+        <div class="control-group">
+          <label for="symbol-select">Symbol</label>
+          <select id="symbol-select">
+            <option value="BTCUSDT">BTCUSDT</option>
+            <option value="ETHUSDT">ETHUSDT</option>
+            <option value="BNBUSDT">BNBUSDT</option>
+            <option value="SOLUSDT">SOLUSDT</option>
+            <option value="XRPUSDT">XRPUSDT</option>
+            <option value="ADAUSDT">ADAUSDT</option>
+            <option value="DOGEUSDT">DOGEUSDT</option>
+            <option value="AVAXUSDT">AVAXUSDT</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label for="timeframe-select">Timeframe</label>
+          <select id="timeframe-select">
+            <option value="1m">1m</option>
+            <option value="3m">3m</option>
+            <option value="5m">5m</option>
+            <option value="15m">15m</option>
+            <option value="30m">30m</option>
+            <option value="1h">1h</option>
+            <option value="4h">4h</option>
+            <option value="1d">1d</option>
+          </select>
+        </div>
+        <div class="control-group toggles">
+          <label class="toggle">
+            <input type="checkbox" id="ha-toggle" checked>
+            <span class="toggle-slider"></span>
+            <span class="toggle-label">Heikin Ashi</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="zones-toggle" checked>
+            <span class="toggle-slider"></span>
+            <span class="toggle-label">Zones</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="sr-toggle" checked>
+            <span class="toggle-slider"></span>
+            <span class="toggle-label">S/R</span>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="signals-toggle" checked>
+            <span class="toggle-slider"></span>
+            <span class="toggle-label">Signals</span>
+          </label>
+        </div>
+        <div class="control-group actions">
+          <button id="connect-btn" class="btn btn-primary">Connect</button>
+          <button id="detect-sr" class="btn btn-secondary">Detect S/R</button>
+          <button id="demo-signal" class="btn btn-accent">Demo Signal</button>
+        </div>
+      </div>
+      <div class="connection-status" id="connection-status">○ Disconnected</div>
+    </header>
+
+    <main class="main">
+      <div class="chart-container">
+        <canvas id="chart-canvas"></canvas>
+        <div class="loading-indicator" id="loading-indicator">
+          <div class="spinner"></div>
+          <span>Loading market data...</span>
+        </div>
+      </div>
+
+      <aside class="sidebar">
+        <div class="panel">
+          <h3>Latest Signal</h3>
+          <div id="latest-signal" class="latest-signal-panel"></div>
+        </div>
+        <div class="panel">
+          <h3>Indicators</h3>
+          <div id="indicators-panel" class="indicators-panel"></div>
+        </div>
+        <div class="panel">
+          <h3>Active Signals</h3>
+          <div id="signals-list" class="signals-list"></div>
+        </div>
+        <div class="panel">
+          <h3>Support / Resistance</h3>
+          <div id="sr-list" class="sr-list"></div>
+        </div>
+        <div class="panel">
+          <h3>Market Info</h3>
+          <div id="market-info" class="market-info"></div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

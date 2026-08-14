@@ -1,9 +1,12 @@
 # Core dependencies for the cryptoautomation terminal
 # Install with:  pip install -r requirements.txt
 
-streamlit          # the dashboard (terminal-style app)
+streamlit          # optional: quick Streamlit view (kept as backup)
+fastapi            # web API server for the terminal
+uvicorn            # runs the web server
 pandas             # data wrangling + indicators
 plotly             # interactive candlestick charts
 requests           # Binance REST API + CryptoPanic
 feedparser         # RSS news feeds
 python-dotenv      # read the API key from .env
+websockets         # real-time Binance WebSocket streams

@@ -9,6 +9,9 @@ __pycache__/
 *.db-shm
 .env
 
+# Runtime artifacts (logs, optimizer output)
+data/
+
 # Streamlit
 .streamlit/
 

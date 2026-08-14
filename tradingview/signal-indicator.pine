@@ -1,0 +1,148 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// cryptoautomation — TradingView Signal Indicator
+// Replicates the dashboard's signal engine inside TradingView.
+// Auto-draws Entry / Stop-Loss / Take-Profit zones on every bar.
+//
+// Install once → runs forever on any chart.  No server needed.
+//
+//@version=6
+indicator("cryptoautomation Signals", overlay=true, max_lines_count=50,
+         max_labels_count=50, max_boxes_count=50, max_bars_back=500)
+
+// ─────────────────────────── Inputs ───────────────────────────
+grp_risk = "Risk Management"
+sl_mult  = input.float(1.5,  "SL ATR Multiplier", minval=0.5, maxval=5.0, step=0.1, group=grp_risk)
+tp_mult  = input.float(2.5,  "TP ATR Multiplier", minval=0.5, maxval=8.0, step=0.1, group=grp_risk)
+
+grp_tf   = "Multi-Timeframe"
+use_htf  = input.bool(true,  "Use higher-timeframe filter", group=grp_tf)
+htf      = input.timeframe("4h", "Higher timeframe", group=grp_tf)
+
+grp_vis  = "Display"
+show_zone = input.bool(true,  "Show entry → TP / SL zone", group=grp_vis)
+show_tbl  = input.bool(true,  "Show signal dashboard table", group=grp_vis)
+show_bg   = input.bool(false, "Background colour on signal bars", group=grp_vis)
+
+// ─────────────────────── Core indicators ──────────────────────
+rsi_val   = ta.rsi(close, 14)
+[macd_l, sig_l, hist] = ta.macd(close, 12, 26, 9)
+sma20     = ta.sma(close, 20)
+sma50     = ta.sma(close, 50)
+bb_mid    = ta.sma(close, 20)
+bb_std    = ta.stdev(close, 20)
+bb_up     = bb_mid + 2 * bb_std
+bb_low    = bb_mid - 2 * bb_std
+atr_val   = ta.atr(14)
+
+// ────────────────────── Per-bar votes ─────────────────────────
+rsi_vote  = rsi_val < 30 ? 1.0 : rsi_val > 70 ? -1.0 : 0.0
+macd_vote = ta.crossover(macd_l, sig_l) ? 1.0 : ta.crossunder(macd_l, sig_l) ? -1.0 : 0.0
+sma_vote  = ta.crossover(sma20, sma50) ? 1.0 : ta.crossunder(sma20, sma50) ? -1.0 : 0.0
+bb_vote   = close < bb_low ? 1.0 : close > bb_up ? -1.0 : 0.0
+
+// ──────────────────── Higher-timeframe filter ─────────────────
+htf_rsi   = request.security(syminfo.tickerid, htf, ta.rsi(close, 14))
+htf_sma20 = request.security(syminfo.tickerid, htf, ta.sma(close, 20))
+htf_sma50 = request.security(syminfo.tickerid, htf, ta.sma(close, 50))
+
+htf_vote  = use_htf ? (htf_sma20 > htf_sma50 ? 1.0 : htf_sma20 < htf_sma50 ? -1.0 : 0.0) : 0.0
+
+// ──────────────────── Combined signal ─────────────────────────
+// Weights: local technicals 80%, HTF trend 20%
+total = rsi_vote + macd_vote + sma_vote + bb_vote + htf_vote * 2
+score = total / 5.0   // normalise to -1..1
+
+// Need at least 2 agreeing signals for an actionable call
+agree_count = math.abs(rsi_vote) + math.abs(macd_vote) + math.abs(sma_vote) + math.abs(bb_vote)
+direction   = score > 0.2 and agree_count >= 2 ? 1 : score < -0.2 and agree_count >= 2 ? -1 : 0
+
+is_new_signal = direction != 0 and direction[1] != direction
+
+// ──────────────────── Entry / SL / TP ────────────────────────
+entry = close
+sl    = direction == 1 ? entry - sl_mult * atr_val : direction == -1 ? entry + sl_mult * atr_val : na
+tp    = direction == 1 ? entry + tp_mult * atr_val : direction == -1 ? entry - tp_mult * atr_val : na
+rr    = sl != na and tp != na ? math.abs(tp - entry) / math.abs(entry - sl) : na
+
+// ──────────────────── Drawing ────────────────────────────────
+// Track lines so we can extend them
+var line entry_line = na
+var line sl_line    = na
+var line tp_line    = na
+var box  zone_box   = na
+
+if is_new_signal
+    // Clean up old drawings
+    line.delete(entry_line)
+    line.delete(sl_line)
+    line.delete(tp_line)
+    box.delete(zone_box)
+
+    // Entry (yellow dashed)
+    entry_line := line.new(bar_index, entry, bar_index + 30, entry,
+         color=color.new(color.yellow, 0), style=line.style_dashed, width=2)
+
+    // Stop Loss (red)
+    sl_line := line.new(bar_index, sl, bar_index + 30, sl,
+         color=color.new(color.red, 0), width=1)
+
+    // Take Profit (green)
+    tp_line := line.new(bar_index, tp, bar_index + 30, tp,
+         color=color.new(color.green, 0), width=1)
+
+    // Zone box (green for LONG, red for SHORT)
+    if show_zone
+        if direction == 1
+            zone_box := box.new(bar_index, tp, bar_index + 30, entry,
+                 bgcolor=color.new(color.green, 90), border_color=color.new(color.green, 80))
+        else
+            zone_box := box.new(bar_index, entry, bar_index + 30, sl,
+                 bgcolor=color.new(color.red, 90), border_color=color.new(color.red, 80))
+
+    // Extend lines until the next signal
+    line.set_x2(entry_line, bar_index + 40)
+    line.set_x2(sl_line, bar_index + 40)
+    line.set_x2(tp_line, bar_index + 40)
+    if show_zone
+        box.set_right(zone_box, bar_index + 40)
+
+    // Labels
+    label.new(bar_index + 32, entry, "ENTRY " + str.tostring(entry, format.mintick),
+         color=color.new(color.yellow, 0), textcolor=color.black, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 32, sl, "SL " + str.tostring(sl, format.mintick),
+         color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_left, size=size.small)
+    label.new(bar_index + 32, tp, "TP " + str.tostring(tp, format.mintick),
+         color=color.new(color.green, 0), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    // Alert
+    alert(direction == 1 ? "LONG " + syminfo.ticker : "SHORT " + syminfo.ticker,
+         alert.freq_once_per_bar)
+
+// Background colour on signal bars
+bgcolor(show_bg and is_new_signal ? (direction == 1 ? color.new(color.green, 85) : color.new(color.red, 85)) : na)
+
+// ──────────────────── Dashboard table ─────────────────────────
+if show_tbl and barstate.islast
+    var table tbl = table.new(position.top_right, 2, 8,
+         bgcolor=color.new(color.black, 20), border_color=color.new(color.white, 80), border_width=1)
+
+    dir_txt  = direction == 1 ? "LONG" : direction == -1 ? "SHORT" : "HOLD"
+    dir_clr  = direction == 1 ? color.green : direction == -1 ? color.red : color.gray
+    conf_txt = str.tostring(math.round(math.abs(score) * 100)) + "%"
+
+    table.cell(tbl, 0, 0, "cryptoautomation", text_color=color.white, text_size=size.small, bgcolor=color.new(color.black, 40))
+    table.cell(tbl, 1, 0, syminfo.ticker, text_color=color.white, text_size=size.small, bgcolor=color.new(color.black, 40))
+    table.cell(tbl, 0, 1, "Signal", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 1, dir_txt, text_color=dir_clr, text_size=size.small)
+    table.cell(tbl, 0, 2, "Confidence", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 2, conf_txt, text_color=color.white, text_size=size.tiny)
+    table.cell(tbl, 0, 3, "Entry", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 3, str.tostring(entry, format.mintick), text_color=color.yellow, text_size=size.tiny)
+    table.cell(tbl, 0, 4, "Stop Loss", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 4, sl != na ? str.tostring(sl, format.mintick) : "—", text_color=color.red, text_size=size.tiny)
+    table.cell(tbl, 0, 5, "Take Profit", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 5, tp != na ? str.tostring(tp, format.mintick) : "—", text_color=color.green, text_size=size.tiny)
+    table.cell(tbl, 0, 6, "R:R", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 6, rr != na ? "1:" + str.tostring(rr, "#.#") : "—", text_color=color.white, text_size=size.tiny)
+    table.cell(tbl, 0, 7, "RSI", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 7, str.tostring(rsi_val, "#.#"), text_color=rsi_val > 70 ? color.red : rsi_val < 30 ? color.green : color.white, text_size=size.tiny)

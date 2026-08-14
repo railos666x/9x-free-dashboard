@@ -26,7 +26,10 @@ def connect() -> sqlite3.Connection:
     on every rerun, so the module-level connection must be usable from any
     thread. Safe here because WAL mode handles concurrent access.
     """
-    conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
+    # timeout=30: with the live server's collector also writing to this DB,
+    # short write bursts can collide — wait up to 30s instead of failing with
+    # "database is locked" (WAL allows one writer + many readers).
+    conn = sqlite3.connect(config.DB_PATH, check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row  # access rows by column name
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -48,6 +51,28 @@ def init_db(conn: sqlite3.Connection) -> None:
             close_time INTEGER,
             PRIMARY KEY (symbol, interval, open_time)
         );
+
+        CREATE TABLE IF NOT EXISTS funding (
+            symbol       TEXT,
+            funding_time INTEGER,          -- ms epoch of the funding settlement
+            rate         REAL,             -- funding rate as decimal (0.0001 = 0.01%)
+            PRIMARY KEY (symbol, funding_time)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_funding_symbol ON funding(symbol);
+
+        CREATE TABLE IF NOT EXISTS macro (
+            symbol     TEXT,
+            open_time  INTEGER,          -- ms epoch (Yahoo timestamps are seconds)
+            open       REAL,
+            high       REAL,
+            low        REAL,
+            close      REAL,
+            volume     REAL,
+            PRIMARY KEY (symbol, open_time)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_macro_symbol ON macro(symbol);
 
         CREATE TABLE IF NOT EXISTS news (
             id              TEXT PRIMARY KEY,  -- hash of url+title, for de-duplication
@@ -79,17 +104,37 @@ def upsert_candles(conn, symbol: str, interval: str, rows: list) -> int:
     """
     if not rows:
         return 0
-    conn.executemany(
-        """
-        INSERT OR REPLACE INTO candles
-            (symbol, interval, open_time, open, high, low, close, volume, close_time)
-        VALUES
-            (:symbol, :interval, :open_time, :open, :high, :low, :close, :volume, :close_time)
-        """,
-        [dict(r, symbol=symbol, interval=interval) for r in rows],
-    )
-    conn.commit()
-    return len(rows)
+    return _write_retry(conn, [dict(r, symbol=symbol, interval=interval) for r in rows],
+                        _UPSERT_CANDLES_SQL)
+
+
+_UPSERT_CANDLES_SQL = """
+    INSERT OR REPLACE INTO candles
+        (symbol, interval, open_time, open, high, low, close, volume, close_time)
+    VALUES
+        (:symbol, :interval, :open_time, :open, :high, :low, :close, :volume, :close_time)
+"""
+
+
+def _write_retry(conn, params_list: list, sql: str, attempts: int = 5) -> int:
+    """Run an executemany+commit with retry on 'database is locked'.
+
+    The live server writes to this DB continuously; under contention a write
+    can hit SQLITE_BUSY even with a long busy timeout. Retrying is safe
+    because every upsert here is idempotent (INSERT OR REPLACE).
+    """
+    import time
+    for attempt in range(attempts):
+        try:
+            conn.executemany(sql, params_list)
+            conn.commit()
+            return len(params_list)
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < attempts - 1:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise
+    return 0
 
 
 def load_candles(conn, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
@@ -120,6 +165,78 @@ def count_candles(conn, symbol=None, interval=None) -> int:
             params.append(interval)
     row = conn.execute(query, params).fetchone()
     return row["n"]
+
+
+# ----------------------------------------------------------------------
+# Funding rates (Binance perpetuals, fapi.binance.com)
+# ----------------------------------------------------------------------
+def upsert_funding(conn, symbol: str, rows: list) -> int:
+    """
+    Insert or replace funding-rate rows. `rows` is a list of dicts with
+    keys: funding_time, rate. Returns how many rows were written.
+    """
+    if not rows:
+        return 0
+    return _write_retry(conn, [dict(r, symbol=symbol) for r in rows],
+                        """
+        INSERT OR REPLACE INTO funding (symbol, funding_time, rate)
+        VALUES (:symbol, :funding_time, :rate)
+        """)
+
+
+def load_funding(conn, symbol: str, limit: int = 1000) -> pd.DataFrame:
+    """Most recent funding rates for a symbol, oldest first."""
+    query = """
+        SELECT funding_time, rate
+        FROM funding
+        WHERE symbol = ?
+        ORDER BY funding_time DESC
+        LIMIT ?
+    """
+    df = pd.read_sql_query(query, conn, params=[symbol, limit])
+    return df.iloc[::-1].reset_index(drop=True)
+
+
+def count_funding(conn, symbol: str = None) -> int:
+    query = "SELECT COUNT(*) AS n FROM funding"
+    params = []
+    if symbol:
+        query += " WHERE symbol = ?"
+        params.append(symbol)
+    return conn.execute(query, params).fetchone()["n"]
+
+
+# ----------------------------------------------------------------------
+# Macro assets (gold, S&P 500 — Yahoo Finance, separate from Binance candles)
+# ----------------------------------------------------------------------
+def upsert_macro(conn, symbol: str, rows: list) -> int:
+    """Insert or replace macro OHLCV rows. `rows`: list of dicts with keys
+    open_time, open, high, low, close, volume (open_time in ms)."""
+    if not rows:
+        return 0
+    return _write_retry(conn, [dict(r, symbol=symbol) for r in rows],
+                        """
+        INSERT OR REPLACE INTO macro (symbol, open_time, open, high, low, close, volume)
+        VALUES (:symbol, :open_time, :open, :high, :low, :close, :volume)
+        """)
+
+
+def load_macro(conn, symbol: str = None, limit: int = 400) -> pd.DataFrame:
+    """Macro candles, oldest first. Optionally one symbol."""
+    query = "SELECT symbol, open_time, open, high, low, close, volume FROM macro"
+    params = []
+    if symbol:
+        query += " WHERE symbol = ?"
+        params.append(symbol)
+    query += " ORDER BY open_time DESC LIMIT ?"
+    params.append(limit)
+    df = pd.read_sql_query(query, conn, params=params)
+    return df.iloc[::-1].reset_index(drop=True)
+
+
+def macro_symbols(conn) -> list[str]:
+    rows = conn.execute("SELECT DISTINCT symbol FROM macro").fetchall()
+    return [r[0] for r in rows]
 
 
 # ----------------------------------------------------------------------

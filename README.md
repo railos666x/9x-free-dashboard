@@ -1,94 +1,176 @@
-# 📡 cryptoautomation
+# OmniRoute2 - High-Performance Trading Dashboard
 
-A Bloomberg-style terminal for crypto: live prices, technical indicators,
-and a multi-source news feed with sentiment — all on one screen.
+A professional-grade trading dashboard with real-time Binance WebSocket data, Heikin Ashi charts, signal zone highlighting, and auto support/resistance detection.
 
-This is **Milestone 1** of a larger platform. The goal here is the
-*review surface*: see price, indicators, and news together so you can
-judge the market. Later milestones add the AI news reviewer, paper
-trading, and automation (news → AI view → trade).
+## Features Implemented
 
-> **What this is vs. Bloomberg:** a real Bloomberg Terminal is a
-> multi-year, paid-data product. This is a *terminal-inspired* dark,
-> dense dashboard built on **free** professional-grade sources
-> (Binance public API + CryptoPanic + trusted RSS feeds). The design
-> leaves a clean slot to plug in paid feeds later if you ever want them.
+### 1. **Heikin Ashi Charts** (`src/charts/heikinashi.ts`)
+- Smoothes price action by averaging open/high/low/close
+- Filters market noise for clearer trend identification
+- Toggle between regular candles and Heikin Ashi
+- Built-in trend detection (bullish/bearish/neutral)
 
----
+### 2. **Signal Zone Highlighting** (`src/charts/zones.ts`)
+- **Green zones**: Entry → Take Profit (profit potential)
+- **Red zones**: Entry → Stop Loss (risk area)
+- Visual trade setup at a glance
+- Configurable opacity and colors
 
-## Quick start
+### 3. **Auto Support/Resistance** (`src/charts/zones.ts`)
+- Swing high/low detection with configurable lookback
+- Price level clustering for cleaner levels
+- Strength scoring based on touch count
+- Visual dashed lines with labels
 
-### 1. Install dependencies (one time)
+### 4. **Real-time Binance WebSocket** (`src/ws/BinanceWebSocket.ts`)
+- Connects to `wss://stream.binance.com:9443/ws`
+- Subscribes to kline/candlestick streams
+- Auto-reconnection with exponential backoff
+- Ping/pong keepalive
+- Only processes closed candles (x=true)
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-```
+### 5. **High-Performance Canvas Renderer** (`src/charts/ChartRenderer.ts`)
+- Device pixel ratio aware for crisp rendering
+- Efficient candle drawing (no allocations in render loop)
+- Grid, price/time scales, trend indicator
+- Responsive resize handling
 
-### 2. Start the live data loops
+### 6. **Dashboard UI** (`src/components/DashboardApp.ts`, `index.html`, `styles.css`)
+- Symbol/timeframe selectors
+- Feature toggles (HA, Zones, S/R, Signals)
+- Connection status indicator
+- Demo signal generator
+- S/R detection button
+- Sidebar with signals, S/R levels, market info
 
-In **one** terminal:
-
-```powershell
-python collector.py backfill   # one-time: download ~30 days of history
-python run_live.py             # keeps prices + news fresh (leave running)
-```
-
-### 3. Open the dashboard
-
-In a **second** terminal:
-
-```powershell
-streamlit run dashboard.py
-```
-
-Your browser opens http://localhost:8501.
-
----
-
-## Optional: CryptoPanic sentiment
-
-RSS alone works fine. To get **real sentiment votes** on every story,
-create a free account at https://cryptopanic.com/, copy your API key into
-a `.env` file:
+## Project Structure
 
 ```
-CRYPTOPANIC_API_KEY=your_key_here
+omniroute2/
+├── index.html              # Main HTML entry point
+├── styles.css              # Complete styling
+├── package.json            # Dependencies & scripts
+├── tsconfig.json           # TypeScript config
+├── vite.config.ts          # Vite build config
+├── CLAUDE.md               # This file
+└── src/
+    ├── main.ts             # App entry point
+    ├── utils/
+    │   └── types.ts        # TypeScript interfaces
+    ├── charts/
+    │   ├── heikinashi.ts   # HA calculation & trend detection
+    │   ├── zones.ts        # Signal zones & S/R detection
+    │   └── ChartRenderer.ts # Canvas rendering engine
+    ├── ws/
+    │   └── BinanceWebSocket.ts # Real-time data connection
+    └── components/
+        └── DashboardApp.ts # Main application controller
 ```
 
-Without a key the system quietly runs RSS-only (with simple keyword
-sentiment) — nothing breaks.
+## Development
 
----
+```bash
+# Install dependencies
+npm install
 
-## What's in each file
+# Start dev server (hot reload)
+npm run dev
 
-| File | Job |
-|---|---|
-| `config.py` | All settings in one place: symbols, timeframes, news sources, refresh rates |
-| `database.py` | SQLite storage for candles + news (de-duplicated, WAL mode) |
-| `collector.py` | Binance prices → DB (`backfill` / `live`) |
-| `news.py` | CryptoPanic + RSS → DB with sentiment (`fetch` / `live`) |
-| `indicators.py` | SMA, EMA, RSI, MACD, ATR, Bollinger — readable, no lookahead |
-| `dashboard.py` | The terminal UI (watchlist, chart, news, Fear & Greed) |
-| `run_live.py` | Starts price + news loops together |
+# Build for production
+npm run build
 
-## Troubleshooting
+# Preview production build
+npm run preview
 
-- **`Binance` connection errors:** the public Binance API may be blocked
-  in some regions. Try `https://api.binance.us` if needed (edit
-  `KLINES_URL` in `collector.py`).
-- **No candles yet:** run `python collector.py backfill` and wait for
-  "Done".
-- **No news yet:** run `python news.py fetch` and check the printed count.
-- **Port already in use:** `streamlit run dashboard.py --server.port 8502`.
+# Run tests
+npm test
 
-## Roadmap (after this milestone)
+# Lint code
+npm run lint
+```
 
-1. **AI News Reviewer** — LLM (Qwen/DeepSeek, cheap API) reads the news
-   panel and scores relevance per coin; model-agnostic advisor interface.
-2. **Paper trading engine** — the risk rules that matter: position
-   sizing, ATR stops, exposure caps.
-3. **News → AI view → paper trade** automation loop.
-4. **Live trading** with tiny size + monitoring.
+## Usage
+
+1. **Start the dev server**: `npm run dev`
+2. **Open** `http://localhost:3000`
+3. **Click "Connect"** to establish WebSocket connection
+4. **Select symbol/timeframe** from dropdowns
+5. **Toggle features**:
+   - Heikin Ashi: Smoothed trend candles
+   - Zones: Trade entry/TP/SL visualization
+   - S/R: Auto-detected support/resistance
+   - Signals: Buy/sell markers
+6. **Click "Detect S/R"** to auto-detect levels
+7. **Click "Demo Signal"** to add a sample trade zone
+
+## Architecture Highlights
+
+### Performance
+- **Zero-allocation render loop**: Reuses objects, no GC pressure
+- **Object pooling ready**: Structure supports pooling for high-frequency updates
+- **WebGL upgrade path**: Canvas 2D renderer can be swapped for WebGL
+- **Web Workers ready**: Heavy computation (HA, S/R) can move off main thread
+
+### Data Flow
+```
+Binance WS → DashboardApp → historicalData[] → ChartRenderer → Canvas
+                    ↓
+              calculateHeikinAshi() → haData[]
+                    ↓
+              detectSupportResistance() → srLevels[]
+                    ↓
+              calculateSignalZones() → zones[]
+```
+
+### Extensibility
+- Add new chart types via `ChartRenderer` strategy pattern
+- Custom indicators via `heikinashi.ts` pattern
+- New data sources via `BinanceWebSocket` interface
+- Signal types via `SignalMarker` extensions
+
+## API Reference
+
+### ChartRenderer
+```typescript
+new ChartRenderer(canvas, config)
+renderer.setData(marketData[])
+renderer.setConfig({ showHeikinAshi, showZones, ... })
+renderer.addSignalZone(entry, tp, sl, startTime, endTime?)
+renderer.addSignalMarker(marker)
+renderer.autoDetectSR()
+renderer.destroy()
+```
+
+### BinanceWebSocket
+```typescript
+new BinanceWebSocket({ url, symbol, timeframe })
+ws.connect()
+ws.disconnect()
+ws.onData(callback)
+ws.onStatus(callback)
+ws.onError(callback)
+ws.isConnected()
+```
+
+### Heikin Ashi
+```typescript
+calculateHeikinAshi(marketData[]) → HeikinAshiData[]
+detectTrend(haData[], lookback?) → 'bullish' | 'bearish' | 'neutral'
+```
+
+### Zones & S/R
+```typescript
+calculateSignalZones(entry, tp, sl, startTime, endTime?) → SignalZone[]
+detectSupportResistance(data[], lookback?, minTouches?, threshold?) → SupportResistanceLevel[]
+```
+
+## Next Steps (Roadmap)
+
+1. **WebSocket Server** - Custom backend for signal generation
+2. **Signal Markers** - Arrow markers with tooltip reasons
+3. **News Integration** - Fundamental catalysts on chart
+4. **Multi-timeframe** - Sync charts across timeframes
+5. **WebGL Renderer** - GPU-accelerated for 1000+ candles
+6. **Web Workers** - Offload HA/S/R calculations
+7. **Persistence** - LocalStorage for settings/layout
+8. **Tests** - Unit tests for calculations, integration for WS

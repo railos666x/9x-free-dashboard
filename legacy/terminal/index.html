@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cryptoautomation · Terminal</title>
+  <link rel="stylesheet" href="/assets/css/style.css" />
+  <link rel="stylesheet" href="/assets/css/terminal.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body>
+  <!-- Applies saved dark/light theme + accent instantly (from localStorage) -->
+  <script src="/assets/js/theme-init.js"></script>
+
+  <div class="shell">
+
+    <!-- ===================== SIDEBAR ===================== -->
+    <aside class="sidebar">
+      <div class="nav-brand">
+        <i class="fa-solid fa-satellite-dish"></i> crypto<span class="text-wise">automation</span>
+      </div>
+
+      <div class="sidebar-title">MARKETS</div>
+      <div class="sidebar-search">
+        <i class="fa-solid fa-search"></i>
+        <input type="text" id="symbolSearch" placeholder="Search coins…" class="form-input" />
+      </div>
+      <div class="sidebar-cats" id="catTabs"><!-- JS fills this --></div>
+      <div class="sidebar-menu" id="symbolList"><!-- JS fills this --></div>
+
+      <div class="sidebar-title">VIEW</div>
+      <div class="flex gap-2" style="padding: 0 8px;">
+        <button class="btn btn-secondary btn-sm" id="compactBtn" title="Toggle compact mode">
+          <i class="fa-solid fa-compress"></i> Compact
+        </button>
+      </div>
+
+      <div class="sidebar-title">TIMEFRAME</div>
+      <div class="sidebar-menu" id="intervalList"><!-- JS fills this --></div>
+
+      <div class="sidebar-title">THEME</div>
+      <div class="flex gap-2" id="themeControls" style="flex-wrap:wrap; padding:0 8px;">
+        <button class="btn btn-secondary btn-sm" id="modeBtn" title="Toggle dark / light">
+          <i class="fa-solid fa-palette"></i>
+        </button>
+        <button class="btn btn-secondary btn-sm accent-dot" data-accent="lime" title="Lime accent" style="background:var(--wise-lime);"></button>
+        <button class="btn btn-secondary btn-sm accent-dot" data-accent="blue" title="Blue accent" style="background:#38bdf8;"></button>
+        <button class="btn btn-secondary btn-sm accent-dot" data-accent="purple" title="Purple accent" style="background:#a78bfa;"></button>
+        <button class="btn btn-secondary btn-sm accent-dot" data-accent="red" title="Red accent" style="background:#f43f5e;"></button>
+      </div>
+
+      <div class="sidebar-title">FEAR & GREED</div>
+      <div class="card" style="padding:14px; margin:0 8px;">
+        <div class="fg-value monospace" id="fgValue">--</div>
+        <div class="fg-label" id="fgLabel">loading…</div>
+      </div>
+
+      <div class="sidebar-foot">
+        <span class="pulse-dot" id="healthDot"></span>
+        <span class="text-muted" id="healthText">connecting…</span>
+      </div>
+    </aside>
+
+    <!-- ===================== MAIN ===================== -->
+    <main class="main-content">
+
+      <div class="page-head">
+        <div>
+          <h1 class="page-title" id="pageTitle">—</h1>
+          <p class="page-subtitle" id="pageSub">Loading live data…</p>
+        </div>
+        <div class="flex gap-2">
+          <select class="form-select" id="newsSentiment" style="width:160px;">
+            <option value="">All sentiment</option>
+            <option value="bullish">🟢 Bullish</option>
+            <option value="bearish">🔴 Bearish</option>
+            <option value="neutral">⚪ Neutral</option>
+            <option value="important">⭐ Important</option>
+          </select>
+          <select class="form-select" id="reviewCoin" style="width:160px;">
+            <option value="">All coins</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Stats row -->
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-label">Last</div><div class="stat-value monospace" id="stLast">—</div></div>
+        <div class="stat-card"><div class="stat-label">Change</div><div class="stat-value monospace" id="stChange">—</div></div>
+        <div class="stat-card"><div class="stat-label">RSI 14</div><div class="stat-value monospace" id="stRsi">—</div></div>
+        <div class="stat-card"><div class="stat-label">ATR 14</div><div class="stat-value monospace" id="stAtr">—</div></div>
+        <div class="stat-card"><div class="stat-label">Volume</div><div class="stat-value monospace" id="stVol">—</div></div>
+        <div class="stat-card"><div class="stat-label">Range</div><div class="stat-value monospace" id="stRange">—</div></div>
+      </div>
+
+      <!-- AI market review -->
+      <section class="card review-card">
+        <div class="review-head">
+          <div class="card-title"><i class="fa-solid fa-brain"></i> AI market review
+            <span class="review-mode" id="reviewMode"></span>
+          </div>
+          <span class="review-market" id="reviewMarket"></span>
+        </div>
+        <div class="review-row" id="reviewRow"><div class="text-muted">loading…</div></div>
+        <div class="review-reasons" id="reviewReasons"></div>
+      </section>
+
+      <!-- Trading signals -->
+      <section class="card signals-card">
+        <div class="signals-head">
+          <div class="card-title"><i class="fa-solid fa-crosshairs"></i> Trading signals</div>
+          <span class="text-muted signals-note" id="signalsNote"></span>
+        </div>
+        <div class="signals-grid" id="signalsGrid"><div class="text-muted">loading…</div></div>
+      </section>
+
+      <!-- Macro assets: gold + S&P 500 -->
+      <section class="card macro-card">
+        <div class="macro-head">
+          <div class="card-title"><i class="fa-solid fa-earth-americas"></i> Macro</div>
+        </div>
+        <div class="macro-grid">
+          <div class="macro-item">
+            <div class="macro-label" id="macroGoldLabel">Gold</div>
+            <div id="macroGold" style="width:100%;height:130px;"></div>
+          </div>
+          <div class="macro-item">
+            <div class="macro-label" id="macroSpxLabel">S&amp;P 500</div>
+            <div id="macroSpx" style="width:100%;height:130px;"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Chart + news -->
+      <div class="terminal-grid">
+        <section class="card chart-card">
+          <div id="chart" style="width:100%;height:560px;"></div>
+        </section>
+
+        <aside class="card news-panel">
+          <div class="card-title"><i class="fa-solid fa-newspaper"></i> News feed</div>
+          <div class="news-feed" id="newsFeed"><div class="text-muted">loading…</div></div>
+        </aside>
+      </div>
+
+    </main>
+  </div>
+
+  <script type="module" src="/assets/js/themes.js"></script>
+  <script type="module" src="/assets/js/terminal.js"></script>
+</body>
+</html>

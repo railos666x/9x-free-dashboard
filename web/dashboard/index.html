@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>cryptoautomation · Dashboard</title>
+<link rel="stylesheet" href="/dash-assets/dashboard.css" />
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body>
+
+<div class="page-bg"></div>
+
+<div class="app">
+  <!-- ═══════════ Top bar ═══════════ -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo">◈</div>
+      <span class="brand-name">crypto<span class="brand-accent">automation</span></span>
+    </div>
+
+    <div class="ticker-pills" id="tickerPills">
+      <!-- filled by JS -->
+    </div>
+
+    <div class="topbar-actions">
+      <button class="icon-btn" title="Search assets" onclick="focusSearch()">⌕</button>
+      <button class="btn-primary" id="btnConnect" onclick="openConnect()">Connect exchange</button>
+    </div>
+  </header>
+
+  <!-- ═══════════ Sidebar + main ═══════════ -->
+  <div class="body">
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-label">Main menu</div>
+        <a class="nav-item active" data-view="dashboard" href="#">▦ Dashboard</a>
+        <a class="nav-item" data-view="assets" href="#">◫ Assets</a>
+        <a class="nav-item" data-view="portfolio" href="#">◔ My portfolio</a>
+        <a class="nav-item" data-view="bots" href="#">⚙ Bots</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">Trading</div>
+        <a class="nav-item" data-view="signals" href="#">⚡ Signals</a>
+      </div>
+    </aside>
+
+    <main class="content">
+
+      <!-- ═══════════ View: Dashboard ═══════════ -->
+      <section class="view active" id="view-dashboard">
+        <div class="row1">
+          <div class="asset-cards" id="assetCards">
+            <!-- 4 cards by JS -->
+          </div>
+          <section class="card port-value">
+            <div class="card-head">
+              <div class="card-title">Portfolio value</div>
+            </div>
+            <div id="portValueChart" class="chart"></div>
+          </section>
+        </div>
+
+        <div class="row2">
+          <section class="card total-assets">
+            <div class="card-head">
+              <div class="card-title">Total assets</div>
+            </div>
+            <div class="total-value" id="totalValue">$0.00</div>
+            <div class="tf-pills" id="tfPills">
+              <button class="tf-pill" data-range="1">1h</button>
+              <button class="tf-pill" data-range="7">Day</button>
+              <button class="tf-pill active" data-range="7">Wk</button>
+              <button class="tf-pill" data-range="30">Mh</button>
+              <button class="tf-pill" data-range="90">1Y</button>
+              <button class="tf-pill" data-range="365">All</button>
+            </div>
+            <div id="totalAssetsChart" class="chart"></div>
+          </section>
+
+          <div class="right-col">
+            <section class="card portfolio-list">
+              <div class="card-head">
+                <div class="card-title">Portfolio</div>
+              </div>
+              <div class="mini-tabs">
+                <button class="mini-tab active" data-tab="coin">By Coin</button>
+                <button class="mini-tab" data-tab="exchange">By Exchange</button>
+              </div>
+              <div id="portfolioList"></div>
+            </section>
+
+            <section class="card balance">
+              <div class="card-head">
+                <div class="card-title">Balance</div>
+              </div>
+              <div class="balance-value" id="balanceValue">$0.00 USD</div>
+              <div class="balance-sub" id="balanceSub"></div>
+              <div class="dist-bar" id="distBar"></div>
+              <div class="dist-legend" id="distLegend"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════════ View: Assets ═══════════ -->
+      <section class="view" id="view-assets">
+        <section class="card crypto-table-card">
+          <div class="card-head">
+            <div class="card-title">All Crypto</div>
+            <div class="assets-head-right">
+              <div class="tf-pills table-tf" id="tableTfPills">
+                <button class="tf-pill" data-interval="1m">1m</button>
+                <button class="tf-pill" data-interval="5m">5m</button>
+                <button class="tf-pill" data-interval="15m">15m</button>
+                <button class="tf-pill active" data-interval="1h">1h</button>
+                <button class="tf-pill" data-interval="4h">4h</button>
+                <button class="tf-pill" data-interval="1d">1d</button>
+              </div>
+              <input class="table-search" id="tableSearch" placeholder="Search…" oninput="filterTable()" />
+            </div>
+          </div>
+          <table class="crypto-table">
+            <thead>
+              <tr>
+                <th>Asset</th><th>Price</th><th>Change</th><th>RSI</th><th>Volume</th><th>Spark</th>
+              </tr>
+            </thead>
+            <tbody id="cryptoTableBody"></tbody>
+          </table>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: My portfolio ═══════════ -->
+      <section class="view" id="view-portfolio">
+        <div class="pf-grid">
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Holdings</div>
+              <div class="mini-tabs">
+                <button class="mini-tab active" data-tab="coin">By Coin</button>
+                <button class="mini-tab" data-tab="exchange">By Exchange</button>
+              </div>
+            </div>
+            <div id="portfolioListFull"></div>
+          </section>
+
+          <section class="card balance">
+            <div class="card-head">
+              <div class="card-title">Balance</div>
+            </div>
+            <div class="balance-value" id="balanceValue2">$0.00 USD</div>
+            <div class="balance-sub" id="balanceSub2"></div>
+            <div class="dist-bar" id="distBar2"></div>
+            <div class="dist-legend" id="distLegend2"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ═══════════ View: Bots ═══════════ -->
+      <section class="view" id="view-bots">
+        <section class="card bots-card">
+          <div class="card-head">
+            <div class="card-title">Signal Bot — strategy backtest</div>
+          </div>
+          <div class="bot-controls">
+            <label class="ap-label">Symbol
+              <div class="ap-wrap" id="assetPicker">
+                <div class="asset-picker">
+                  <div class="ap-input-row">
+                    <span class="ap-search-ico">⌕</span>
+                    <input id="apInput" type="text" autocomplete="off" spellcheck="false" placeholder="Search…" />
+                    <span class="ap-caret">▾</span>
+                  </div>
+                  <div class="ap-list" id="apList" hidden></div>
+                </div>
+                <div class="ap-quick" id="apQuick"></div>
+              </div>
+            </label>
+            <label>Timeframe
+              <select id="btInterval">
+                <option value="1m">1m</option>
+                <option value="5m">5m</option>
+                <option value="15m">15m</option>
+                <option value="1h" selected>1h</option>
+                <option value="4h">4h</option>
+                <option value="1d">1d</option>
+              </select>
+            </label>
+            <button class="btn-primary" id="btnRunBacktest" onclick="runBacktest()">Run backtest</button>
+          </div>
+          <div id="btResults" class="bt-results">
+            <div class="muted">Pick a symbol and run a backtest of the v2 mean-reversion strategy (net of fees + slippage).</div>
+          </div>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: Signals ═══════════ -->
+      <section class="view" id="view-signals">
+        <div class="sig-layout">
+          <section class="card signals-card">
+            <div class="card-head">
+              <div class="card-title">Trading signals</div>
+              <span class="muted" id="signalsMeta"></span>
+            </div>
+            <div class="sig-picker-row">
+              <label class="ap-label">Jump to asset
+                <div class="ap-wrap" id="sigPickerWrap">
+                  <div class="asset-picker">
+                    <div class="ap-input-row">
+                      <span class="ap-search-ico">⌕</span>
+                      <input id="sigInput" type="text" autocomplete="off" spellcheck="false" placeholder="Search…" />
+                      <span class="ap-caret">▾</span>
+                    </div>
+                    <div class="ap-list" id="sigList" hidden></div>
+                  </div>
+                  <div class="ap-quick" id="sigQuick"></div>
+                </div>
+              </label>
+              <span class="sig-hint muted">Click a signal card to chart it</span>
+            </div>
+            <div id="signalsList" class="sig-list"><div class="muted">Loading signals…</div></div>
+          </section>
+
+          <section class="card sig-chart-card">
+            <div class="card-head">
+              <div class="card-title" id="sigChartTitle">Chart</div>
+              <div class="tf-pills sig-tf" id="sigTfPills">
+                <button class="tf-pill" data-interval="1m">1m</button>
+                <button class="tf-pill" data-interval="5m">5m</button>
+                <button class="tf-pill" data-interval="15m">15m</button>
+                <button class="tf-pill active" data-interval="1h">1h</button>
+                <button class="tf-pill" data-interval="4h">4h</button>
+                <button class="tf-pill" data-interval="1d">1d</button>
+              </div>
+            </div>
+            <div id="sigChart" class="chart sig-chart"></div>
+            <div class="sig-level-legend muted" id="sigLevelLegend"></div>
+          </section>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<!-- ═══════════ Connect exchange modal ═══════════ -->
+<div class="modal-overlay" id="connectModal" style="display:none;">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">Connect exchange <span class="binance-tag">Binance</span></div>
+      <button class="modal-close" onclick="closeConnect()">✕</button>
+    </div>
+    <div class="modal-tabs">
+      <button class="modal-tab">Fast Connect</button>
+      <button class="modal-tab active">Connect with API keys</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-sub">Connect keys securely ⓘ</div>
+      <ol class="steps">
+        <li>Log in to your exchange account and go to API settings.</li>
+        <li>Turn on IP whitelisting and copy/paste the following list of IP addresses:
+          <div class="ip-box">
+            <code>192.26.9.10 193.26.9.14 194.26.9.18</code>
+            <button class="copy-btn" onclick="copyIPs()">⧉</button>
+          </div>
+        </li>
+        <li>Paste generated data in inputs below.</li>
+      </ol>
+      <div class="form-field">
+        <label>Name</label>
+        <input id="keyName" value="My Binance" />
+      </div>
+      <div class="form-field">
+        <label>API Key</label>
+        <input id="keyApi" placeholder="Enter api key..." />
+      </div>
+      <div class="form-field">
+        <label>API Secret</label>
+        <input id="keySecret" type="password" placeholder="Enter api secret..." />
+      </div>
+      <a class="link" href="#">Available account types</a>
+      <div class="warn">Keys are stored locally and sent only to Binance. Enable IP whitelisting.</div>
+      <button class="btn-primary btn-wide" id="btnConnectSubmit" onclick="submitConnect()">Connect Binance</button>
+      <div class="modal-foot">Don't have an account? <a class="link" href="#">Register</a></div>
+    </div>
+  </div>
+</div>
+
+<script src="/dash-assets/dashboard.js"></script>
+</body>
+</html>
