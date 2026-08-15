@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Donut tooltip PnL sign** — slices sized by absolute value showed "+$"
   for losses too; now shows the real sign
+- **Side badges wrapping** — "▲ LONG"/"▼ SHORT" stacked onto two lines in
+  narrow table/live-panel columns; badges and journal cells now
+  `white-space: nowrap`, table card scrolls horizontally instead
+
+### Changed
+- **Emoji → professional inline-SVG icons** — sidebar nav, brand mark,
+  search/caret pickers, Dry/Live test buttons, TV link, journal chip,
+  alert/lock indicators all use a self-contained stroke-icon sprite
+  (no CDN, matches the theme)
 
 ---
 

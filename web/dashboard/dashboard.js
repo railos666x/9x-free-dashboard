@@ -27,6 +27,11 @@ const fmtCompact = (n) => {
 const symOf = (symbol) => symbol.split("/")[0];
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 // Price formatting that keeps significant digits for micro-priced coins (SHIB etc).
+// Professional inline-SVG icon from the sprite in index.html (no emoji).
+function icon(name, cls = "") {
+  return `<svg class="ic ${cls}" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+}
+
 const fmtPrice = (n) => {
   if (n === null || n === undefined || !isFinite(n)) return "—";
   if (n !== 0 && Math.abs(n) < 0.001) return n.toLocaleString("en-US", { maximumSignificantDigits: 6 });
@@ -160,7 +165,7 @@ function renderBotStatus(s) {
     ["Source B (proprietary)", s.proprietary_enabled ? "on" : "off — bot holds"],
     ["LLM overlay", llmLbl],
     ["Agreement gate", gateLabel],
-    ["Live safety", liveBlocked ? "🛑 blocked (test gate)" : "ok"],
+    ["Live safety", liveBlocked ? `${icon("alert")} blocked (test gate)` : "ok"],
     ["Auto loop", loopLabel],
     ["Loop cadence", `${s.loop_seconds}s`],
     ["Open positions", String(s.open_orders ?? 0)],
@@ -205,11 +210,11 @@ function renderBotStatus(s) {
   const srcMsg = $("botSourceMsg");
   if (sel) sel.value = s.signal_source_a || "math_engine";
   if (applyBtn) applyBtn.disabled = loopRunning;
-  if (srcMsg) srcMsg.textContent = loopRunning ? "🔒 stop the loop to change source" : "";
+  if (srcMsg) srcMsg.innerHTML = loopRunning ? `${icon("lock", "ic-sm")} stop the loop to change source` : "";
   let cycleHtml = '<div class="muted">No cycle run yet — press “Dry test” or “Live test”.</div>';
   const c = s.last_cycle;
   if (c && c.blocked) {
-    cycleHtml = `<div class="bot-cycle" style="color:var(--red,#ff5c5c);">🛑 ${esc(c.block_reason || "Live run blocked")}</div>`;
+    cycleHtml = `<div class="bot-cycle" style="color:var(--red,#ff5c5c);">${icon("alert")} ${esc(c.block_reason || "Live run blocked")}</div>`;
   } else if (c) {
     const modeBadge = c.dry_run
       ? '<span class="signal-badge badge-hold">dry-run</span>'
@@ -653,7 +658,7 @@ async function reconcileBroker() {
       // tool / earlier config) — flagged instead of silently ignored.
       if (res.foreign_count) {
         const syms = (res.foreign || []).slice(0, 6).map((f) => symOf(f.symbol)).join(", ");
-        strip.innerHTML += ` <span class="muted" style="color:var(--gold,#f0b90b)">· ⚠ ${res.foreign_count} foreign fill(s) not from this bot${syms ? `: ${syms}` : ""}</span>`;
+        strip.innerHTML += ` <span class="muted" style="color:var(--gold,#f0b90b)">· ${icon("alert", "ic-sm")} ${res.foreign_count} foreign fill(s) not from this bot${syms ? `: ${syms}` : ""}</span>`;
       }
     }
     await loadOrders();
@@ -729,8 +734,8 @@ async function runBotCycle(dryRun) {
     if (!ok) return;
   }
   btn.disabled = true;
-  const label = btn.textContent;
-  btn.textContent = dryRun ? "Running…" : "Placing orders…";
+  const label = btn.innerHTML;                       // keep the icon — restore with innerHTML
+  btn.innerHTML = dryRun ? "Running…" : "Placing orders…";
   try {
     await api("/api/bot/run", {
       method: "POST",
@@ -743,7 +748,7 @@ async function runBotCycle(dryRun) {
     if (b) b.innerHTML = `<div class="muted">Cycle failed — ${esc(e.message)}</div>`;
   } finally {
     btn.disabled = false;
-    btn.textContent = label;
+    btn.innerHTML = label;
   }
 }
 
@@ -1116,7 +1121,7 @@ function sigCard(s) {
   const rr = s.risk_reward != null && isFinite(s.risk_reward) ? `1:${s.risk_reward}` : "—";
   const tr = lastOrderBySym[s.symbol];
   const tradeChip = tr
-    ? `<a class="btn-signal" title="Journal: ${esc(tr.side)} qty ${fmt(tr.qty, 4)} · ${esc(tr.status)}${tr.pnl != null ? ` · pnl ${tr.pnl > 0 ? "+" : ""}${fmt(tr.pnl, 2)}` : ""}" onclick="switchView('orders'); return false;">⏺ ${tr.status}</a>`
+    ? `<a class="btn-signal" title="Journal: ${esc(tr.side)} qty ${fmt(tr.qty, 4)} · ${esc(tr.status)}${tr.pnl != null ? ` · pnl ${tr.pnl > 0 ? "+" : ""}${fmt(tr.pnl, 2)}` : ""}" onclick="switchView('orders'); return false;">${icon("book", "ic-sm")} ${tr.status}</a>`
     : "";
   const tvUrl = "https://www.tradingview.com/chart/?symbol=BINANCE:" + s.symbol.replace("/", "");
   const w = state.watchlist.find((x) => x.symbol === s.symbol);
@@ -1144,7 +1149,7 @@ function sigCard(s) {
       </div>
       <div class="sig-card-right">
         ${tradeChip}
-        <a class="btn-signal" href="${esc(tvUrl)}" target="_blank" rel="noopener">↗ TV</a>
+        <a class="btn-signal" href="${esc(tvUrl)}" target="_blank" rel="noopener">${icon("external", "ic-sm")} TV</a>
         <button class="btn-signal pine-copy" data-symbol="${esc(s.symbol)}">Pine</button>
       </div>
     </div>
