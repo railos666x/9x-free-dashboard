@@ -11,7 +11,7 @@ dashboard reads, without "database is locked" errors.
 
 import hashlib
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -87,8 +87,68 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_news_published ON news(published_at);
+
+        CREATE TABLE IF NOT EXISTS intents (
+            intent_hash  TEXT PRIMARY KEY,   -- sha256(symbol|direction|window) — dedup key
+            symbol       TEXT,
+            direction    TEXT,               -- LONG | SHORT
+            window       TEXT,               -- signal window, e.g. "1h"
+            sources      TEXT,               -- comma-separated source ids that agreed
+            entry        REAL,
+            stop_loss    REAL,
+            take_profit  REAL,
+            confidence   REAL,
+            created_at   TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS orders (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            intent_hash TEXT UNIQUE,         -- one order per intent → no duplicate orders
+            symbol      TEXT,
+            side        TEXT,                -- LONG | SHORT
+            qty         REAL,
+            entry       REAL,
+            stop_loss   REAL,
+            take_profit REAL,
+            source      TEXT,                -- which broker/gateway placed it
+            status      TEXT,                -- filled | open | closed | cancelled | error
+            fill_price  REAL,
+            fill_time   TEXT,
+            fees        REAL,
+            pnl         REAL,
+            error       TEXT,
+            reasons     TEXT,                -- why the trade was taken (sources A+B)
+            broker_ref  TEXT,                -- broker order id (e.g. Alpaca order UUID)
+            created_at  TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);
+        CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+
+        CREATE TABLE IF NOT EXISTS news_verdicts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol     TEXT,
+            direction  TEXT,                -- the proposed trade: LONG | SHORT
+            verdict    TEXT,                -- confirm | veto | neutral
+            score      REAL,                -- the news score (-100..100)
+            big_move   INTEGER,             -- 1 = big-move expected (vetoed)
+            mode       TEXT,                -- rule | llm
+            message    TEXT,
+            created_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_news_verdicts_created ON news_verdicts(created_at);
         """
     )
+    # Migrate older orders tables that predate the exit columns.
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+        for col in ("exit_price", "exit_time", "exit_reason", "reasons", "broker_ref"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
+        conn.commit()
+    except Exception:
+        pass  # table may not exist yet — CREATE IF NOT EXISTS covers fresh DBs
     conn.commit()
 
 
@@ -300,3 +360,148 @@ def load_news(conn, limit: int = 50, sentiment=None, symbol=None) -> pd.DataFram
     query += " ORDER BY published_at DESC LIMIT ?"
     params.append(limit)
     return pd.read_sql_query(query, conn, params=params)
+
+
+# ----------------------------------------------------------------------
+# Intents & orders (execution journal — see arbitrator.py / execution.py)
+# ----------------------------------------------------------------------
+def record_intent(conn, intent) -> bool:
+    """
+    Persist an approved trade intent. Returns True if it was NEW, False if
+    the same intent_hash already exists (i.e. a duplicate that must not
+    produce another order).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO intents
+            (intent_hash, symbol, direction, window, sources, entry,
+             stop_loss, take_profit, confidence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (intent.intent_hash, intent.symbol, intent.direction, intent.window,
+         ",".join(intent.sources), intent.entry, intent.stop_loss,
+         intent.take_profit, intent.confidence, now),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def intent_exists(conn, intent_hash: str) -> bool:
+    return conn.execute("SELECT 1 FROM intents WHERE intent_hash = ?",
+                        (intent_hash,)).fetchone() is not None
+
+
+def record_order(conn, order: dict) -> int:
+    """
+    Insert an order row keyed by intent_hash (INSERT OR IGNORE — a second
+    attempt for the same intent silently becomes a no-op). Returns the new
+    rowid, or 0 if it already existed.
+    """
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO orders
+            (intent_hash, symbol, side, qty, entry, stop_loss, take_profit,
+             source, status, fill_price, fill_time, fees, pnl, error,
+             reasons, broker_ref, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (order["intent_hash"], order["symbol"], order["side"], order["qty"],
+         order["entry"], order["stop_loss"], order["take_profit"],
+         order["source"], order["status"], order.get("fill_price"),
+         order.get("fill_time"), order.get("fees"), order.get("pnl"),
+         order.get("error"), order.get("reasons"), order.get("broker_ref"),
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    return cur.lastrowid if cur.rowcount > 0 else 0
+
+
+def order_for_intent(conn, intent_hash: str) -> dict | None:
+    row = conn.execute("SELECT * FROM orders WHERE intent_hash = ?",
+                       (intent_hash,)).fetchone()
+    return dict(row) if row else None
+
+
+def discard_dry_run(conn, intent_hash: str) -> bool:
+    """Remove a preview (dry_run) order row so a later REAL order can be
+    placed for the same intent. A dry run must never consume the trade —
+    only a placed/error order is idempotent."""
+    cur = conn.execute(
+        "DELETE FROM orders WHERE intent_hash = ? AND status = 'dry_run'",
+        (intent_hash,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def load_orders(conn, symbol: str = None, status: str = None,
+                limit: int = 100) -> list[dict]:
+    """Recent orders, newest first. Optionally filter by symbol/status."""
+    query = "SELECT * FROM orders WHERE 1=1"
+    params = []
+    if symbol:
+        query += " AND symbol = ?"
+        params.append(symbol)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ----------------------------------------------------------------------
+# News gate verdict history (see reviewer.verify_trade / bot.py)
+# ----------------------------------------------------------------------
+def record_news_verdict(conn, symbol: str, direction: str, verdict: str,
+                        score: float, big_move: bool, mode: str,
+                        message: str = "") -> None:
+    """Journal one news-gate decision so veto/confirm stats can be tracked."""
+    conn.execute(
+        """INSERT INTO news_verdicts
+           (symbol, direction, verdict, score, big_move, mode, message, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (symbol, direction, verdict, float(score or 0), 1 if big_move else 0,
+         mode or "rule", message or "",
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def news_verdict_stats(conn, days: int = 7) -> dict:
+    """Veto/confirm/neutral totals for the last `days`, for the dashboard."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        "SELECT verdict, COUNT(*) AS n FROM news_verdicts WHERE created_at >= ? "
+        "GROUP BY verdict", (cutoff,)).fetchall()
+    out = {"veto": 0, "confirm": 0, "neutral": 0, "days": days, "total": 0}
+    for r in rows:
+        if r["verdict"] in out:
+            out[r["verdict"]] = r["n"]
+    out["total"] = out["veto"] + out["confirm"] + out["neutral"]
+    return out
+
+
+def paper_equity(conn) -> float:
+    """Paper-trading equity: starting capital + realized PnL on closed
+    orders. Used by the paper broker for risk-based sizing."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(pnl), 0) AS pnl FROM orders WHERE status = 'closed'"
+    ).fetchone()
+    return config.INITIAL_CAPITAL + float(row["pnl"] or 0.0)
+
+
+def update_order_exit(conn, order_id: int, exit_price: float, exit_time: str,
+                      exit_reason: str, pnl: float, fees: float) -> None:
+    """Mark an open/filled order as closed with its exit + realized PnL."""
+    conn.execute(
+        """
+        UPDATE orders
+        SET status = 'closed', exit_price = ?, exit_time = ?, exit_reason = ?,
+            pnl = ?, fees = ?
+        WHERE id = ? AND status IN ('filled', 'open')
+        """,
+        (exit_price, exit_time, exit_reason, pnl, fees, order_id),
+    )
+    conn.commit()

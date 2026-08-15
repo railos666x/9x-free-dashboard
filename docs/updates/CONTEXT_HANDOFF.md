@@ -192,6 +192,34 @@ backtester.print_report(result)
 curl http://localhost:8501/api/signals | jq '.signals[] | select(.direction != "HOLD")'
 ```
 
+## ��� SESSION HANDOFF (2026-08-15 — execution stack + news-verified AI trading)
+
+### What's running now
+- **Broker: Alpaca paper** (`EXECUTION_BROKER=alpaca`, `ALPACA_PAPER=true`)
+  — bot auto-loop LIVE on the ~$100k paper account, sized from account
+  equity (`execution._broker_equity`). SHORTs held (spot); unsupported
+  assets held (`not_on_broker`) — the old 422/403 spam is fixed.
+- **News review: Gemini LLM** — `LLM_ENABLED=true`, model
+  `gemini-3.1-flash-lite` (2.5-flash is deprecated for new users),
+  cached 10 min (`LLM_MIN_INTERVAL_SECONDS`). Optional OpenRouter/Groq
+  fallbacks: `python scripts/setup_free_llm.py --openrouter … --groq …`.
+- **News verification gate** — `reviewer.verify_trade` vetoes/confirms
+  every agreed trade; decisions journaled to `news_verdicts`;
+  `/api/news/stats`; tuning via `python scripts/analyze_news_gate.py`.
+
+### Useful commands
+```bash
+cd backend && python server.py        # dashboard :8501, auto-loop included
+python scripts/setup_free_llm.py      # add free LLM keys to .env
+python scripts/analyze_news_gate.py   # replay veto/confirm thresholds
+python tests/test_execution.py        # execution + broker regression tests
+```
+
+### Known follow-ups
+- Add OpenRouter/Groq keys (optional; Gemini alone works).
+- Tune `NEWS_VETO_SCORE` / `NEWS_BIG_MOVE_SCORE` after veto history builds.
+- Binance live keys for real-money execution (untested).
+
 ---
 
 *Session complete. All changes committed to docs/updates/.*

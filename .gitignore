@@ -12,6 +12,10 @@ __pycache__/
 # Runtime artifacts (logs, optimizer output)
 data/
 
+# Server log + local editor config (never commit these)
+server.log
+.vscode/
+
 # Database snapshots (scripts/backup_db.py)
 backups/
 

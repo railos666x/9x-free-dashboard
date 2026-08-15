@@ -177,6 +177,14 @@ def review(limit: int = 40):
     return reviewer.review_market(conn, limit=min(limit, 200))
 
 
+@app.get("/api/news/stats")
+def news_stats(days: int = 7):
+    """News-gate history: how often the confirmation layer vetoed / confirmed
+    / stayed neutral over the last `days` (see reviewer.verify_trade)."""
+    conn = database.connect()
+    return database.news_verdict_stats(conn, days=min(days, 30))
+
+
 @app.get("/api/macro")
 def macro(limit: int = 250):
     """Macro asset charts (gold, S&P 500) from the `macro` table."""
@@ -268,6 +276,259 @@ def disconnect_exchange():
     return {"ok": True}
 
 
+# ----------------------------------------------------------------------
+# Bot + trade journal (see bot.py / execution.py)
+# ----------------------------------------------------------------------
+_bot_last_cycle = {"summary": None, "at": None}
+
+
+_last_reconcile = 0.0
+RECONCILE_THROTTLE = 15.0  # seconds between auto-reconciles (matches the 15s journal poll)
+
+
+@app.get("/api/orders")
+def orders(status: str = None, limit: int = 100, detail: int = 0):
+    """The trade journal: every order the bot has placed (or dry-run).
+
+    detail=1 enriches each row with current price / market value /
+    unrealized PnL and a sparkline of the last 24 1h closes, plus a
+    journal summary block. When the broker is Alpaca, statuses are also
+    auto-reconciled (throttled to once per 30s) so the journal mirrors
+    the broker without a manual refresh.
+    """
+    conn = database.connect()
+    global _last_reconcile
+    if config.EXECUTION_BROKER == "alpaca" and time.time() - _last_reconcile > RECONCILE_THROTTLE:
+        try:
+            import execution
+            execution.reconcile_orders(conn)
+            _last_reconcile = time.time()
+        except Exception:
+            pass  # reconciliation is best-effort on reads
+
+    orders_list = database.load_orders(conn, status=status or None,
+                                       limit=min(limit, 500))
+    if not detail:
+        return {"orders": orders_list}
+
+    # ── Per-symbol market context (1h closes), cached across rows ──
+    closes: dict[str, list[float]] = {}
+    for o in orders_list:
+        sym = o["symbol"]
+        if sym in closes:
+            continue
+        df = database.load_candles(conn, sym, "1h", limit=24)
+        closes[sym] = [float(c) for c in df["close"].tolist()] if not df.empty else []
+
+    enriched = []
+    for o in orders_list:
+        row = dict(o)
+        cc = closes.get(o["symbol"], [])
+        row["spark"] = cc
+        row["current_price"] = cc[-1] if cc else None
+        qty = float(o.get("qty") or 0)
+        # Cost basis: intent entry, falling back to the actual fill price.
+        entry = o.get("entry") or o.get("fill_price")
+        cur = row["current_price"]
+        active = o.get("status") in ("filled", "open")
+        row["market_value"] = round(qty * cur, 2) if (active and cur) else None
+        if active and cur and entry:
+            if o["side"].upper() == "LONG":
+                unreal = (cur - float(entry)) * qty - float(o.get("fees") or 0)
+            else:
+                unreal = (float(entry) - cur) * qty - float(o.get("fees") or 0)
+            row["unrealized_pnl"] = round(unreal, 2)
+        else:
+            row["unrealized_pnl"] = None
+        enriched.append(row)
+
+    # ── Alpaca: blend the broker's real-time marks so the journal donut
+    # matches the live account. Journal marks use 1h-candle closes (only
+    # change hourly — the donut looks "stuck"); Alpaca's per-position
+    # unrealized PnL is marked continuously and also covers positions that
+    # were opened outside the bot. Falls back to journal marks when the
+    # account is unreachable.
+    acct_positions: dict[str, dict] = {}
+    if config.EXECUTION_BROKER == "alpaca":
+        try:
+            import portfolio as pf
+            acct = pf._alpaca_account()
+            if acct:
+                acct_positions = acct.get("positions") or {}
+        except Exception:
+            acct_positions = {}
+    if acct_positions:
+        for r in enriched:
+            if r.get("status") not in ("filled", "open"):
+                continue
+            pos = acct_positions.get(r["symbol"])
+            if pos:
+                r["unrealized_pnl"] = round(pos["unrealized_pl"], 2)
+                r["market_value"] = round(pos["market_value"], 2)
+            else:
+                # No open position at the broker — the journal row is stale
+                # (closed broker-side); don't show phantom PnL.
+                r["unrealized_pnl"] = 0.0
+                r["market_value"] = None
+
+    open_val = sum(r["market_value"] or 0 for r in enriched
+                   if r.get("status") in ("filled", "open"))
+    realized = sum(float(r.get("pnl") or 0) for r in enriched
+                   if r.get("status") == "closed")
+
+    # ── Per-currency PnL contribution (for the donut chart) ──
+    by_sym: dict[str, dict] = {}
+    for r in enriched:
+        e = by_sym.setdefault(r["symbol"],
+                              {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0})
+        if r.get("status") == "closed":
+            e["realized"] += float(r.get("pnl") or 0)
+        if r.get("status") in ("filled", "open"):
+            e["unrealized"] += float(r.get("unrealized_pnl") or 0)
+            e["market_value"] += float(r.get("market_value") or 0)
+    # Account-only positions (opened outside the bot) still belong in the
+    # donut, otherwise the centre total wouldn't match the slices.
+    for sym, pos in acct_positions.items():
+        e = by_sym.setdefault(sym,
+                              {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0})
+        e["unrealized"] += float(pos.get("unrealized_pl") or 0)
+        e["market_value"] += float(pos.get("market_value") or 0)
+    gross = sum(abs(e["realized"] + e["unrealized"]) for e in by_sym.values()) or 1.0
+    by_symbol = []
+    for sym, e in by_sym.items():
+        pnl = round(e["realized"] + e["unrealized"], 2)
+        by_symbol.append({
+            "symbol": sym,
+            "pnl": pnl,
+            "realized": round(e["realized"], 2),
+            "unrealized": round(e["unrealized"], 2),
+            "market_value": round(e["market_value"], 2),
+            "share": round(abs(pnl) / gross * 100, 1),
+        })
+    by_symbol.sort(key=lambda r: abs(r["pnl"]), reverse=True)
+
+    summary_block = {
+        "orders": len(enriched),
+        "open_positions": len([r for r in enriched
+                                if r.get("status") in ("filled", "open")]),
+        "dry_run": len([r for r in enriched if r.get("status") == "dry_run"]),
+        "open_market_value": round(open_val, 2),
+        "realized_pnl": round(realized, 2),
+        "unrealized_pnl": round(sum(e["unrealized"] for e in by_sym.values()), 2),
+        "total_pnl": round(realized + sum(e["unrealized"] for e in by_sym.values()), 2),
+        "by_symbol": by_symbol,
+    }
+    return {"orders": enriched, "summary": summary_block}
+
+
+@app.post("/api/bot/reconcile")
+def bot_reconcile():
+    """Force a journal ↔ broker reconciliation now. Returns updated rows
+    plus any foreign fills (broker orders our journal didn't place)."""
+    import execution
+    conn = database.connect()
+    try:
+        rows = execution.reconcile_orders(conn)
+        updated = [r for r in rows if not r.get("foreign")]
+        foreign = [r for r in rows if r.get("foreign")]
+        return {"updated": updated, "count": len(updated),
+                "foreign": foreign, "foreign_count": len(foreign)}
+    except Exception as e:
+        return {"error": str(e), "updated": [], "count": 0, "foreign": []}
+
+
+@app.post("/api/bot/run")
+def bot_run(payload: dict = None):
+    """Run one bot cycle. dry_run=true (default) journals intents without
+    touching a broker — safe to press from the dashboard."""
+    payload = payload or {}
+    dry_run = bool(payload.get("dry_run", True))
+    conn = database.connect()
+    import bot
+    summary = bot.run_once(conn, dry_run=dry_run)
+    _bot_last_cycle.update({"summary": summary, "at": time.time()})
+    return summary
+
+
+@app.post("/api/bot/loop")
+def bot_loop_control(payload: dict = None):
+    """Start/stop the server-side bot loop from the dashboard.
+
+    Start runs dry-run unless the broker is paper (live auto-loop is
+    refused for real-money brokers by _auto_loop_live). Stop asks the
+    loop to finish after the current cycle.
+    """
+    payload = payload or {}
+    if bool(payload.get("running")):
+        started = _start_bot_loop()
+        return {"ok": True, "running": True, "live": _auto_loop_live(),
+                "message": "already running" if not started else "started"}
+    stopped = _stop_bot_loop()
+    return {"ok": True, "running": False, "stopped": stopped,
+            "message": ("stop requested — finishes after the current cycle"
+                         if stopped else "loop was not running")}
+
+
+@app.post("/api/bot/source")
+def bot_source(payload: dict = None):
+    """Switch signal source A (math_engine | strategy) from the dashboard.
+
+    Only allowed while the bot loop is STOPPED, so a running bot is never
+    yanked mid-cycle. Takes effect immediately (next cycle) and is
+    persisted to .env so a restart keeps the choice.
+    """
+    if _bot_thread is not None and _bot_thread.is_alive():
+        return {"ok": False,
+                "error": "bot is running — stop it first (Auto loop → Stop)"}
+    payload = payload or {}
+    source = str(payload.get("source") or "").strip().lower()
+    if source not in ("math_engine", "strategy", "hybrid"):
+        return {"ok": False,
+                "error": "source must be 'math_engine', 'strategy' or 'hybrid'"}
+    config.SIGNAL_SOURCE_A = source
+    try:
+        _write_env_key("SIGNAL_SOURCE_A", source)
+    except Exception as e:
+        return {"ok": True, "source": source,
+                "warning": f"applied for this session but .env not updated: {e}"}
+    return {"ok": True, "source": source}
+
+
+@app.get("/api/bot/status")
+def bot_status():
+    """Bot configuration + the last cycle summary (for the dashboard)."""
+    # Keep open_positions truthful: broker-side closes are synced (throttled)
+    # so a position closed in Alpaca stops showing as open here.
+    global _last_reconcile
+    if config.EXECUTION_BROKER == "alpaca" and time.time() - _last_reconcile > RECONCILE_THROTTLE:
+        try:
+            import execution
+            execution.reconcile_orders(database.connect())
+            _last_reconcile = time.time()
+        except Exception:
+            pass
+    return {
+        "broker": config.EXECUTION_BROKER,
+        "alpaca_paper": config.ALPACA_PAPER,
+        "proprietary_enabled": config.PROPRIETARY_SIGNALS_ENABLED,
+        "llm_providers": len(reviewer._llm_providers()) if config.LLM_ENABLED else -1,
+        "loop_seconds": config.BOT_LOOP_SECONDS,
+        "signal_source_a": config.SIGNAL_SOURCE_A,
+        "arbitration_min_sources": config.ARBITRATION_MIN_SOURCES,
+        "arbitration_min_confidence": config.ARBITRATION_MIN_CONFIDENCE,
+        "live_single_source_blocked": (config.ARBITRATION_MIN_SOURCES < 2
+                                        and not config.ALLOW_LIVE_SINGLE_SOURCE),
+        "auto_loop": config.BOT_AUTO_LOOP,
+        "auto_loop_running": bool(_bot_thread is not None and _bot_thread.is_alive()),
+        "auto_loop_live": _auto_loop_live(),
+        "last_cycle": _bot_last_cycle["summary"],
+        "last_run_at": _bot_last_cycle["at"],
+        "open_orders": len([o for o in database.load_orders(database.connect(),
+                                                            limit=1000)
+                            if o.get("status") in ("filled", "open")]),
+    }
+
+
 @app.get("/api/backtest")
 def run_backtest(
     symbol: str = "BTC/USDT",
@@ -341,6 +602,87 @@ def index():
     return FileResponse(DASHBOARD / "index.html")
 
 
+# ----------------------------------------------------------------------
+# Bot auto-loop control (start/stop from the dashboard, see /api/bot/loop)
+# ----------------------------------------------------------------------
+_bot_thread = None
+_bot_stop = threading.Event()
+_bot_loop_state = {"running": False, "live": False, "since": None}
+
+
+def _auto_loop_live() -> bool:
+    """Effective live mode for the server-side bot loop. Real-money
+    brokers (live Alpaca, Binance) are NEVER auto-traded — only paper
+    brokers may run the loop live; everything else falls back to dry-run."""
+    if not config.BOT_AUTO_LOOP_LIVE:
+        return False
+    if config.EXECUTION_BROKER == "binance":
+        return False
+    if config.EXECUTION_BROKER == "alpaca" and not config.ALPACA_PAPER:
+        return False
+    return True
+
+
+def _start_bot_loop() -> bool:
+    """Start the bot loop thread (idempotent). Returns True if started."""
+    global _bot_thread
+    if _bot_thread is not None and _bot_thread.is_alive():
+        return False
+    live = _auto_loop_live()
+    _bot_stop.clear()
+    _bot_loop_state.update({
+        "running": True, "live": live,
+        "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    _bot_thread = threading.Thread(target=_bot_loop_worker, args=(live,),
+                                   daemon=True, name="bot-loop")
+    _bot_thread.start()
+    return True
+
+
+def _stop_bot_loop() -> bool:
+    """Ask the loop to finish after the current cycle. True if it was running."""
+    if _bot_thread is None or not _bot_thread.is_alive():
+        return False
+    _bot_stop.set()
+    return True
+
+
+def _bot_loop_worker(live: bool) -> None:
+    import bot as _bot
+    conn = database.connect()
+    database.init_db(conn)
+
+    def _record_cycle(summary: dict) -> None:
+        """Surface auto-loop cycles to the dashboard (same slot as manual
+        /api/bot/run cycles)."""
+        _bot_last_cycle.update({"summary": summary, "at": time.time()})
+
+    try:
+        _bot.bot_loop(conn, dry_run=not live,
+                      interval_seconds=config.BOT_LOOP_SECONDS,
+                      stop_event=_bot_stop, on_cycle=_record_cycle)
+    finally:
+        _bot_loop_state.update({"running": False, "live": False, "since": None})
+
+
+def _write_env_key(key: str, value: str) -> None:
+    """Set one KEY=VALUE line in the project .env, preserving every other
+    line (and never printing/reading the secrets in it)."""
+    path = ROOT / ".env"
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    out, found = [], False
+    for ln in lines:
+        if ln.split("=", 1)[0].strip() == key:
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(ln)
+    if not found:
+        out.append(f"{key}={value}")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 def _start_live_threads() -> None:
     """Start the price collector and news loops as daemon threads."""
     import collector as _col
@@ -372,6 +714,12 @@ def _start_live_threads() -> None:
     t2.start()
     t3.start()
     print("  Live data threads started (prices + news + macro)")
+    if config.BOT_AUTO_LOOP:
+        if _start_bot_loop():
+            print("  Bot loop thread started"
+                  + (" (live/paper)" if _auto_loop_live() else " (dry-run)"))
+        else:
+            print("  Bot loop already running")
 
 
 if __name__ == "__main__":

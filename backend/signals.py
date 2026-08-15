@@ -246,8 +246,14 @@ def generate_all_signals(conn, news_limit: int = 60) -> dict:
     for symbol in config.SYMBOLS:
         raw = coin_scores.get(symbol, 0)
         ns = max(-1.0, min(1.0, raw / 100.0))
-        signals.append(generate_signal(conn, symbol, news_score=ns,
-                                       all_coins_data=all_coins_data))
+        sig = generate_signal(conn, symbol, news_score=ns,
+                              all_coins_data=all_coins_data)
+        # The news confirmation verdict for this coin's signal — surfaced on
+        # the dashboard signal card (NEWS ✓ / ✗ / −) and used by the bot's
+        # news gate. Pure call: no network, no extra review pass.
+        sig["news_score"] = int(raw)
+        sig["news_verdict"] = reviewer.verdict_for(raw, sig.get("direction", "HOLD"))
+        signals.append(sig)
 
     return {
         "signals": signals,

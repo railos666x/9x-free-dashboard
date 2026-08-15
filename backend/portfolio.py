@@ -1,17 +1,20 @@
 """
 cryptoautomation — Portfolio module.
 
-Two modes:
-  1. **demo** (default) — a sample portfolio of real coins, priced with
-     LIVE market data from the candles table. Enough to make the dashboard
-     fully functional out of the box.
+Three modes (first that works wins):
+  1. **alpaca** — when EXECUTION_BROKER=alpaca and Alpaca keys are set in
+     .env, the paper/live Alpaca account is the trading account: equity,
+     cash, buying power and open positions are fetched and priced.
   2. **exchange** — when the user connects a Binance account via the
      dashboard's "Connect exchange" modal, their real spot balances are
      fetched (signed API calls) and priced the same way.
+  3. **demo** (fallback) — a sample portfolio of real coins, priced with
+     LIVE market data from the candles table.
 
-API keys are stored locally in data/exchange_keys.json (never committed,
-never sent anywhere except Binance itself). Best-effort: any error falls
-back to demo mode.
+Binance API keys are stored locally in data/exchange_keys.json (never
+committed, never sent anywhere except Binance itself). Alpaca keys live in
+.env (shared with the execution layer). Best-effort: any error falls back
+to the next mode.
 """
 
 from __future__ import annotations
@@ -97,6 +100,78 @@ def _latest_prices(conn, symbols: list[str]) -> dict[str, float]:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Alpaca account + positions (the execution/trading account)
+# ──────────────────────────────────────────────────────────────────────
+
+def _alpaca_account() -> dict | None:
+    """
+    Snapshot the Alpaca trading account: equity, cash, buying power and
+    open positions (mapped to our BTC/USDT symbol format). Returns None
+    when keys are missing or the account call fails.
+    """
+    if not (config.ALPACA_API_KEY and config.ALPACA_SECRET_KEY):
+        return None
+    base = config.ALPACA_PAPER_URL if config.ALPACA_PAPER else config.ALPACA_LIVE_URL
+    headers = {"APCA-API-KEY-ID": config.ALPACA_API_KEY,
+               "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY}
+    try:
+        acc = requests.get(f"{base}/v2/account", headers=headers, timeout=15).json()
+        pos = requests.get(f"{base}/v2/positions", headers=headers, timeout=15).json()
+    except Exception:
+        return None
+
+    holdings = {}
+    unreal = 0.0
+    positions = {}   # symbol -> {qty, entry, current, market_value, unrealized_pl}
+    for p in pos or []:
+        sym = str(p.get("symbol") or "")
+        qty = float(p.get("qty") or 0)
+        if abs(qty) < 1e-9:
+            continue
+        if sym.endswith("USD") and len(sym) > 3:
+            sym = sym[:-3] + "/USDT"   # BTCUSD -> BTC/USDT
+        else:
+            continue  # non-crypto (stocks etc.) — out of scope for this dashboard
+        holdings[sym] = abs(qty)
+        try:
+            upl = float(p.get("unrealized_pl") or 0)
+            unreal += upl
+        except (TypeError, ValueError):
+            upl = 0.0
+        positions[sym] = {
+            "qty": abs(qty),
+            "entry": float(p.get("entry_price") or 0) or None,
+            "current": float(p.get("current_price") or 0) or None,
+            "market_value": float(p.get("market_value") or 0),
+            "unrealized_pl": round(upl, 2),
+        }
+    cash = float(acc.get("cash") or 0)
+    if cash > 0:
+        holdings["USDT"] = round(cash, 2)  # stablecoin pseudo-holding (priced 1.0)
+    if not holdings:
+        return None
+    # Account-level PnL: equity vs the last recorded equity. Alpaca paper
+    # crypto does NOT populate portfolio/history (returns zeros), so this
+    # equity delta is the only broker-side number that captures fees too
+    # (Alpaca's order payload has no filled_fees for crypto — the journal
+    # records 0 and would otherwise understate costs).
+    equity = float(acc.get("equity") or 0)
+    last_equity = float(acc.get("last_equity") or 0)
+    account_pnl = round(equity - last_equity, 2) if last_equity else None
+    return {
+        "holdings": holdings,
+        "positions": positions,
+        "equity": equity,
+        "cash": cash,
+        "buying_power": float(acc.get("buying_power") or 0),
+        "unrealized_pl": round(unreal, 2),
+        "account_pnl": account_pnl,
+        "account_number": acc.get("account_number"),
+        "paper": config.ALPACA_PAPER,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Binance exchange balances (signed)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -151,11 +226,28 @@ def get_portfolio(conn) -> dict:
     """
     Full portfolio snapshot: mode, holdings priced in USD, distribution,
     and a daily value history (from real 1d candles).
+
+    Mode priority: alpaca (the connected trading account) → binance
+    exchange (connect-exchange modal) → demo.
     """
     keys = load_keys()
     mode = "demo"
     holdings = dict(DEMO_HOLDINGS)
-    if keys and keys.get("api_key"):
+    account_meta = {}
+
+    # 1. Alpaca trading account (execution broker).
+    if config.EXECUTION_BROKER == "alpaca":
+        try:
+            alp = _alpaca_account()
+        except Exception:
+            alp = None
+        if alp:
+            holdings = alp["holdings"]
+            mode = "alpaca"
+            account_meta = alp
+
+    # 2. Binance exchange (explicitly connected via the modal).
+    if mode == "demo" and keys and keys.get("api_key"):
         try:
             ex = _signed_request(keys)
             if ex:
@@ -191,7 +283,7 @@ def get_portfolio(conn) -> dict:
         for i in items if i["value"] > 0
     ]
 
-    return {
+    result = {
         "mode": mode,
         "exchange_name": keys.get("name") if keys else None,
         "total_usd": round(total, 2),
@@ -199,6 +291,18 @@ def get_portfolio(conn) -> dict:
         "distribution": distribution,
         "history": _value_history(conn, holdings, days=90),
     }
+    if mode == "alpaca":
+        result.update({
+            "exchange_name": f"Alpaca {'paper' if account_meta.get('paper') else 'live'}",
+            "equity": round(account_meta.get("equity") or 0, 2),
+            "cash": round(account_meta.get("cash") or 0, 2),
+            "buying_power": round(account_meta.get("buying_power") or 0, 2),
+            "unrealized_pl": account_meta.get("unrealized_pl") or 0.0,
+            "account_pnl": account_meta.get("account_pnl"),
+            "account_number": account_meta.get("account_number"),
+            "total_usd": round(account_meta.get("equity") or total, 2),
+        })
+    return result
 
 
 def _value_history(conn, holdings: dict, days: int = 90) -> list[dict]:

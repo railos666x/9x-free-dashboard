@@ -30,38 +30,40 @@ DATA_DIR.mkdir(exist_ok=True)
 # ----------------------------------------------------------------------
 # Symbols to watch. Binance uses BASE/QUOTE format, e.g. "BTC/USDT".
 # NOTE: deduplicated and pruned of pairs that are not on Binance Spot
-# (verified against crypto_data.db): removed ICON/USDT (ticker is ICX),
-# QLC/USDT, OMN/USDT, BLOB/USDT, BTCDOM/USDT (index, not a pair).
+# (verified 2026-08-15 against Binance exchangeInfo): removed ICON/USDT
+# (ticker is ICX), QLC/USDT, OMN/USDT, BLOB/USDT, BTCDOM/USDT (index, not
+# a pair), and the BREAK/delisted HNT/USDT, XMR/USDT, MATIC/USDT (renamed
+# to POL — kept as POL/USDT below), MKR/USDT, OCEAN/USDT, EOS/USDT,
+# FIO/USDT, CREAM/USDT, MDT/USDT, IRIS/USDT, BLZ/USDT.
 # ── Major ──
 SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "DOGE/USDT",
     # ── Layer 1 ──
     "ADA/USDT", "XRP/USDT", "AVAX/USDT", "DOT/USDT", "NEAR/USDT",
-    "ALGO/USDT", "ATOM/USDT", "EOS/USDT", "TRX/USDT", "LTC/USDT",
-    "BCH/USDT", "ETC/USDT", "ICP/USDT", "XLM/USDT", "XMR/USDT",
-    "FIL/USDT", "HBAR/USDT", "EGLD/USDT", "THETA/USDT",
+    "ALGO/USDT", "ATOM/USDT", "TRX/USDT", "LTC/USDT",
+    "BCH/USDT", "ETC/USDT", "ICP/USDT", "XLM/USDT",
+    "FIL/USDT", "HBAR/USDT", "EGLD/USDT", "THETA/USDT", "POL/USDT",
     # ── Layer 2 ──
-    "ARB/USDT", "MATIC/USDT", "OP/USDT",
+    "ARB/USDT", "OP/USDT",
     # ── DeFi ──
     "AAVE/USDT", "UNI/USDT", "LINK/USDT", "COMP/USDT", "CRV/USDT",
-    "SUSHI/USDT", "SNX/USDT", "YFI/USDT", "1INCH/USDT", "MKR/USDT",
+    "SUSHI/USDT", "SNX/USDT", "YFI/USDT", "1INCH/USDT",
     "BAND/USDT", "KNC/USDT", "ZRX/USDT", "RUNE/USDT", "LPT/USDT",
-    "DYDX/USDT", "TRB/USDT", "OCEAN/USDT",
+    "DYDX/USDT", "TRB/USDT",
     # ── Meme ──
     "SHIB/USDT", "FLOKI/USDT", "PEPE/USDT", "WIF/USDT", "BONK/USDT",
     # ── Gaming / Metaverse ──
     "SAND/USDT", "MANA/USDT", "AXS/USDT", "ENJ/USDT", "GALA/USDT",
     "ALICE/USDT", "CHZ/USDT", "BAT/USDT",
     # ── Infrastructure / Storage ──
-    "GRT/USDT", "HNT/USDT", "NEO/USDT", "VET/USDT", "IOTA/USDT",
-    "STORJ/USDT", "BLZ/USDT", "CVC/USDT", "CTSI/USDT", "CELR/USDT",
+    "GRT/USDT", "NEO/USDT", "VET/USDT", "IOTA/USDT",
+    "STORJ/USDT", "CVC/USDT", "CTSI/USDT", "CELR/USDT",
     "KAVA/USDT", "ONE/USDT", "MASK/USDT",
     # ── Other ──
     "DASH/USDT", "KSM/USDT", "SFP/USDT", "COTI/USDT", "CELO/USDT",
     "IOST/USDT", "CKB/USDT",
     # ── Additional from watchlist ──
-    "OG/USDT", "BEL/USDT", "OGN/USDT", "SLP/USDT",
-    "FIO/USDT", "CREAM/USDT", "MDT/USDT", "IRIS/USDT", "LUNA/USDT",
+    "OG/USDT", "BEL/USDT", "OGN/USDT", "SLP/USDT", "LUNA/USDT",
 ]
 
 # Candle timeframes supported by Binance (named the way the API wants).
@@ -174,6 +176,32 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
+# How often the LLM news overlay may actually re-ask a provider (seconds).
+# Free tiers (Gemini Flash ~tens of req/day, OpenRouter 50-1000/day, Groq
+# ~1000/day) would be exhausted in minutes by the 20s signals refresh, so
+# the last successful LLM verdict is served from cache within this window.
+LLM_MIN_INTERVAL_SECONDS = int(os.environ.get("LLM_MIN_INTERVAL_SECONDS", "600"))  # 10 min
+
+# Optional LLM failover chain. When the primary (LLM_* above) is unreachable,
+# rate-limited, or returns garbage, the reviewer tries each fallback in order
+# and only gives up when every provider has failed. All providers must be
+# OpenAI-compatible (OpenRouter, Groq, DeepSeek, Gemini's OpenAI-compat
+# endpoint, …) — no code change, just config.
+#
+# Format: a `;`-separated list of `base_url|model[|api_key]` entries.
+#   LLM_FALLBACKS="https://openrouter.ai/api/v1|meta-llama/llama-3.3-70b-instruct|sk-or-...;https://api.groq.com/openai/v1|llama-3.3-70b-versatile|gsk_..."
+# Keyless providers work too (leave the api_key field empty).
+_LLM_FALLBACKS_RAW = os.environ.get("LLM_FALLBACKS", "")
+LLM_FALLBACKS: list[dict] = []
+for _entry in [e.strip() for e in _LLM_FALLBACKS_RAW.split(";") if e.strip()]:
+    _parts = [p.strip() for p in _entry.split("|")]
+    if len(_parts) >= 2 and _parts[0] and _parts[1]:
+        LLM_FALLBACKS.append({
+            "base_url": _parts[0].rstrip("/"),
+            "model": _parts[1],
+            "api_key": _parts[2] if len(_parts) > 2 else "",
+        })
+
 # RSS feeds of trusted outlets. Format: (display name, feed URL).
 # Crypto + macro/commodities/forex — each feed is fetched defensively,
 # a dead feed is skipped, never fatal (see news.fetch_rss).
@@ -218,6 +246,117 @@ BEARISH_KEYWORDS = [
     "ban", "banned", "lawsuit", "sues", "liquidation", "liquidated", "warning",
     "loss", "fines", "delisting", "collapses",
 ]
+
+# ----------------------------------------------------------------------
+# Execution (broker gateway — single path for all orders)
+# ----------------------------------------------------------------------
+# Which broker the execution layer uses: "paper" (default, offline fills
+# from our candles + risk model), "alpaca" (paper or live REST, no SDK
+# needed), or "binance" (signed spot orders).
+EXECUTION_BROKER = os.environ.get("EXECUTION_BROKER", "paper").strip().lower()
+
+# Alpaca keys. ALPACA_PAPER=true (default) talks to the free paper-trading
+# endpoint; set ALPACA_PAPER=false for live (real orders — be careful).
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_PAPER = os.environ.get("ALPACA_PAPER", "true").lower() in ("1", "true", "yes")
+ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
+ALPACA_LIVE_URL = "https://api.alpaca.markets"
+
+# Alpaca crypto taker fee, in bps. Alpaca's order payload has no filled_fees
+# for crypto and the activities feed doesn't report a fee either — so we
+# estimate from their published schedule (0.25% taker below $100k volume;
+# tier 2 is 0.22%). Override per account in .env.
+ALPACA_FEE_BPS = float(os.environ.get("ALPACA_FEE_BPS", "25"))
+
+# Max fraction of account equity one position may represent (notional cap,
+# scaled by the confidence multiplier — a sure trade may take a bigger
+# slice). Without it, a burst of simultaneous signals (e.g. 25 RSI(2)
+# longs) would each try to spend ~100× their risk and blow past the cash.
+MAX_POSITION_PCT = float(os.environ.get("MAX_POSITION_PCT", "0.15"))
+
+# Max concurrently open positions the bot will hold. New entries are held
+# back while this many positions are open, so a signal burst can't stack
+# more exposure than the account can fund. 0 = unlimited.
+MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
+
+# Binance execution keys (separate from the read-only portfolio keys in
+# data/exchange_keys.json — keep those read-only, use these for trading).
+BINANCE_EXEC_API_KEY = os.environ.get("BINANCE_EXEC_API_KEY", "")
+BINANCE_EXEC_API_SECRET = os.environ.get("BINANCE_EXEC_API_SECRET", "")
+
+# Proprietary signal source #2 (off by default — see proprietary_signals.py).
+PROPRIETARY_SIGNALS_ENABLED = os.environ.get(
+    "PROPRIETARY_SIGNALS_ENABLED", ""
+).lower() in ("1", "true", "yes")
+
+# Source B mode:
+#   "rsi2" — Connors-style RSI(2) extremes on 15m (default, deterministic)
+#   "llm"  — batched LLM analysis of the latest headlines via the failover
+#            chain (Gemini → OpenRouter → Groq); requires LLM_ENABLED=true
+PROPRIETARY_MODE = os.environ.get("PROPRIETARY_MODE", "rsi2").strip().lower()
+
+# RSI(2) extreme thresholds for the rsi2 mode (LONG below low, SHORT above
+# high). 10/90 is ultra-strict (rare signals, high conviction); 25/75 is a
+# pragmatic default that actually produces agreement with source A.
+PROPRIETARY_RSI_LOW = float(os.environ.get("PROPRIETARY_RSI_LOW", "25"))
+PROPRIETARY_RSI_HIGH = float(os.environ.get("PROPRIETARY_RSI_HIGH", "75"))
+
+# How often the scheduled bot loop (`python bot.py loop`) runs one cycle.
+BOT_LOOP_SECONDS = int(os.environ.get("BOT_LOOP_SECONDS", "300"))  # 5 min
+
+# Server-side auto-loop: when BOT_AUTO_LOOP=true, server.py starts the bot
+# loop as a background thread (no manual `python bot.py loop` needed). The
+# loop is DRY-RUN unless BOT_AUTO_LOOP_LIVE=true. Safety rail: a live
+# auto-loop is refused for real-money brokers (live Alpaca / Binance) —
+# only paper brokers auto-trade; real-money setups fall back to dry-run.
+BOT_AUTO_LOOP = os.environ.get("BOT_AUTO_LOOP", "false").lower() in ("1", "true", "yes")
+BOT_AUTO_LOOP_LIVE = os.environ.get("BOT_AUTO_LOOP_LIVE", "false").lower() in ("1", "true", "yes")
+
+# Agreement gate (see arbitrator.arbitrate): how many signal sources must
+# want a trade before the bot executes it.
+#   2 (default) = BOTH sources must agree — production safety. Conflicts and
+#                 missing sources never trade.
+#   1 = a single source can trade alone, but only if it is at least
+#       ARBITRATION_MIN_CONFIDENCE confident — handy for testing the
+#       execution path / dry-testing the journal when source B is quiet.
+# Confidence floor default is 45 = source B's flat conviction in rsi2 mode,
+# so a lone RSI(2) extreme can be the inspectable test trade.
+ARBITRATION_MIN_SOURCES = int(os.environ.get("ARBITRATION_MIN_SOURCES", "2"))
+ARBITRATION_MIN_CONFIDENCE = float(os.environ.get("ARBITRATION_MIN_CONFIDENCE", "45"))
+
+# Safety: when the gate is in single-source test mode, LIVE runs are blocked
+# unless this is explicitly set to true. Prevents accidentally trading real
+# money on a test-only gate. Dry runs are always allowed.
+ALLOW_LIVE_SINGLE_SOURCE = os.environ.get("ALLOW_LIVE_SINGLE_SOURCE", "false").lower() in ("1", "true", "yes")
+
+# Which generator feeds source A of the bot (see bot.py).
+#   "math_engine" (default) — signals.py Bayesian fusion + factors. Strict
+#       calibration (DIRECTIVE-001): often all-HOLD by design.
+#   "strategy" — the validated mean-reversion v2 (strategy.compute_signal,
+#       import-only, never edited). Produces full entry/SL/TP intents when
+#       the market ranges; quiet in trending regimes by design.
+#   "hybrid" — union of both: either generator can fire; when both fire the
+#       same direction the stronger wins, opposing active opinions abstain.
+SIGNAL_SOURCE_A = os.environ.get("SIGNAL_SOURCE_A", "math_engine").strip().lower()
+
+# ----------------------------------------------------------------------
+# News verification gate (see reviewer.verify_trade)
+# ----------------------------------------------------------------------
+# When the signal system agrees on a trade, the news review acts as a
+# CONFIRMATION layer on top (the "confirmation AI"). It can only ever
+# block or endorse — it never initiates trades:
+#   - opposing headlines at or beyond NEWS_VETO_SCORE  → VETO (don't take)
+#   - an extreme score in EITHER direction (|score| >= NEWS_BIG_MOVE_SCORE)
+#     means a big move is expected → stand aside instead of trading into
+#     the whipsaw (the confirmation AI says "don't take")
+#   - aligned headlines at or beyond NEWS_CONFIRM_SCORE → confirm (the
+#     intent is journaled with a "news confirms" reason)
+#   - neutral / no news → never blocks a trade
+NEWS_VERIFY_ENABLED = os.environ.get("NEWS_VERIFY_ENABLED", "true").lower() in ("1", "true", "yes")
+NEWS_VETO_SCORE = float(os.environ.get("NEWS_VETO_SCORE", "30"))        # opposing |score| → veto
+NEWS_CONFIRM_SCORE = float(os.environ.get("NEWS_CONFIRM_SCORE", "20"))  # aligned |score| → confirm
+NEWS_BIG_MOVE_SCORE = float(os.environ.get("NEWS_BIG_MOVE_SCORE", "55"))  # |score| any direction → big move
 
 # ----------------------------------------------------------------------
 # Fear & Greed index (free API, no key)

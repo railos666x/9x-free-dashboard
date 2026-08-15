@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>cryptoautomation · Dashboard</title>
+<link rel="icon" href="data:," />
 <link rel="stylesheet" href="/dash-assets/dashboard.css" />
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
@@ -24,6 +25,7 @@
     </div>
 
     <div class="topbar-actions">
+      <span class="server-dot" id="serverDot" title="Backend status"></span>
       <button class="icon-btn" title="Search assets" onclick="focusSearch()">⌕</button>
       <button class="btn-primary" id="btnConnect" onclick="openConnect()">Connect exchange</button>
     </div>
@@ -41,6 +43,7 @@
       </div>
       <div class="nav-group">
         <div class="nav-label">Trading</div>
+        <a class="nav-item" data-view="orders" href="#">📒 Orders</a>
         <a class="nav-item" data-view="signals" href="#">⚡ Signals</a>
       </div>
     </aside>
@@ -178,20 +181,113 @@
               </div>
             </label>
             <label>Timeframe
-              <select id="btInterval">
-                <option value="1m">1m</option>
-                <option value="5m">5m</option>
-                <option value="15m">15m</option>
-                <option value="1h" selected>1h</option>
-                <option value="4h">4h</option>
-                <option value="1d">1d</option>
-              </select>
+              <div class="asset-picker ap-select" id="intervalPicker">
+                <div class="ap-input-row" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="false">
+                  <span class="ap-value" id="intervalValue">1h</span>
+                  <span class="ap-caret">▾</span>
+                </div>
+                <div class="ap-list" id="intervalList" hidden role="listbox"></div>
+              </div>
             </label>
             <button class="btn-primary" id="btnRunBacktest" onclick="runBacktest()">Run backtest</button>
           </div>
           <div id="btResults" class="bt-results">
             <div class="muted">Pick a symbol and run a backtest of the v2 mean-reversion strategy (net of fees + slippage).</div>
           </div>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: Orders (bot status + trade journal) ═══════════ -->
+      <section class="view" id="view-orders">
+        <section class="card bots-card">
+          <div class="card-head">
+            <div class="card-title">Bot status</div>
+            <span class="muted" id="botStatusMeta"></span>
+          </div>
+          <div id="botStatusBody" class="bot-status-body"><div class="muted">Loading…</div></div>
+          <div id="heldReasons" class="held-reasons"></div>
+          <div class="bot-controls-row">
+            <div class="bot-loop-ctl">
+              <span class="muted">Auto loop:</span>
+              <span id="botLoopBadge" class="signal-badge badge-hold">…</span>
+              <button class="btn-primary" id="btnToggleLoop" onclick="toggleBotLoop()">Start</button>
+            </div>
+            <div class="bot-source-ctl">
+              <label>Source A
+                <select id="botSourceSelect" title="Signal source A generator — change only while the bot is stopped">
+                  <option value="math_engine">math_engine (strict)</option>
+                  <option value="strategy">strategy v2 (mean-reversion)</option>
+                  <option value="hybrid">hybrid (both, union)</option>
+                </select>
+              </label>
+              <button class="btn-primary" id="btnApplySource" onclick="applyBotSource()">Apply</button>
+              <span class="muted" id="botSourceMsg"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card ord-chart-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title" id="ordChartTitle">Position chart</div>
+            <div class="dash-controls">
+              <label class="ap-label">Asset
+                <div class="ap-wrap" id="ordPickerWrap">
+                  <div class="asset-picker">
+                    <div class="ap-input-row">
+                      <span class="ap-search-ico">⌕</span>
+                      <input id="ordInput" type="text" autocomplete="off" spellcheck="false" placeholder="Search…" />
+                      <span class="ap-caret">▾</span>
+                    </div>
+                    <div class="ap-list" id="ordList" hidden></div>
+                  </div>
+                  <div class="ap-quick" id="ordQuick"></div>
+                </div>
+              </label>
+              <div class="tf-pills" id="ordTfPills">
+                <button class="tf-pill" data-interval="1m">1m</button>
+                <button class="tf-pill" data-interval="5m">5m</button>
+                <button class="tf-pill" data-interval="15m">15m</button>
+                <button class="tf-pill active" data-interval="1h">1h</button>
+                <button class="tf-pill" data-interval="4h">4h</button>
+                <button class="tf-pill" data-interval="1d">1d</button>
+              </div>
+            </div>
+          </div>
+          <div id="ordChart" class="chart ord-chart"></div>
+          <div class="sig-level-legend muted" id="ordLevelLegend"></div>
+        </section>
+
+        <section class="card pnl-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">Profit by currency</div>
+            <span class="muted" id="pnlDonutMeta"></span>
+          </div>
+          <div class="pnl-layout">
+            <div id="pnlDonut" class="chart pnl-donut"></div>
+            <div id="pnlBreakdown" class="pnl-breakdown"><div class="muted">Loading…</div></div>
+          </div>
+        </section>
+
+        <section class="card crypto-table-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">Trade journal</div>
+            <div class="assets-head-right">
+              <span class="signal-badge badge-hold" id="botModeBadge" title="Bot run mode (set by the Auto loop control)">AUTO: ?</span>
+              <button class="btn-primary" id="btnRunBotDry" onclick="runBotCycle(true)">🧪 Dry test</button>
+              <button class="btn-warn" id="btnRunBotLive" onclick="runBotCycle(false)">⚡ Live test</button>
+            </div>
+          </div>
+          <div id="journalSummary" class="journal-summary muted"></div>
+          <table class="crypto-table orders-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Fill</th>
+                <th>Exit</th><th>PnL</th><th>Unreal</th><th>Status</th><th>Source</th>
+                <th>Current</th><th>Mkt value</th><th>24h chart</th><th>Why</th><th>Time</th>
+              </tr>
+            </thead>
+            <tbody id="ordersBody"><tr><td colspan="15" class="muted">No orders yet.</td></tr></tbody>
+          </table>
         </section>
       </section>
 

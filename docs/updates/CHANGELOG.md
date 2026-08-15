@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-08-15
+
+### Added
+- **News verification badges on signal cards** — `NEWS ✓ / ✗ / −` verdict
+  chips per coin (from the reviewer gate), with score + reason on hover;
+  compact `N +score` chip on HOLD rows
+- **Journal trade chips in Signals view** — coins with journal orders show
+  a `⏺ status` chip linking to the Orders view
+- **News-gate stats row in Bots panel** — "News gate (7d): X vetoed · Y
+  confirmed · Z neutral" from `/api/news/stats`
+- **Foreign-fill warning** — Reconcile now flags broker fills our journal
+  never placed (manual / other tools) inline in the journal summary
+- **LLM overlay status row** — Bots panel shows rule-based vs active
+  (provider count) via `/api/bot/status llm_providers`
+
+### Changed
+- **News review now LLM-powered** — Gemini free tier (`gemini-3.1-flash-lite`,
+  OpenAI-compat endpoint) with optional OpenRouter/Groq fallbacks; cached
+  10 min so free tiers aren't burned; keyless cloud providers skipped
+- **Broker = Alpaca paper** — bot + portfolio use the real $100k Alpaca
+  paper account; sizing scales with account equity
+
+### Fixed
+- **Alpaca rejected-order spam** — unsupported assets/shorts are held
+  (`not_on_broker` / `no_short_on_spot`) instead of 422/403ing at the
+  broker; stale error rows cleaned from the journal
+
+---
+
 ## [Unreleased] - 2026-08-13
 
 ### Added

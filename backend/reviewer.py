@@ -23,6 +23,7 @@ Exposed to the terminal as `GET /api/review`.
 import json
 import math
 import re
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -197,10 +198,112 @@ def _rule_review(conn, limit: int, hours: float) -> dict:
 
 
 # ----------------------------------------------------------------------
-# Optional LLM overlay (OpenAI-compatible chat completions)
+# Optional LLM overlay (OpenAI-compatible chat completions, with failover)
 # ----------------------------------------------------------------------
+
+# If every configured provider fails (down / rate-limited / bad output), back
+# off for a while instead of hammering them on every 5-minute refresh.
+_llm_cooldown_until = 0.0
+LLM_COOLDOWN_SECONDS = 600.0  # 10 minutes
+
+# The last SUCCESSFUL LLM verdict, served from cache for
+# LLM_MIN_INTERVAL_SECONDS so free tiers aren't re-queried on every 20s
+# signals refresh (Gemini Flash ~tens of req/day, OpenRouter 50-1000/day,
+# Groq ~1000/day).
+_llm_result_cache = {"at": 0.0, "data": None}
+
+
+def _llm_providers() -> list[dict]:
+    """Primary provider first (LLM_*), then every configured fallback.
+
+    Providers without an API key are skipped UNLESS they are local
+    (localhost / 127.0.0.1, e.g. llama.cpp). Cloud free tiers all require
+    a key — a keyless cloud entry would just burn a guaranteed 401 on
+    every cycle, so it's filtered out instead."""
+    providers = [
+        {"base_url": config.LLM_BASE_URL, "model": config.LLM_MODEL,
+         "api_key": config.LLM_API_KEY}
+    ]
+    providers += list(config.LLM_FALLBACKS)
+    out = []
+    for p in providers:
+        base = (p.get("base_url") or "").rstrip("/")
+        if not base or not p.get("model"):
+            continue
+        if not p.get("api_key") and "localhost" not in base \
+                and "127.0.0.1" not in base:
+            continue  # keyless cloud provider -> guaranteed 401, skip
+        out.append(p)
+    return out
+
+
+def _parse_llm_json(content: str):
+    """Strip markdown fences and parse provider JSON. Returns dict or None."""
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.I)
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _llm_request(provider: dict, prompt: str):
+    """One chat-completions call to a provider. Returns parsed JSON dict or None."""
+    headers = {"Content-Type": "application/json"}
+    api_key = provider.get("api_key") or ""
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    resp = requests.post(
+        provider["base_url"] + "/chat/completions",
+        headers=headers,
+        json={"model": provider["model"], "temperature": 0.0,
+              "messages": [{"role": "system",
+                            "content": "You are a cautious crypto market analyst. "
+                                       "You score coins from headlines alone, never "
+                                       "invent news."},
+                           {"role": "user", "content": prompt}],
+              "max_tokens": 600},
+        timeout=45,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    return _parse_llm_json(content)
+
+
+def _llm_data_to_coins(data: dict) -> list:
+    """Convert a provider's {symbol: {score, stance, reasons}} payload into our
+    per-coin rows. Returns [] if nothing usable came back."""
+    coin_map = {s.split("/")[0]: s for s in config.SYMBOLS}
+    coins = []
+    for key, val in data.items():
+        symbol = coin_map.get(str(key).upper())
+        if not symbol or not isinstance(val, dict):
+            continue
+        score = val.get("score", 0)
+        stance = val.get("stance", "neutral")
+        if stance not in ("bullish", "bearish", "neutral"):
+            stance = "neutral"
+        coins.append({"symbol": symbol, "score": int(score), "stance": stance,
+                      "reasons": [{"title": val.get("reasons", ""), "sentiment": stance,
+                                   "url": ""}], "stories": 0})
+    return coins
+
+
 def _llm_review(conn, limit: int) -> dict:
-    """Ask the configured LLM for a per-coin call. Returns None on any failure."""
+    """Ask the LLM chain (primary + fallbacks) for a per-coin call.
+
+    Tries each provider in order; the first that returns usable JSON wins.
+    Returns None when every provider fails (a cooldown prevents retry spam),
+    when there is no news to analyze, or on any other failure.
+    """
+    global _llm_cooldown_until
+    if time.time() < _llm_cooldown_until:
+        return None
+    # Serve the cached LLM verdict inside the min-interval window — free
+    # tiers can't take a call every 20s.
+    if (_llm_result_cache["data"] is not None
+            and time.time() - _llm_result_cache["at"] < config.LLM_MIN_INTERVAL_SECONDS):
+        return _llm_result_cache["data"]
     try:
         df = database.load_news(conn, limit=min(limit, 20))
         items = df.to_dict(orient="records")
@@ -220,48 +323,96 @@ def _llm_review(conn, limit: int) -> dict:
             "is no meaningful signal. Reply with ONLY valid JSON.\n\n" + lines
         )
 
-        resp = requests.post(
-            config.LLM_BASE_URL + "/chat/completions",
-            headers={"Authorization": f"Bearer {config.LLM_API_KEY}",
-                     "Content-Type": "application/json"},
-            json={"model": config.LLM_MODEL, "temperature": 0.0,
-                  "messages": [{"role": "system",
-                                "content": "You are a cautious crypto market analyst. "
-                                           "You score coins from headlines alone, never "
-                                           "invent news."},
-                               {"role": "user", "content": prompt}],
-                  "max_tokens": 600},
-            timeout=45,
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.I)
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            return None
-
-        coin_map = {s.split("/")[0]: s for s in config.SYMBOLS}
-        coins = []
-        for key, val in data.items():
-            symbol = coin_map.get(str(key).upper())
-            if not symbol or not isinstance(val, dict):
+        for provider in _llm_providers():
+            try:
+                data = _llm_request(provider, prompt)
+            except Exception:
+                continue  # this provider is down/rate-limited — try the next
+            if not data:
+                continue  # unusable output — try the next
+            coins = _llm_data_to_coins(data)
+            if not coins:
                 continue
-            score = val.get("score", 0)
-            stance = val.get("stance", "neutral")
-            if stance not in ("bullish", "bearish", "neutral"):
-                stance = "neutral"
-            coins.append({"symbol": symbol, "score": int(score), "stance": stance,
-                          "reasons": [{"title": val.get("reasons", ""), "sentiment": stance,
-                                       "url": ""}], "stories": 0})
-        if not coins:
-            return None
+            avg = sum(c["score"] for c in coins) / len(coins)
+            market = ("Bullish" if avg >= STANCE_BULL
+                      else "Bearish" if avg <= STANCE_BEAR else "Neutral")
+            result = {"coins": coins, "stories": len(items), "window_hours": None,
+                      "market": market, "mode": "llm", "model": provider["model"],
+                      "generated_at": _now_iso()}
+            _llm_result_cache.update({"at": time.time(), "data": result})
+            return result
 
-        avg = sum(c["score"] for c in coins) / len(coins)
-        market = ("Bullish" if avg >= STANCE_BULL else "Bearish" if avg <= STANCE_BEAR else "Neutral")
-        return {"coins": coins, "stories": len(items), "window_hours": None,
-                "market": market, "mode": "llm", "model": config.LLM_MODEL}
-    except Exception:
+        # Every provider failed (network, rate limit, or bad JSON) — back off.
+        _llm_cooldown_until = time.time() + LLM_COOLDOWN_SECONDS
         return None
+    except Exception:
+        _llm_cooldown_until = time.time() + LLM_COOLDOWN_SECONDS
+        return None
+
+
+# ----------------------------------------------------------------------
+# News verification of a proposed trade (the confirmation layer)
+# ----------------------------------------------------------------------
+def verdict_for(score, direction: str) -> dict:
+    """Pure verdict from a news score (-100..+100) and a proposed trade
+    direction — shared by verify_trade (bot gate) and the signal cards
+    (dashboard). Returns {verdict, message, big_move}."""
+    score = int(score or 0)
+    direction = (direction or "").upper()
+    big = abs(score) >= config.NEWS_BIG_MOVE_SCORE
+    stance = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
+    if big:
+        verdict = "veto"
+        message = (f"big move expected (news {stance}, {score:+d}) — "
+                   f"standing aside, the signal would be whipsawed")
+    elif direction == "LONG" and score <= -config.NEWS_VETO_SCORE:
+        verdict, message = "veto", f"news bearish ({score:+d}) against LONG"
+    elif direction == "SHORT" and score >= config.NEWS_VETO_SCORE:
+        verdict, message = "veto", f"news bullish ({score:+d}) against SHORT"
+    elif (direction == "LONG" and score >= config.NEWS_CONFIRM_SCORE) or \
+            (direction == "SHORT" and score <= -config.NEWS_CONFIRM_SCORE):
+        verdict, message = "confirm", f"news {stance} ({score:+d}) supports {direction}"
+    else:
+        verdict, message = "neutral", "news neutral or too weak to matter — allow"
+    return {"verdict": verdict, "message": message, "big_move": big}
+
+
+def verify_trade(conn, symbol: str, direction: str) -> dict:
+    """
+    News verification of a proposed trade — the "confirmation AI" gate.
+
+    Called by the bot AFTER the signal sources agree on an intent, BEFORE
+    execution. It can only veto or endorse, never initiate:
+
+      veto     — headlines strongly oppose the trade, OR an extreme score
+                 in either direction means a big move is expected (the
+                 math signal is likely to be whipsawed → stand aside).
+      confirm  — headlines support the trade direction (journaled as a
+                 "news confirms" reason on the intent).
+      neutral  — no news or too weak to matter → never blocks a trade.
+
+    Returns a dict with verdict, the raw news score, the top reasons, and
+    which review mode produced the score ("rule" or the LLM overlay).
+    """
+    review = review_market(conn, limit=40)
+    row = next((c for c in review.get("coins", []) if c.get("symbol") == symbol), None)
+    base = {"mode": review.get("mode", "rule"), "model": review.get("model"),
+            "big_move": False}
+    if not row:
+        base.update({"verdict": "neutral", "score": 0, "stance": "neutral",
+                     "reasons": [], "message": "no news coverage — allow"})
+        return base
+
+    score = int(row.get("score") or 0)
+    stance = row.get("stance", "neutral")
+    reasons = [r.get("title") for r in (row.get("reasons") or [])
+               if isinstance(r, dict) and r.get("title")]
+    v = verdict_for(score, direction)
+    base.update({"verdict": v["verdict"], "score": score, "stance": stance,
+                 "big_move": v["big_move"], "reasons": reasons[:3],
+                 "message": v["message"],
+                 "stories": int(row.get("stories") or 0)})
+    return base
 
 
 # ----------------------------------------------------------------------
@@ -271,7 +422,9 @@ def review_market(conn, limit: int = 40, hours: float = 48.0) -> dict:
     """Market review: rule-based view, optionally overlaid by the LLM."""
     result = _rule_review(conn, limit, hours)
 
-    if config.LLM_ENABLED and config.LLM_API_KEY:
+    # LLM overlay is enabled if LLM_ENABLED=true AND at least one provider is
+    # usable (primary key, or a configured fallback — e.g. fallback-only setup).
+    if config.LLM_ENABLED and _llm_providers():
         llm = _llm_review(conn, limit)
         if llm:
             # Keep the rule-based reasons as a fallback trail, but take the
