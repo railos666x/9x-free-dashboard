@@ -1,6 +1,11 @@
 # CryptoAutomation - Task List & Roadmap
 
-*Last Updated: 2026-08-12*
+*Last Updated: 2026-08-15*
+
+> **📌 Session tracker (current):** this file is the legacy roadmap. The
+> authoritative list of completed + pending work for the current session lives in
+> `documentation/FOLLOWUPS_TRACKER.md` (created 2026-08-15, branch
+> `feature/ai-execution-news-gate`). Resume from there.
 
 ---
 
