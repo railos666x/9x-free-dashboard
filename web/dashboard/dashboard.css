@@ -579,9 +579,49 @@ a { color: inherit; text-decoration: none; }
 .pnl-sub { width: 96px; text-align: right; font-size: 11px; }
 @media (max-width: 900px) {
   .pnl-layout { grid-template-columns: 1fr; }
+}/* ── Trades: period filter + closed-trades list + live panel ───────*/
+.trades-filter {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 14px; padding: 10px 14px;
 }
+.trades-filter input[type="date"] {
+  background: var(--card2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 4px 8px; font-size: 12px;
+}
+.trades-grid {
+  display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; align-items: start;
+}
+@media (max-width: 1100px) { .trades-grid { grid-template-columns: 1fr; } }
 
-/* ── Orders view: bot status + trade journal ─────────────────────── */
+.closed-trades-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+}
+.closed-trades-list { margin-top: 8px; max-height: 420px; overflow-y: auto; }
+.closed-trade {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 7px 4px; border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.closed-trade:last-child { border-bottom: none; }
+.ct-pnl { font-weight: 700; min-width: 70px; text-align: right; }
+.ct-pnl.up { color: var(--green); } .ct-pnl.down { color: var(--red); }
+
+.live-trades-body { display: flex; flex-direction: column; gap: 10px; max-height: 560px; overflow-y: auto; }
+.live-trade {
+  background: var(--card2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 10px 12px;
+}
+.lt-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lt-upnl { margin-left: auto; font-weight: 800; font-size: 14px; }
+.lt-upnl.up { color: var(--green); } .lt-upnl.down { color: var(--red); }
+.lt-grid {
+  display: grid; grid-template-columns: auto auto auto; gap: 4px 14px;
+  margin-top: 8px; font-family: "Consolas", monospace; font-size: 11px;
+}
+.lt-sl { color: var(--red); } .lt-tp { color: var(--green); }
+
+/* ── Orders view: bot status + trade journal ───────────────────────*/
 .bot-status-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));

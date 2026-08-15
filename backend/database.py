@@ -435,8 +435,11 @@ def discard_dry_run(conn, intent_hash: str) -> bool:
 
 
 def load_orders(conn, symbol: str = None, status: str = None,
+                created_from: str = None, created_to: str = None,
                 limit: int = 100) -> list[dict]:
-    """Recent orders, newest first. Optionally filter by symbol/status."""
+    """Recent orders, newest first. Optionally filter by symbol/status and
+    a created-at window (ISO datetimes — plain dates "YYYY-MM-DD" are
+    widened to the full day)."""
     query = "SELECT * FROM orders WHERE 1=1"
     params = []
     if symbol:
@@ -445,10 +448,28 @@ def load_orders(conn, symbol: str = None, status: str = None,
     if status:
         query += " AND status = ?"
         params.append(status)
+    frm = _day_start(created_from) if created_from else None
+    to = _day_end(created_to) if created_to else None
+    if frm:
+        query += " AND created_at >= ?"
+        params.append(frm)
+    if to:
+        query += " AND created_at <= ?"
+        params.append(to)
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
     rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def _day_start(iso: str) -> str:
+    """Widen a date/ISO to the start of its day (UTC) for range filters."""
+    return iso.strip()[:10] + "T00:00:00"
+
+
+def _day_end(iso: str) -> str:
+    """Widen a date/ISO to the end of its day (UTC) for range filters."""
+    return iso.strip()[:10] + "T23:59:59.999999"
 
 
 # ----------------------------------------------------------------------

@@ -5,6 +5,25 @@ agent must be appended here.
 
 ---
 
+## 2026-08-15 — Trades analytics: date-range filter, every-closed-trade list, live-trades panel
+
+- **Date-range filter** (Orders view): Today / 7 days / 30 days / All presets
+  plus custom from→to date inputs. `/api/orders` accepts `from`/`to`
+  (created-at window, widened to full days) — the Profit-by-currency donut,
+  the closed-trades list and the journal table all scope to the period.
+- **Every closed trade list** — per-trade rows (symbol, side, qty,
+  entry→exit, exit reason, PnL, time) under the donut, capped at 200 rows
+  with a "widen the range" hint.
+- **Live trades panel** — new lean `/api/positions` endpoint (open/filled
+  rows + fresh price + unrealized PnL, broker marks blended; no heavy
+  enrichment) powering a side panel polled every 10s with SL/TP distance
+  and opened time.
+- **Donut tooltip sign bug fixed** — slices are sized by |PnL| but the
+  tooltip showed "+$" for every slice (absolute value); it now renders the
+  real sign (e.g. "DOGE: −$438 (65.9% of gross)").
+
+---
+
 ## 2026-08-15 — Execution stack + news-verification gate + free-LLM news review (feature/ai-execution-news-gate)
 
 ### Trading pipeline (new: bot.py · arbitrator.py · execution.py · verification.py · proprietary_signals.py)

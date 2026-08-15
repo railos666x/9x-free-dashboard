@@ -257,16 +257,45 @@
           <div class="sig-level-legend muted" id="ordLevelLegend"></div>
         </section>
 
-        <section class="card pnl-card" style="margin-top:16px;">
-          <div class="card-head">
-            <div class="card-title">Profit by currency</div>
-            <span class="muted" id="pnlDonutMeta"></span>
+        <div class="trades-filter" style="margin-top:16px;">
+          <span class="muted">Closed trades period:</span>
+          <div class="tf-pills" id="tradeRangePills">
+            <button class="tf-pill" data-range="today">Today</button>
+            <button class="tf-pill active" data-range="7d">7 days</button>
+            <button class="tf-pill" data-range="30d">30 days</button>
+            <button class="tf-pill" data-range="all">All</button>
           </div>
-          <div class="pnl-layout">
-            <div id="pnlDonut" class="chart pnl-donut"></div>
-            <div id="pnlBreakdown" class="pnl-breakdown"><div class="muted">Loading…</div></div>
-          </div>
-        </section>
+          <label class="muted">From <input type="date" id="tradeFrom"></label>
+          <label class="muted">To <input type="date" id="tradeTo"></label>
+          <button class="btn-primary" id="btnApplyTradeRange">Apply</button>
+          <span class="muted" id="tradeRangeMeta"></span>
+        </div>
+
+        <div class="trades-grid" style="margin-top:16px;">
+          <section class="card pnl-card">
+            <div class="card-head">
+              <div class="card-title">Profit by currency</div>
+              <span class="muted" id="pnlDonutMeta"></span>
+            </div>
+            <div class="pnl-layout">
+              <div id="pnlDonut" class="chart pnl-donut"></div>
+              <div id="pnlBreakdown" class="pnl-breakdown"><div class="muted">Loading…</div></div>
+            </div>
+            <div class="closed-trades-head">
+              <div class="card-title">Every closed trade</div>
+              <span class="muted" id="closedTradesMeta"></span>
+            </div>
+            <div id="closedTradesList" class="closed-trades-list"><div class="muted">No closed trades in this period.</div></div>
+          </section>
+
+          <section class="card live-card">
+            <div class="card-head">
+              <div class="card-title">Live trades</div>
+              <span class="muted" id="liveTradesMeta">—</span>
+            </div>
+            <div id="liveTradesBody" class="live-trades-body"><div class="muted">Loading…</div></div>
+          </section>
+        </div>
 
         <section class="card crypto-table-card" style="margin-top:16px;">
           <div class="card-head">

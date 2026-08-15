@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-08-15
 
 ### Added
+- **Date-range filter for closed trades** — Today / 7d / 30d / All presets
+  plus custom from→to dates; donut, every-closed-trade list and journal
+  table all scope to the period
+- **Every closed trade list** — per-trade rows under the Profit-by-currency
+  donut (symbol, side, entry→exit, reason, PnL, time)
+- **Live trades panel** — side card with open positions (price, unrealized
+  PnL, SL/TP distance, opened time), polled every 10s via the new lean
+  `/api/positions` endpoint
+
+### Fixed
+- **Donut tooltip PnL sign** — slices sized by absolute value showed "+$"
+  for losses too; now shows the real sign
+
+---
+
+## [Unreleased] - 2026-08-15
+
+### Added
 - **News verification badges on signal cards** — `NEWS ✓ / ✗ / −` verdict
   chips per coin (from the reviewer gate), with score + reason on hover;
   compact `N +score` chip on HOLD rows

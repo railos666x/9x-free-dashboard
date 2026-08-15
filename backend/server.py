@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -287,7 +287,9 @@ RECONCILE_THROTTLE = 15.0  # seconds between auto-reconciles (matches the 15s jo
 
 
 @app.get("/api/orders")
-def orders(status: str = None, limit: int = 100, detail: int = 0):
+def orders(status: str = None, limit: int = 100, detail: int = 0,
+           from_: str = Query(None, alias="from"),
+           to: str = Query(None, alias="to")):
     """The trade journal: every order the bot has placed (or dry-run).
 
     detail=1 enriches each row with current price / market value /
@@ -295,6 +297,9 @@ def orders(status: str = None, limit: int = 100, detail: int = 0):
     journal summary block. When the broker is Alpaca, statuses are also
     auto-reconciled (throttled to once per 30s) so the journal mirrors
     the broker without a manual refresh.
+
+    `from` / `to` (dates or ISO datetimes) filter by created-at window,
+    so the donut + summary reflect any period (today / week / custom).
     """
     conn = database.connect()
     global _last_reconcile
@@ -307,7 +312,8 @@ def orders(status: str = None, limit: int = 100, detail: int = 0):
             pass  # reconciliation is best-effort on reads
 
     orders_list = database.load_orders(conn, status=status or None,
-                                       limit=min(limit, 500))
+                                       created_from=from_, created_to=to,
+                                       limit=min(limit, 1000))
     if not detail:
         return {"orders": orders_list}
 
@@ -419,6 +425,55 @@ def orders(status: str = None, limit: int = 100, detail: int = 0):
         "by_symbol": by_symbol,
     }
     return {"orders": enriched, "summary": summary_block}
+
+
+@app.get("/api/positions")
+def positions():
+    """LIVE trades snapshot — open/filled journal rows with a fresh price
+    and unrealized PnL. Deliberately lean (no sparklines, no heavy
+    enrichment) so the dashboard can poll it fast; broker-side marks
+    (Alpaca) are blended when available.
+    """
+    conn = database.connect()
+    rows = [o for o in database.load_orders(conn, limit=500)
+            if o.get("status") in ("filled", "open")]
+
+    acct_positions = {}
+    if config.EXECUTION_BROKER == "alpaca":
+        try:
+            import portfolio as pf
+            acct = pf._alpaca_account()
+            if acct:
+                acct_positions = acct.get("positions") or {}
+        except Exception:
+            acct_positions = {}
+
+    out = []
+    for o in rows:
+        df = database.load_candles(conn, o["symbol"], "1h", limit=3)
+        cur = float(df["close"].iloc[-1]) if not df.empty else None
+        entry = o.get("entry") or o.get("fill_price")
+        unreal = None
+        if cur and entry:
+            qty = float(o.get("qty") or 0)
+            if o["side"].upper() == "LONG":
+                unreal = (cur - float(entry)) * qty - float(o.get("fees") or 0)
+            else:
+                unreal = (float(entry) - cur) * qty - float(o.get("fees") or 0)
+        pos = acct_positions.get(o["symbol"])
+        if pos:
+            cur = pos.get("current") or cur
+            unreal = pos.get("unrealized_pl")
+        out.append({
+            "symbol": o["symbol"], "side": o["side"], "qty": o.get("qty"),
+            "entry": entry, "fill_price": o.get("fill_price"),
+            "stop_loss": o.get("stop_loss"), "take_profit": o.get("take_profit"),
+            "current_price": cur,
+            "unrealized_pnl": round(unreal, 2) if unreal is not None else None,
+            "created_at": o.get("created_at"),
+        })
+    return {"positions": out, "count": len(out),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
 @app.post("/api/bot/reconcile")

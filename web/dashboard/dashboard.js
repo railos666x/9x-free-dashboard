@@ -92,6 +92,7 @@ function switchView(name) {
   if (name === "orders") {
     loadBotStatus();
     loadOrders();
+    loadLiveTrades();
     if (ordChart) ordChart.resize();
     if (pendingOrdCandles) { renderOrdChart(pendingOrdCandles); pendingOrdCandles = null; }
     else if (state.ordSymbol) loadOrdChart();
@@ -289,9 +290,70 @@ function renderBotStatus(s) {
 
 let lastOrders = [];   // latest journal rows (for the Orders chart levels)
 
+// Closed-trades period filter: presets (today / 7d / 30d / all) or a custom
+// from→to window. Applies to the Profit-by-currency donut, the every-closed-
+// trade list and the journal table.
+const tradesRange = { preset: "7d", from: null, to: null };
+
+function _rangeQuery() {
+  const q = new URLSearchParams({ limit: "500", detail: "1" });
+  if (tradesRange.from) q.set("from", tradesRange.from);
+  if (tradesRange.to) q.set("to", tradesRange.to);
+  return q.toString();
+}
+
+function _periodLabel() {
+  const r = tradesRange;
+  if (r.preset === "today") return "today";
+  if (r.preset === "7d") return "last 7 days";
+  if (r.preset === "30d") return "last 30 days";
+  if (r.preset === "all") return "all time";
+  return `${r.from || "…"} → ${r.to || "now"}`;
+}
+
+function applyTradePreset(preset) {
+  tradesRange.preset = preset;
+  const now = new Date();
+  const iso = (d) => d.toISOString().slice(0, 10);
+  if (preset === "today") { tradesRange.from = iso(now); tradesRange.to = null; }
+  else if (preset === "7d") { tradesRange.from = iso(new Date(now.getTime() - 7 * 864e5)); tradesRange.to = null; }
+  else if (preset === "30d") { tradesRange.from = iso(new Date(now.getTime() - 30 * 864e5)); tradesRange.to = null; }
+  else { tradesRange.from = null; tradesRange.to = null; }
+  document.querySelectorAll("#tradeRangePills .tf-pill").forEach((b) => b.classList.toggle("active", b.dataset.range === preset));
+  const f = $("tradeFrom"), t = $("tradeTo");
+  if (f) f.value = tradesRange.from || "";
+  if (t) t.value = tradesRange.to || "";
+  const meta = $("tradeRangeMeta");
+  if (meta) meta.textContent = `· ${_periodLabel()}`;
+  loadOrders();
+}
+
+function applyCustomRange() {
+  const f = $("tradeFrom"), t = $("tradeTo");
+  tradesRange.preset = "custom";
+  tradesRange.from = (f && f.value) || null;
+  tradesRange.to = (t && t.value) || null;
+  document.querySelectorAll("#tradeRangePills .tf-pill").forEach((b) => b.classList.remove("active"));
+  const meta = $("tradeRangeMeta");
+  if (meta) meta.textContent = `· ${_periodLabel()}`;
+  loadOrders();
+}
+
+function bindTradeRange() {
+  document.querySelectorAll("#tradeRangePills .tf-pill").forEach((b) => {
+    b.addEventListener("click", () => applyTradePreset(b.dataset.range));
+  });
+  const apply = $("btnApplyTradeRange");
+  if (apply) apply.addEventListener("click", applyCustomRange);
+  ["tradeFrom", "tradeTo"].forEach((id) => {
+    const el = $(id);
+    if (el) el.addEventListener("change", applyCustomRange);
+  });
+}
+
 async function loadOrders() {
   try {
-    const data = await api("/api/orders?limit=100&detail=1");
+    const data = await api("/api/orders?" + _rangeQuery());
     lastOrders = data.orders || [];
     renderOrders(lastOrders, data.summary);
     // Default the position chart to the first open/filled position.
@@ -306,6 +368,56 @@ async function loadOrders() {
     const b = $("ordersBody");
     if (b) b.innerHTML = `<tr><td colspan="15" class="muted">Orders unavailable — ${esc(e.message)}</td></tr>`;
   }
+}
+
+// ── Live trades panel (fast, polled separately from the heavy journal) ──
+let _livePollStarted = false;
+
+async function loadLiveTrades() {
+  try {
+    const d = await api("/api/positions");
+    renderLiveTrades(d.positions || []);
+  } catch (e) {
+    const b = $("liveTradesBody");
+    if (b) b.innerHTML = `<div class="muted">Live trades unavailable — ${esc(e.message)}</div>`;
+  }
+}
+
+function renderLiveTrades(positions) {
+  const b = $("liveTradesBody"), meta = $("liveTradesMeta");
+  if (!b) return;
+  if (meta) meta.textContent = `${positions.length} open · ${new Date().toLocaleTimeString()}`;
+  if (!positions.length) {
+    b.innerHTML = '<div class="muted">No open positions — the bot is flat.</div>';
+    return;
+  }
+  b.innerHTML = positions.map((p) => {
+    const long = p.side === "LONG";
+    const up = p.unrealized_pnl == null ? null : p.unrealized_pnl >= 0;
+    const dist = (lvl) => (lvl != null && p.current_price) ? (lvl - p.current_price) / p.current_price * 100 : null;
+    const slD = dist(p.stop_loss), tpD = dist(p.take_profit);
+    return `<div class="live-trade">
+      <div class="lt-head">
+        <span class="sym">${symOf(p.symbol)}</span>
+        <span class="signal-badge ${long ? "badge-long" : "badge-short"}">${long ? "▲ LONG" : "▼ SHORT"}</span>
+        <span class="lt-upnl ${up === null ? "" : up ? "up" : "down"}">${p.unrealized_pnl == null ? "—" : `${p.unrealized_pnl > 0 ? "+" : ""}${fmt(p.unrealized_pnl, 2)}`}</span>
+      </div>
+      <div class="lt-grid">
+        <span class="muted">qty ${fmt(p.qty, 4)}</span>
+        <span class="muted">entry ${fmtPrice(p.entry)}</span>
+        <span class="muted">now ${fmtPrice(p.current_price)}</span>
+        ${slD != null ? `<span class="lt-sl">SL ${fmtPrice(p.stop_loss)} <span class="lvl-dist ${long === (slD < 0) ? "down" : "up"}">${slD > 0 ? "+" : ""}${slD.toFixed(1)}%</span></span>` : ""}
+        ${tpD != null ? `<span class="lt-tp">TP ${fmtPrice(p.take_profit)} <span class="lvl-dist ${long === (tpD > 0) ? "up" : "down"}">${tpD > 0 ? "+" : ""}${tpD.toFixed(1)}%</span></span>` : ""}
+        <span class="muted">opened ${esc(String(p.created_at || "").slice(0, 16).replace("T", " "))}</span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function startLivePolling() {
+  if (_livePollStarted) return;
+  _livePollStarted = true;
+  setInterval(loadLiveTrades, 10000);   // lean endpoint — safe to poll
 }
 
 /* ── Orders view: big position chart (entry / SL / TP from the journal) ── */
@@ -374,10 +486,38 @@ function sparkline(values, w = 90, h = 28) {
     `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`;
 }
 
+function renderClosedTrades(orders) {
+  const box = $("closedTradesList"), meta = $("closedTradesMeta");
+  if (!box) return;
+  const closed = orders.filter((o) => o.status === "closed");
+  if (meta) meta.textContent = `${closed.length} trade${closed.length === 1 ? "" : "s"} · ${_periodLabel()}`;
+  if (!closed.length) {
+    box.innerHTML = '<div class="muted">No closed trades in this period.</div>';
+    return;
+  }
+  const shown = closed.slice(0, 200);
+  const more = closed.length > shown.length ? `<div class="muted" style="margin-top:8px">… +${closed.length - shown.length} more (widen the date range to see them)</div>` : "";
+  box.innerHTML = shown.map((o) => {
+    const long = o.side === "LONG";
+    const pnlCls = o.pnl > 0 ? "up" : o.pnl < 0 ? "down" : "";
+    const exit = o.exit_price != null ? fmtPrice(o.exit_price) : "—";
+    const t = String(o.exit_time || o.created_at || "").slice(0, 16).replace("T", " ");
+    return `<div class="closed-trade">
+      <span class="sym">${symOf(o.symbol)}</span>
+      <span class="signal-badge ${long ? "badge-long" : "badge-short"}">${long ? "▲" : "▼"}</span>
+      <span class="muted">${fmt(o.qty, 2)}</span>
+      <span class="muted">${fmtPrice(o.entry)} → ${exit}${o.exit_reason ? ` <span class="muted">(${esc(o.exit_reason)})</span>` : ""}</span>
+      <span class="ct-pnl ${pnlCls}">${o.pnl > 0 ? "+" : ""}${fmt(o.pnl, 2)}</span>
+      <span class="muted">${esc(t)}</span>
+    </div>`;
+  }).join("") + more;
+}
+
 function renderOrders(orders, summary) {
   const b = $("ordersBody");
   if (!b) return;
   renderPnlDonut(summary);
+  renderClosedTrades(orders);
   const strip = $("journalSummary");
   if (strip) {
     if (summary) {
@@ -443,6 +583,7 @@ function renderPnlDonut(summary) {
     meta.textContent = rows.length
       ? `${rows.length} currencies · realized ${summary.realized_pnl > 0 ? "+" : ""}$${fmt(summary.realized_pnl, 2)}`
         + ` · unrealized ${unreal > 0 ? "+" : ""}$${fmt(unreal, 2)}`
+        + ` · ${_periodLabel()}`
       : "";
   }
   if (!rows.length) {
@@ -457,7 +598,12 @@ function renderPnlDonut(summary) {
     tooltip: {
       trigger: "item", backgroundColor: "#14161c", borderColor: "#24262e",
       textStyle: { color: "#e6e9f0" },
-      formatter: (p) => `${p.name}: ${p.value > 0 ? "+" : ""}$${fmt(p.value, 0)} (${p.percent}% of gross)`,
+      // p.value is the ABSOLUTE pnl (donut sizes by magnitude) — carry the
+      // real sign on each slice so losses don't render as "+$".
+      formatter: (p) => {
+        const v = (p.data && p.data.pnl != null) ? p.data.pnl : p.value;
+        return `${p.name}: ${v >= 0 ? "+" : "−"}$${fmt(Math.abs(v), 0)} (${p.percent}% of gross)`;
+      },
     },
     title: {
       text: `${total >= 0 ? "+" : "−"}$${fmt(Math.abs(total), 0)}`,
@@ -474,6 +620,7 @@ function renderPnlDonut(summary) {
       data: rows.map((r) => ({
         name: symOf(r.symbol),
         value: Math.abs(r.pnl),
+        pnl: r.pnl,                            // real sign for the tooltip
         itemStyle: { color: r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c" },
       })),
     }],
@@ -1734,11 +1881,14 @@ ordPicker = createAssetPicker({
   onSelect: (sym) => { state.ordSymbol = sym; loadOrdChart(); },
 });
 bindOrdTfPills();
+bindTradeRange();
+startLivePolling();
 loadPortfolio();
 loadWatchlist();
 loadSignals();
 loadOrders();
 loadBotStatus();
+loadLiveTrades();
 setInterval(loadPortfolio, 60000);
 setInterval(loadWatchlist, 120000);
 setInterval(loadSignals, 60000);
