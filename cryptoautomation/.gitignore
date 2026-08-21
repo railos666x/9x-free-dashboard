@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Data + local files (DB, logs, optimizer cache, exchange keys)
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# Local editor config (never commit)
+.vscode/
+
+# Database snapshots (scripts/backup_db.py)
+backups/
+
+# Streamlit
+.streamlit/
+
+# OS
+Thumbs.db
+.DS_Store

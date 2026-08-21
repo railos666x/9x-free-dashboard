@@ -8,9 +8,11 @@ from Binance + news from RSS) run automatically as daemon threads.
 Run:
     python server.py              # starts everything — no extra terminals
     python server.py --no-live    # serve only, skip live data fetching
+    python server.py --reload     # dev: auto-restart on backend/dashboard edits
 """
 
 import math
+import os
 import sys
 import time
 import threading
@@ -33,6 +35,13 @@ WEB = ROOT / "web"
 DASHBOARD = WEB / "dashboard"
 
 app = FastAPI(title="cryptoautomation", version="0.3.0")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """Return an empty 204 to suppress browser favicon 404s."""
+    from fastapi.responses import Response
+    return Response(status_code=204)
 
 # Serve the dashboard's static assets (css / js) at /dash-assets
 if DASHBOARD.exists():
@@ -67,6 +76,18 @@ def _clean(v):
 
 def _series(df, col):
     return [_clean(v) for v in df[col]]
+
+
+def _broker_sources() -> list[str]:
+    """Resolve the active broker(s) to the source tag(s) used in the orders
+    table. In `hybrid` mode orders are journaled under their actual broker
+    (`mt5` / `binance`) — see execution._actual_broker_for — so filtering by
+    the literal `config.EXECUTION_BROKER` ('hybrid') returns nothing. This
+    expands the filter to every concrete broker the current config routes to.
+    """
+    if config.EXECUTION_BROKER == "hybrid":
+        return ["mt5", "binance"]
+    return [config.EXECUTION_BROKER]
 
 
 # ----------------------------------------------------------------------
@@ -185,6 +206,155 @@ def news_stats(days: int = 7):
     return database.news_verdict_stats(conn, days=min(days, 30))
 
 
+@app.get("/api/news/analytics")
+def news_analytics(limit: int = 25):
+    """Structured per-asset news analytics from the Groq analyst: sentiment
+    score (-100..100), confidence, impact horizon, driving headlines — the
+    algorithmic-consumption view of the news (see news_analyst.py)."""
+    from news_analyst import analyze_market, fetch_headlines
+    conn = database.connect()
+    try:
+        review = analyze_market(conn, limit=min(limit, 60))
+    except Exception as e:
+        return {"ok": False, "error": str(e), "coins": []}
+    if not review:
+        return {"ok": False,
+                "error": "Groq analyst unavailable (no GROQ_API_KEY, rate-limited, or no news)",
+                "coins": []}
+    return {"ok": True, "mode": review.get("mode"), "model": review.get("model"),
+            "market": review.get("market"), "stories": review.get("stories"),
+            "coins": review.get("coins", []),
+            "headlines": [h["title"] for h in fetch_headlines(conn, limit=8)]}
+
+
+@app.get("/api/news/analyze")
+def news_analyze(headline: str = "", content: str = "", symbol: str = "",
+                 url: str = ""):
+    """Agent 1 — News & Catalyst Sentiment: score one headline/article for
+    structural price impact (sentiment, impact score, black-swan flag,
+    duration, core catalyst). The answer is journaled for the trade
+    explainer. Returns {ok, agent, result} or {ok: False} when off/failed.
+
+    When `url` is given and `content` is empty, the article is scraped
+    with Firecrawl (web_scraper.get_article — cached) so the agent reasons
+    over the full article, not the bare headline.
+    """
+    import ai_agents
+    import web_scraper
+    conn = database.connect()
+    if url and not content:
+        article = web_scraper.get_article(conn, url)
+        if article:
+            content = article.get("content") or ""
+            headline = headline or article.get("title") or ""
+        else:
+            return {"ok": False,
+                    "error": "article scrape failed (no FIRECRAWL_API_KEY, out of credits, or unreachable)"}
+    try:
+        result = ai_agents.agent_news_sentiment(headline, content,
+                                                conn=conn, symbol=symbol)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not result:
+        return {"ok": False, "error": "agent unavailable (no GROQ_API_KEY / AI_AGENTS_ENABLED=false / unparseable)"}
+    return {"ok": True, "agent": "news_sentiment", "result": result,
+            "scraped": bool(url and content)}
+
+
+@app.get("/api/news/article")
+def news_article(url: str = ""):
+    """Scrape one article URL to clean markdown (Firecrawl, cached 24h).
+    Returns {ok, title, content} or {ok: False} when scraping is off /
+    fails. The raw material for the news agents."""
+    import web_scraper
+    if not url:
+        return {"ok": False, "error": "url parameter is required"}
+    conn = database.connect()
+    try:
+        article = web_scraper.get_article(conn, url)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not article:
+        return {"ok": False,
+                "error": "scrape failed (no FIRECRAWL_API_KEY, out of credits, or unreachable)"}
+    return {"ok": True, "title": article["title"],
+            "content": article["content"], "chars": len(article["content"])}
+
+
+@app.get("/api/portfolio/analyze")
+def portfolio_analyze(symbol: str = "BTC/USDT", catalyst: str = ""):
+    """Agent 2 — Deep Research & HODL Portfolio: given a detected catalyst
+    for `symbol`, decide ACCUMULATE_AND_HOLD / TRADE_ONLY / AVOID with a
+    confidence percentage. Journaled under ai_analyses(hold_research)."""
+    import ai_agents
+    conn = database.connect()
+    try:
+        result = ai_agents.agent_hold_research(symbol, catalyst, conn=conn)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not result:
+        return {"ok": False, "error": "agent unavailable (no GROQ_API_KEY / AI_AGENTS_ENABLED=false)"}
+    return {"ok": True, "agent": "hold_research", "result": result}
+
+
+@app.get("/api/trade/verify")
+def trade_verify(symbol: str = "BTC/USDT", direction: str = "LONG"):
+    """Agent 3 — Price Action & Chart Confluence: verify a news-driven
+    trade against the live chart (price, 1h change, S/R, news sentiment).
+    Returns {ok, result} where result.is_valid_setup tells the caller
+    whether to take the trade, plus entry_strategy and a stop-loss."""
+    import ai_agents
+    conn = database.connect()
+    try:
+        result = ai_agents.agent_chart_confluence(
+            conn, symbol, direction, force=True)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not result:
+        return {"ok": False, "error": "agent unavailable (no GROQ_API_KEY / AI_AGENTS_ENABLED=false / no candles)"}
+    return {"ok": True, "agent": "chart_confluence", "result": result}
+
+
+@app.get("/api/portfolio/holds")
+def portfolio_holds(limit: int = 20, agent: str = None):
+    """Recent AI agent journal: every news-sentiment / hold-research /
+    chart-confluence answer, newest first — the "why" behind agent-driven
+    decisions (see ai_agents.py + docs/math_system/07-ai-agents.md)."""
+    conn = database.connect()
+    rows = database.load_ai_analyses(conn, agent=agent or None,
+                                     limit=min(limit, 200))
+    return {"count": len(rows), "analyses": rows}
+
+
+@app.get("/api/tutor")
+def tutor(topic: str = None):
+    """Educational layer: list every topic, or the full explanation of one
+    (market_order, leverage, slippage, atr_volatility, … see tutor.py)."""
+    import tutor
+    if topic:
+        t = tutor.explain(topic)
+        if not t:
+            return {"ok": False, "error": f"unknown topic: {topic}",
+                    "topics": [x["topic"] for x in tutor.list_topics()]}
+        return {"ok": True, **t}
+    return {"ok": True, "topics": tutor.list_topics()}
+
+
+@app.get("/api/tutor/trade")
+def tutor_trade(order_id: int = None):
+    """Why was this trade taken (or skipped)? Explain a journal order from
+    its recorded reasons, or the held-back reasoning from the last cycle."""
+    import tutor
+    conn = database.connect()
+    if order_id:
+        order = next((o for o in database.load_orders(conn, limit=2000)
+                      if o.get("id") == order_id), None)
+        return tutor.explain_trade(order)
+    # No id: explain the last bot cycle's executed/held mix.
+    summary = _bot_last_cycle.get("summary")
+    return tutor.explain_last_cycle(summary)
+
+
 @app.get("/api/macro")
 def macro(limit: int = 250):
     """Macro asset charts (gold, S&P 500) from the `macro` table."""
@@ -289,8 +459,14 @@ RECONCILE_THROTTLE = 15.0  # seconds between auto-reconciles (matches the 15s jo
 @app.get("/api/orders")
 def orders(status: str = None, limit: int = 100, detail: int = 0,
            from_: str = Query(None, alias="from"),
-           to: str = Query(None, alias="to")):
-    """The trade journal: every order the bot has placed (or dry-run).
+           to: str = Query(None, alias="to"),
+           exit_from: str = Query(None, alias="exitFrom"),
+           exit_to: str = Query(None, alias="exitTo"),
+           source: str = Query(None)):
+    """The trade journal: every order the bot has placed (or dry-run) for
+    the CURRENT broker's account. Old accounts' trades (e.g. the retired
+    Alpaca rows after switching to Exness/MT5) are hidden by default to
+    avoid confusion — pass source=all to see every account's rows.
 
     detail=1 enriches each row with current price / market value /
     unrealized PnL and a sparkline of the last 24 1h closes, plus a
@@ -298,8 +474,11 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
     auto-reconciled (throttled to once per 30s) so the journal mirrors
     the broker without a manual refresh.
 
-    `from` / `to` (dates or ISO datetimes) filter by created-at window,
-    so the donut + summary reflect any period (today / week / custom).
+    `from` / `to` (dates or ISO datetimes) filter by created-at window.
+    `exitFrom` / `exitTo` filter by EXIT time — the correct dimension for
+    a "closed trades period": combine with status=closed to see exactly
+    the trades that closed in the window (open rows have no exit_time and
+    drop out automatically).
     """
     conn = database.connect()
     global _last_reconcile
@@ -311,9 +490,31 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
         except Exception:
             pass  # reconciliation is best-effort on reads
 
-    orders_list = database.load_orders(conn, status=status or None,
-                                       created_from=from_, created_to=to,
-                                       limit=min(limit, 1000))
+    # Journal views default to the CURRENT broker so a retired account's
+    # trades never resurface on the dashboard; source=all overrides.
+    # In hybrid mode, orders are journaled under their concrete broker
+    # (mt5/binance) — collect both so the dashboard shows them.
+    src = None if (source or "") == "all" else (source or _broker_sources())
+    if isinstance(src, list):
+        # load_orders takes a single source filter — OR-union the rows.
+        orders_list = []
+        seen_ids = set()
+        for s in src:
+            for o in database.load_orders(conn, status=status or None, source=s,
+                                          created_from=from_, created_to=to,
+                                          exit_from=exit_from, exit_to=exit_to,
+                                          limit=min(limit, 1000)):
+                if o["id"] not in seen_ids:
+                    seen_ids.add(o["id"])
+                    orders_list.append(o)
+        # Re-sort newest-first by id (load_orders is DESC per source already).
+        orders_list.sort(key=lambda o: o["id"], reverse=True)
+        orders_list = orders_list[:min(limit, 1000)]
+    else:
+        orders_list = database.load_orders(conn, status=status or None, source=src,
+                                           created_from=from_, created_to=to,
+                                           exit_from=exit_from, exit_to=exit_to,
+                                           limit=min(limit, 1000))
     if not detail:
         return {"orders": orders_list}
 
@@ -348,19 +549,41 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
             row["unrealized_pnl"] = None
         enriched.append(row)
 
-    # ── Alpaca: blend the broker's real-time marks so the journal donut
+    # ── Alpaca/MT5: blend the broker's real-time marks so the journal donut
     # matches the live account. Journal marks use 1h-candle closes (only
-    # change hourly — the donut looks "stuck"); Alpaca's per-position
+    # change hourly — the donut looks "stuck"); broker's per-position
     # unrealized PnL is marked continuously and also covers positions that
     # were opened outside the bot. Falls back to journal marks when the
     # account is unreachable.
     acct_positions: dict[str, dict] = {}
-    if config.EXECUTION_BROKER == "alpaca":
+    broker_name = config.EXECUTION_BROKER
+    if broker_name == "alpaca":
         try:
             import portfolio as pf
             acct = pf._alpaca_account()
             if acct:
                 acct_positions = acct.get("positions") or {}
+        except Exception:
+            acct_positions = {}
+    elif broker_name in ("mt5", "hybrid"):
+        # Fetch MT5 account positions (includes manually opened trades)
+        try:
+            import execution
+            broker = execution.get_broker()
+            if broker_name == "hybrid":
+                # For hybrid, get MT5 broker specifically
+                mt5_broker = broker._mt5
+            else:
+                mt5_broker = broker
+            positions = mt5_broker.fetch_positions()
+            # Convert to dict format expected by the blending logic
+            for pos in positions:
+                sym = pos.get("symbol")
+                if sym:
+                    acct_positions[sym] = {
+                        "unrealized_pl": float(pos.get("unrealized_pl") or pos.get("unrealized_pnl") or 0),
+                        "market_value": float(pos.get("market_value") or 0),
+                    }
         except Exception:
             acct_positions = {}
     if acct_positions:
@@ -386,7 +609,7 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
     by_sym: dict[str, dict] = {}
     for r in enriched:
         e = by_sym.setdefault(r["symbol"],
-                              {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0})
+                              {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0, "source": r.get("source", "")})
         if r.get("status") == "closed":
             e["realized"] += float(r.get("pnl") or 0)
         if r.get("status") in ("filled", "open"):
@@ -396,9 +619,33 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
     # donut, otherwise the centre total wouldn't match the slices.
     for sym, pos in acct_positions.items():
         e = by_sym.setdefault(sym,
-                              {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0})
+                              {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0, "source": "mt5"})
         e["unrealized"] += float(pos.get("unrealized_pl") or 0)
         e["market_value"] += float(pos.get("market_value") or 0)
+    
+    # Account-only closed deals (closed outside the bot) also belong in the
+    # donut to show complete account history.
+    acct_deals = []
+    if broker_name in ("mt5", "hybrid"):
+        try:
+            import execution
+            broker = execution.get_broker()
+            if broker_name == "hybrid":
+                mt5_broker = broker._mt5
+            else:
+                mt5_broker = broker
+            # Fetch closed deals from last 30 days
+            acct_deals = mt5_broker.fetch_deals(days=30)
+        except Exception:
+            acct_deals = []
+    
+    # Add closed deals to the aggregation
+    for deal in acct_deals:
+        sym = deal.get("symbol")
+        if sym:
+            e = by_sym.setdefault(sym,
+                                  {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0, "source": "mt5"})
+            e["realized"] += float(deal.get("pnl") or 0)
     gross = sum(abs(e["realized"] + e["unrealized"]) for e in by_sym.values()) or 1.0
     by_symbol = []
     for sym, e in by_sym.items():
@@ -410,6 +657,7 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
             "unrealized": round(e["unrealized"], 2),
             "market_value": round(e["market_value"], 2),
             "share": round(abs(pnl) / gross * 100, 1),
+            "source": e.get("source", ""),
         })
     by_symbol.sort(key=lambda r: abs(r["pnl"]), reverse=True)
 
@@ -429,26 +677,71 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
 
 @app.get("/api/positions")
 def positions():
-    """LIVE trades snapshot — open/filled journal rows with a fresh price
-    and unrealized PnL. Deliberately lean (no sparklines, no heavy
-    enrichment) so the dashboard can poll it fast; broker-side marks
-    (Alpaca) are blended when available.
+    """LIVE trades snapshot — open/filled journal rows for the CURRENT
+    broker's account with a fresh price and unrealized PnL. Deliberately
+    lean (no sparklines, no heavy enrichment) so the dashboard can poll it
+    fast; broker-side marks (Alpaca) are blended when available. Old
+    accounts' rows are excluded (source = current broker).
     """
     conn = database.connect()
-    rows = [o for o in database.load_orders(conn, limit=500)
-            if o.get("status") in ("filled", "open")]
+    sources = _broker_sources()
+    rows = []
+    seen_ids = set()
+    for s in sources:
+        for o in database.load_orders(conn, source=s, limit=500):
+            if o["id"] not in seen_ids:
+                seen_ids.add(o["id"])
+                if o.get("status") in ("filled", "open"):
+                    rows.append(o)
 
     acct_positions = {}
-    if config.EXECUTION_BROKER == "alpaca":
+    acct_positions_list = []  # list of all positions (supports multiple per symbol)
+    broker_name = config.EXECUTION_BROKER
+    if broker_name == "alpaca":
         try:
             import portfolio as pf
             acct = pf._alpaca_account()
             if acct:
                 acct_positions = acct.get("positions") or {}
+                # Alpaca doesn't have positions_list yet, convert from dict
+                for sym, pos in acct_positions.items():
+                    acct_positions_list.append({**pos, "symbol": sym})
         except Exception:
             acct_positions = {}
+            acct_positions_list = []
+    elif broker_name in ("mt5", "hybrid"):
+        try:
+            import execution
+            broker = execution.get_broker()
+            if broker_name == "hybrid":
+                # For hybrid, get MT5 broker specifically
+                mt5_broker = broker._mt5
+            else:
+                mt5_broker = broker
+            # Fetch positions from MT5
+            positions = mt5_broker.fetch_positions()
+            # Convert to the format expected by the blending logic
+            for pos in positions:
+                sym = pos.get("symbol")
+                if sym:
+                    # Add to positions_list (supports multiple positions per symbol)
+                    acct_positions_list.append({
+                        "symbol": sym,
+                        "side": pos.get("side", "long").lower() if pos.get("side") else "long",
+                        "qty": pos.get("qty") or pos.get("volume"),
+                        "entry": pos.get("entry") or pos.get("price") or pos.get("open_price"),
+                        "current": pos.get("current") or pos.get("current_price"),
+                        "unrealized_pl": float(pos.get("unrealized_pl") or pos.get("unrealized_pnl") or pos.get("profit") or 0),
+                    })
+                    # Also add to dict for single-position-per-symbol lookup
+                    if sym not in acct_positions:
+                        acct_positions[sym] = acct_positions_list[-1]
+        except Exception:
+            acct_positions = {}
+            acct_positions_list = []
 
     out = []
+    seen_symbols = set()
     for o in rows:
         df = database.load_candles(conn, o["symbol"], "1h", limit=3)
         cur = float(df["close"].iloc[-1]) if not df.empty else None
@@ -472,6 +765,36 @@ def positions():
             "unrealized_pnl": round(unreal, 2) if unreal is not None else None,
             "created_at": o.get("created_at"),
         })
+        seen_symbols.add(o["symbol"])
+    
+    # Add live broker positions that aren't in the journal (manual trades)
+    # Use positions_list to support multiple positions per symbol
+    seen_entries = set()
+    for o in rows:
+        seen_entries.add((o["symbol"], o.get("entry")))
+    
+    for pos in acct_positions_list:
+        sym = pos.get("symbol")
+        entry = pos.get("entry")
+        # Skip if this exact position (symbol + entry) is already in journal
+        if (sym, entry) in seen_entries:
+            continue
+        df = database.load_candles(conn, sym, "1h", limit=3)
+        cur = float(df["close"].iloc[-1]) if not df.empty else pos.get("current")
+        out.append({
+            "symbol": sym,
+            "side": pos.get("side", "long"),
+            "qty": pos.get("qty"),
+            "entry": entry,
+            "fill_price": entry,
+            "stop_loss": None,
+            "take_profit": None,
+            "current_price": cur,
+            "unrealized_pnl": pos.get("unrealized_pl"),
+            "created_at": None,
+            "source": "live",
+        })
+    
     return {"positions": out, "count": len(out),
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
@@ -526,9 +849,12 @@ def bot_loop_control(payload: dict = None):
 
 @app.post("/api/bot/source")
 def bot_source(payload: dict = None):
-    """Switch signal source A (math_engine | strategy) from the dashboard.
+    """Set the signal source from the dashboard.
 
-    Only allowed while the bot loop is STOPPED, so a running bot is never
+    Since 2026-08-17 the bot trades ONLY on the AI/news analyst
+    ("ai_news"); the candle-factor engines (math_engine / strategy /
+    hybrid) are retired from the trade path and are refused here. Only
+    allowed while the bot loop is STOPPED, so a running bot is never
     yanked mid-cycle. Takes effect immediately (next cycle) and is
     persisted to .env so a restart keeps the choice.
     """
@@ -537,9 +863,10 @@ def bot_source(payload: dict = None):
                 "error": "bot is running — stop it first (Auto loop → Stop)"}
     payload = payload or {}
     source = str(payload.get("source") or "").strip().lower()
-    if source not in ("math_engine", "strategy", "hybrid"):
+    if source != "ai_news":
         return {"ok": False,
-                "error": "source must be 'math_engine', 'strategy' or 'hybrid'"}
+                "error": "legacy engines (math_engine/strategy/hybrid) are retired from "
+                          "trading — the bot trades on the AI/news analyst only (ai_news)"}
     config.SIGNAL_SOURCE_A = source
     try:
         _write_env_key("SIGNAL_SOURCE_A", source)
@@ -571,16 +898,287 @@ def bot_status():
         "signal_source_a": config.SIGNAL_SOURCE_A,
         "arbitration_min_sources": config.ARBITRATION_MIN_SOURCES,
         "arbitration_min_confidence": config.ARBITRATION_MIN_CONFIDENCE,
-        "live_single_source_blocked": (config.ARBITRATION_MIN_SOURCES < 2
-                                        and not config.ALLOW_LIVE_SINGLE_SOURCE),
+        "live_single_source_blocked": (config.SIGNAL_SOURCE_A
+                                         in ("math_engine", "strategy", "hybrid")
+                                         and config.ARBITRATION_MIN_SOURCES < 2
+                                         and not config.ALLOW_LIVE_SINGLE_SOURCE),
         "auto_loop": config.BOT_AUTO_LOOP,
         "auto_loop_running": bool(_bot_thread is not None and _bot_thread.is_alive()),
         "auto_loop_live": _auto_loop_live(),
         "last_cycle": _bot_last_cycle["summary"],
         "last_run_at": _bot_last_cycle["at"],
-        "open_orders": len([o for o in database.load_orders(database.connect(),
+        "open_orders": len([o for s in _broker_sources() for o in database.load_orders(database.connect(),
+                                                            source=s,
                                                             limit=1000)
                             if o.get("status") in ("filled", "open")]),
+        # 2026-08-17 upgrade: AI mode + confirmation layer status
+        "ai_mode": config.AI_MODE,
+        "ai_confirm_enabled": config.AI_CONFIRM_ENABLED,
+        "dxy_filter_enabled": config.DXY_FILTER_ENABLED,
+        "smc_enabled": config.SMC_ENABLED,
+        "calendar_guard_enabled": config.CALENDAR_GUARD_ENABLED,
+        "circuit_breaker_enabled": config.CIRCUIT_BREAKER_ENABLED,
+        "trailing_stop_enabled": config.TRAILING_STOP_ENABLED,
+    }
+
+
+# ----------------------------------------------------------------------
+# Dashboard stats (TradinJournal-style overview cards + radar + heatmap)
+# ----------------------------------------------------------------------
+@app.get("/api/trade-stats")
+def trade_stats():
+    """Aggregated trading stats for the TradinJournal-style dashboard:
+    today's P&L, total P&L, current streak, win rate, profit factor,
+    daily activity for the calendar heatmap, and radar scores."""
+    from datetime import datetime, timedelta, timezone
+    conn = database.connect()
+    sources = _broker_sources()
+    orders = []
+    seen_ids = set()
+    for s in sources:
+        for o in database.load_orders(conn, source=s, limit=2000):
+            if o["id"] not in seen_ids:
+                seen_ids.add(o["id"])
+                orders.append(o)
+    closed = [o for o in orders if o.get("status") == "closed" and o.get("pnl") is not None]
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    today_pnl = 0.0
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+    total_win_amount = 0.0
+    total_loss_amount = 0.0
+    daily_pnl = {}  # date -> pnl sum
+    biggest_win = 0.0
+    best_day_pnl = 0.0
+
+    for o in closed:
+        pnl = float(o["pnl"])
+        total_pnl += pnl
+        if pnl > 0:
+            wins += 1
+            total_win_amount += pnl
+            biggest_win = max(biggest_win, pnl)
+        elif pnl < 0:
+            losses += 1
+            total_loss_amount += abs(pnl)
+        # Date key (exit_time or created_at)
+        exit_time = o.get("exit_time") or o.get("created_at") or ""
+        day = exit_time[:10] if exit_time else ""
+        if day:
+            daily_pnl[day] = daily_pnl.get(day, 0.0) + pnl
+        # Today's PnL
+        if day == today_str:
+            today_pnl += pnl
+
+    # Best day
+    if daily_pnl:
+        best_day_pnl = max(daily_pnl.values())
+
+    total_trades = wins + losses
+    win_rate = round(wins / total_trades * 100, 1) if total_trades else 0.0
+    avg_win = round(total_win_amount / wins, 2) if wins else 0.0
+    avg_loss = round(total_loss_amount / losses, 2) if losses else 0.0
+    profit_factor = round(total_win_amount / total_loss_amount, 2) if total_loss_amount > 0 else 99.99
+
+    # Streak calculation (most recent trades first)
+    sorted_closed = sorted(closed, key=lambda o: o.get("exit_time") or o.get("created_at") or "", reverse=True)
+    current_streak = 0
+    streak_type = None
+    longest_win_streak = 0
+    longest_loss_streak = 0
+    temp_streak = 0
+    temp_type = None
+    for o in sorted_closed:
+        pnl = float(o["pnl"])
+        is_win = pnl > 0
+        st = "win" if is_win else ("loss" if pnl < 0 else None)
+        if streak_type is None and st:
+            streak_type = st
+            current_streak = 1
+        elif st == streak_type:
+            current_streak += 1
+        elif st is not None:
+            break
+        # Longest streak tracking
+        if st == temp_type:
+            temp_streak += 1
+        else:
+            if temp_type == "win":
+                longest_win_streak = max(longest_win_streak, temp_streak)
+            elif temp_type == "loss":
+                longest_loss_streak = max(longest_loss_streak, temp_streak)
+            temp_streak = 1
+            temp_type = st
+    if temp_type == "win":
+        longest_win_streak = max(longest_win_streak, temp_streak)
+    elif temp_type == "loss":
+        longest_loss_streak = max(longest_loss_streak, temp_streak)
+    longest_streak = max(longest_win_streak, longest_loss_streak)
+
+    trading_days = len(daily_pnl)
+
+    # Radar scores (0-100)
+    radar = {
+        "Win Rate": min(win_rate, 100),
+        "Risk/Reward": min((avg_win / avg_loss * 50) if avg_loss > 0 else 0, 100),
+        "Consistency": min(100 - (abs(total_pnl) / max(total_win_amount, 1) * 100) if total_pnl < 0 else max(0, 100 - (total_loss_amount / max(total_win_amount, 1) * 100)), 100),
+        "Profitability": min(max(0, profit_factor * 30), 100),
+        "Discipline": min(total_trades * 2, 100) if total_trades < 50 else 100,
+        "Recovery": min(max(0, 100 - abs(total_pnl) / max(total_win_amount, 1) * 50), 100),
+    }
+    trade_score = round(sum(radar.values()) / len(radar))
+
+    # Calendar heatmap data (last 180 days)
+    cal_start = (datetime.now(timezone.utc) - timedelta(days=180)).strftime("%Y-%m-%d")
+    heatmap = []
+    for day in sorted(daily_pnl.keys()):
+        if day >= cal_start:
+            heatmap.append({"date": day, "pnl": round(daily_pnl[day], 2)})
+
+    return {
+        "today_pnl": round(today_pnl, 2),
+        "total_pnl": round(total_pnl, 2),
+        "balance": round(config.INITIAL_CAPITAL + total_pnl, 2),
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "biggest_win": round(biggest_win, 2),
+        "best_day": round(best_day_pnl, 2),
+        "current_streak": current_streak,
+        "streak_type": streak_type or "none",
+        "longest_streak": longest_streak,
+        "trading_days": trading_days,
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "trade_score": trade_score,
+        "radar": radar,
+        "heatmap": heatmap,
+        "period": "all",
+    }
+
+
+# ----------------------------------------------------------------------
+# Test AI trades + feedback loop (2026-08-17 upgrade)
+# ----------------------------------------------------------------------
+@app.get("/api/test-trades")
+def test_trades(limit: int = 100, status: str = None):
+    """AI paper-trading journal: test trades with full confirmation metadata.
+    Separate from the live orders table — used when AI_MODE=test."""
+    conn = database.connect()
+    trades = database.load_test_trades(conn, limit=min(limit, 500),
+                                       status=status or None)
+    stats = database.test_trade_stats(conn)
+    return {"trades": trades, "stats": stats}
+
+
+@app.get("/api/test-portfolio")
+def test_portfolio():
+    """Test AI portfolio summary: win rate, PnL, breakdown by regime/session."""
+    import test_ai
+    conn = database.connect()
+    return test_ai.test_portfolio_summary(conn)
+
+
+@app.get("/api/circuit-breaker")
+def circuit_breaker_status():
+    """Tiered circuit breaker state: current level, risk multiplier,
+    drawdown, consecutive losses, strategy health."""
+    import circuit_breaker
+    conn = database.connect()
+    state = circuit_breaker.current_risk_state(conn)
+    health = circuit_breaker.strategy_health_check(conn)
+    exposure = circuit_breaker.correlation_exposure(conn)
+    return {"state": state, "health": health, "exposure": exposure}
+
+
+@app.get("/api/feedback/calibration")
+def feedback_calibration(days: int = 30):
+    """Feedback loop calibration report: win rate by factor (regime, session,
+    confirm_score, dxy_score, smc_score) with recommendations."""
+    import ai_feedback
+    conn = database.connect()
+    return ai_feedback.calibration_report(conn, days=min(days, 90))
+
+
+@app.get("/api/feedback/thresholds")
+def feedback_thresholds():
+    """Adaptive threshold suggestions based on actual trade outcomes.
+    Suggests adjustments to sentiment, confidence, confirm score, and
+    regime/session blocking based on what's actually winning."""
+    import ai_feedback
+    conn = database.connect()
+    return ai_feedback.adaptive_thresholds(conn)
+
+
+@app.get("/api/ai-layers")
+def ai_layers_status():
+    """Status of all 6 confirmation layers: enabled/disabled, current
+    settings, and live state for the dashboard's pipeline visualization."""
+    import ai_confirm
+    conn = database.connect()
+    # Current session
+    session_info = ai_confirm.current_session()
+    session_mult = ai_confirm.session_multiplier()
+    # DXY state (best effort)
+    dxy_info = {"available": False}
+    try:
+        import dxy_filter
+        dxy_state = dxy_filter.get_dxy_state(conn)
+        dxy_info = {"available": True, **dxy_state}
+    except Exception:
+        pass
+    return {
+        "ai_mode": config.AI_MODE,
+        "layers": {
+            "news_sentiment": {
+                "enabled": config.NEWS_ANALYST_ENABLED,
+                "sentiment_long": config.AI_SENTIMENT_LONG,
+                "sentiment_short": config.AI_SENTIMENT_SHORT,
+                "confidence_floor": config.AI_CONFIDENCE_FLOOR,
+            },
+            "freshness": {
+                "enabled": True,
+                "max_age_hours": config.NEWS_MAX_AGE_HOURS,
+                "min_fresh": config.NEWS_MIN_FRESH_HEADLINES,
+            },
+            "calendar_guard": {
+                "enabled": config.CALENDAR_GUARD_ENABLED,
+                "high_impact_block_min": config.CALENDAR_HIGH_IMPACT_BLOCK_MIN,
+            },
+            "ai_confirm": {
+                "enabled": config.AI_CONFIRM_ENABLED,
+                "min_score": config.AI_CONFIRM_MIN_SCORE,
+                "block_volatile": config.AI_REGIME_BLOCK_VOLATILE,
+                "mtf_enabled": config.AI_MTF_ENABLED,
+            },
+            "dxy_filter": {
+                "enabled": config.DXY_FILTER_ENABLED,
+                "block_on_contradiction": config.DXY_BLOCK_ON_CONTRADICTION,
+                "state": dxy_info,
+            },
+            "smart_money": {
+                "enabled": config.SMC_ENABLED,
+                "min_score": config.SMC_MIN_SCORE,
+            },
+        },
+        "session": {
+            "enabled": config.SESSION_AWARE_ENABLED,
+            "current": session_info,
+            "multiplier": session_mult,
+        },
+        "risk": {
+            "circuit_breaker": config.CIRCUIT_BREAKER_ENABLED,
+            "trailing_stop": config.TRAILING_STOP_ENABLED,
+            "trail_activate_atr": config.TRAIL_ACTIVATE_ATR,
+            "trail_distance_atr": config.TRAIL_DISTANCE_ATR,
+            "partial_tp": config.PARTIAL_TP_ENABLED,
+            "max_hold_bars": config.TP_MAX_HOLD_BARS,
+        },
     }
 
 
@@ -762,13 +1360,25 @@ def _start_live_threads() -> None:
             pass
         macro_data.macro_loop(conn)
 
+    def _exness_candle_loop():
+        # Keep the bot's Exness 1h candle feed fresh (the macro loop only
+        # refreshes the `macro` table — the bot's SMC/data gates read the
+        # `candles` table, which went 1-4 days stale on 2026-08-18 and
+        # blocked every signal until fetch_all.py was run manually).
+        import macro_data
+        conn = database.connect()
+        database.init_db(conn)
+        macro_data.exness_candle_loop(conn)
+
     t1 = threading.Thread(target=_prices, daemon=True, name="price-collector")
     t2 = threading.Thread(target=_news_loop, daemon=True, name="news-fetcher")
     t3 = threading.Thread(target=_macro_loop, daemon=True, name="macro-fetcher")
+    t4 = threading.Thread(target=_exness_candle_loop, daemon=True, name="exness-candles")
     t1.start()
     t2.start()
     t3.start()
-    print("  Live data threads started (prices + news + macro)")
+    t4.start()
+    print("  Live data threads started (prices + news + macro + exness candles)")
     if config.BOT_AUTO_LOOP:
         if _start_bot_loop():
             print("  Bot loop thread started"
@@ -777,8 +1387,80 @@ def _start_live_threads() -> None:
             print("  Bot loop already running")
 
 
+def _reload_supervisor() -> None:
+    """Dev-only: `python server.py --reload` runs the server as a child
+    process and restarts it whenever a backend/ or dashboard file changes.
+
+    uvicorn's own reloader is NOT used here: it serves the app from a
+    child process while the live-data/bot threads stay in the parent, so
+    a dashboard "Start loop" would spawn a SECOND bot loop on top of the
+    parent's (double orders on a live paper broker). A full process
+    restart keeps the server and its threads in one process per
+    generation, exactly what a code edit wants.
+    """
+    import subprocess
+
+    here = Path(__file__).resolve()
+    watched = sorted(
+        set([here])
+        | set(here.parent.glob("*.py"))
+        | set((ROOT / "web" / "dashboard").glob("*"))
+        | {ROOT / ".env"}  # key/config edits must restart too — a running
+        #                     server won't re-read .env until it respawns
+    )
+    watched = [p for p in watched if p.exists()]
+    snap = {p: (p.stat().st_mtime_ns, p.stat().st_size) for p in watched if p.exists()}
+
+    def spawn() -> subprocess.Popen:
+        env = {**os.environ, "CRYPTOAUTO_RELOAD_CHILD": "1"}
+        args = [a for a in sys.argv[1:] if a != "--reload"]
+        return subprocess.Popen([sys.executable, str(here)] + args, env=env)
+
+    child = spawn()
+    last_spawn = time.time()
+    print("  --reload: watching backend/ + web/dashboard — Ctrl+C to stop")
+    try:
+        while True:
+            time.sleep(1.0)
+            changed = [p for p in watched
+                       if p.exists()
+                       and (p.stat().st_mtime_ns, p.stat().st_size) != snap.get(p)]
+            if changed:
+                print(f"  --reload: {changed[0].name} changed — restarting…")
+                child.terminate()
+                child.wait()
+                snap = {p: (p.stat().st_mtime_ns, p.stat().st_size)
+                        for p in watched if p.exists()}
+                child = spawn()
+                last_spawn = time.time()
+                continue
+            if child.poll() is not None:
+                # Crash-loop guard: if the server died almost immediately
+                # (e.g. port already in use), don't respawn in a hot loop.
+                if time.time() - last_spawn < 3:
+                    print(f"  --reload: server exited fast (code {child.returncode}) "
+                          "— waiting before restart…")
+                    time.sleep(3)
+                else:
+                    print(f"  --reload: server exited (code {child.returncode}) — "
+                          "restarting…")
+                snap = {p: (p.stat().st_mtime_ns, p.stat().st_size)
+                        for p in watched if p.exists()}
+                child = spawn()
+                last_spawn = time.time()
+    except KeyboardInterrupt:
+        child.terminate()
+        child.wait()
+        print("\n  --reload: stopped.")
+
+
 if __name__ == "__main__":
     import uvicorn
+
+    reload = "--reload" in sys.argv
+    if reload and os.environ.get("CRYPTOAUTO_RELOAD_CHILD") != "1":
+        _reload_supervisor()
+        sys.exit(0)
 
     no_live = "--no-live" in sys.argv
     print("cryptoautomation terminal -> http://localhost:8501")

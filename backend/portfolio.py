@@ -100,6 +100,93 @@ def _latest_prices(conn, symbols: list[str]) -> dict[str, float]:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# MT5/Exness account + positions (the execution/trading account)
+# ──────────────────────────────────────────────────────────────────────
+
+def _mt5_account() -> dict | None:
+    """Snapshot the MT5/Exness trading account: balance, equity, free
+    margin and open positions (mapped to our BTC/USDT symbol format).
+    Returns None when the broker isn't configured / terminal is down."""
+    try:
+        from execution import MT5Broker, BrokerError
+        broker = MT5Broker()
+        info = broker.account_info()
+        positions = broker.fetch_positions()
+    except Exception:
+        return None
+
+    holdings = {}
+    unreal = 0.0
+    pos_map = {}   # symbol -> {qty, side, entry, current, unrealized_pl} (legacy, single position per symbol)
+    positions_list = []  # list of all positions (supports multiple per symbol)
+    for p in positions or []:
+        sym = str(p.get("symbol") or "")
+        qty = float(p.get("qty") or 0)
+        if abs(qty) < 1e-9:
+            continue
+        # MT5 name (EURUSD, XAUUSD, BTCUSD…) → our BTC/USDT style.
+        ours = _mt5_to_ours(sym)
+        if not ours:
+            continue
+        holdings[ours] = holdings.get(ours, 0) + abs(qty)
+        entry = p.get("entry")
+        current = p.get("current")
+        profit = p.get("profit")
+        # Calculate unrealized PnL if we have entry and current
+        if entry and current:
+            side = str(p.get("side") or "long")
+            if side == "long":
+                calc_unreal = (current - entry) * abs(qty)
+            else:
+                calc_unreal = (entry - current) * abs(qty)
+        elif profit is not None:
+            calc_unreal = profit
+        else:
+            calc_unreal = None
+        pos_data = {
+            "symbol": ours,
+            "qty": abs(qty),
+            "side": str(p.get("side") or "long"),
+            "entry": entry,
+            "current": current,
+            "unrealized_pl": calc_unreal,
+        }
+        positions_list.append(pos_data)
+        # Legacy pos_map for backward compatibility (last position wins)
+        pos_map[ours] = pos_data
+    balance = float(info.get("balance") or 0)
+    equity = float(info.get("equity") or 0)
+    if equity > 0:
+        holdings["USDT"] = round(equity, 2)  # pseudo-holding: account value priced 1.0
+    if not holdings and balance <= 0:
+        return None
+    return {
+        "holdings": holdings,
+        "positions": pos_map,
+        "positions_list": positions_list,  # all positions (supports multiple per symbol)
+        "unrealized_pl": unreal,
+        "equity": equity or balance,
+        "cash": float(info.get("margin_free") or 0),
+        "buying_power": float(info.get("margin_free") or 0),
+        "balance": balance,
+        "account_number": "",
+        "paper": True,
+    }
+
+
+_MT5_TO_OURS = {v: k for k, v in config.EXNESS_MT5_SYMBOLS.items()}
+
+def _mt5_to_ours(sym: str) -> str | None:
+    """MT5 symbol name → our BTC/USDT-style symbol (or None for unknown)."""
+    if sym in _MT5_TO_OURS:
+        return _MT5_TO_OURS[sym]
+    # MT5 base-quote pairs (EURUSD, BTCUSD, XAUUSD…): base/QUOTE → base/USDT
+    # is wrong for FX, but the dashboard prices from our candle table which
+    # stores EXNESS_SYMBOLS; keep the identity so lookups don't miss.
+    return sym
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Alpaca account + positions (the execution/trading account)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -235,8 +322,19 @@ def get_portfolio(conn) -> dict:
     holdings = dict(DEMO_HOLDINGS)
     account_meta = {}
 
-    # 1. Alpaca trading account (execution broker).
-    if config.EXECUTION_BROKER == "alpaca":
+    # 1. MT5/Exness trading account (execution broker).
+    if config.EXECUTION_BROKER == "mt5":
+        try:
+            mt = _mt5_account()
+        except Exception:
+            mt = None
+        if mt:
+            holdings = mt["holdings"]
+            mode = "mt5"
+            account_meta = mt
+
+    # 2. Alpaca trading account (execution broker).
+    if mode == "demo" and config.EXECUTION_BROKER == "alpaca":
         try:
             alp = _alpaca_account()
         except Exception:
@@ -246,7 +344,7 @@ def get_portfolio(conn) -> dict:
             mode = "alpaca"
             account_meta = alp
 
-    # 2. Binance exchange (explicitly connected via the modal).
+    # 3. Binance exchange (explicitly connected via the modal).
     if mode == "demo" and keys and keys.get("api_key"):
         try:
             ex = _signed_request(keys)
@@ -285,7 +383,8 @@ def get_portfolio(conn) -> dict:
 
     result = {
         "mode": mode,
-        "exchange_name": keys.get("name") if keys else None,
+        "exchange_name": ("MT5/Exness (demo)" if mode == "mt5"
+                           else keys.get("name") if keys else None),
         "total_usd": round(total, 2),
         "items": items,
         "distribution": distribution,
@@ -300,6 +399,17 @@ def get_portfolio(conn) -> dict:
             "unrealized_pl": account_meta.get("unrealized_pl") or 0.0,
             "account_pnl": account_meta.get("account_pnl"),
             "account_number": account_meta.get("account_number"),
+            "total_usd": round(account_meta.get("equity") or total, 2),
+        })
+    elif mode == "mt5":
+        result.update({
+            "exchange_name": "MT5/Exness (demo)",
+            "equity": round(account_meta.get("equity") or 0, 2),
+            "cash": round(account_meta.get("cash") or 0, 2),
+            "buying_power": round(account_meta.get("buying_power") or 0, 2),
+            "unrealized_pl": account_meta.get("unrealized_pl") or 0.0,
+            "account_pnl": None,
+            "account_number": account_meta.get("account_number") or "",
             "total_usd": round(account_meta.get("equity") or total, 2),
         })
     return result

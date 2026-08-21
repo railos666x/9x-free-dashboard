@@ -41,6 +41,17 @@ class Proposal:
     window: str = "1h"
     ts: float = field(default_factory=time.time)
     reasons: list[str] = field(default_factory=list)   # why this source says so
+    # Extended metadata from the 6-layer confirmation pipeline (2026-08-17):
+    regime: str | None = None
+    confirm_score: int = 0
+    dxy_score: int = 0
+    smc_score: int = 0
+    session: str | None = None
+    session_mult: float = 1.0
+    block_reasons: list[str] = field(default_factory=list)
+    # AI-suggested SL/TP percentages (2026-08-18):
+    stop_loss_pct: float = 0.0
+    take_profit_pct: float = 0.0
 
 
 @dataclass
@@ -56,6 +67,9 @@ class Intent:
     confidence: float
     intent_hash: str
     reasons: list[str] = field(default_factory=list)   # why the trade is taken
+    # AI-suggested SL/TP percentages (2026-08-18):
+    stop_loss_pct: float = 0.0
+    take_profit_pct: float = 0.0
 
 
 def proposal_from_signal_dict(d: dict, source: str = "math_engine",
@@ -76,6 +90,8 @@ def proposal_from_signal_dict(d: dict, source: str = "math_engine",
         source=source,
         window=window,
         reasons=reasons,
+        stop_loss_pct=float(d.get("stop_loss_pct") or 0.0),
+        take_profit_pct=float(d.get("take_profit_pct") or 0.0),
     )
 
 
@@ -172,6 +188,8 @@ def arbitrate(a: Proposal, b: Proposal, min_sources: int = 2,
             confidence=min(a_.confidence, b_.confidence),
             intent_hash=intent_hash(a_.symbol, direction, window),
             reasons=list(a_.reasons or []),
+            stop_loss_pct=a_.stop_loss_pct or b_.stop_loss_pct,
+            take_profit_pct=a_.take_profit_pct or b_.take_profit_pct,
         )
         for r in b_.reasons or []:
             if r not in intent.reasons:
@@ -190,4 +208,6 @@ def arbitrate(a: Proposal, b: Proposal, min_sources: int = 2,
         confidence=p.confidence,
         intent_hash=intent_hash(p.symbol, direction, window),
         reasons=list(p.reasons or []),
+        stop_loss_pct=p.stop_loss_pct,
+        take_profit_pct=p.take_profit_pct,
     )

@@ -1,21 +1,34 @@
 """
 cryptoautomation — Bot orchestrator.
 
-One bot cycle (`run_once`), matching the target architecture:
+One bot cycle (`run_once`), matching the AI/news architecture (since
+2026-08-17 — the old candle-factor sources are retired from trading):
 
-    data pipeline (SQLite candles)
-        → verification (data-quality gate)
-        → Source A (math engine signals) + Source B (proprietary signals)
-        → arbitrator (agreement gate + intent-hash dedup)
-        → verification (re-gate the intent against fresh data, incl. a
-          second-price cross-check when Alpaca keys are configured)
-        → execution (single broker path, journaled)
-        → SL/TP monitor (manage_open_positions) closes hits
+    data pipeline (SQLite candles + news feed)
+        -> verification (data-quality gate)
+        -> AI/news source: the Groq news analyst (news_analyst.signal_for)
+          6-layer confirmation pipeline:
+            1. Raw sentiment  2. Freshness  3. Calendar guard
+            4. AI confirm (regime+technical+session)
+            5. DXY master filter  6. Smart money confluence
+          the chart-confluence agent (ai_agents.gate_news_trade) verifies
+          each LONG/SHORT against price structure when AI_CONFLUENCE_GATE
+          is on
+        -> circuit breaker (tiered step-down: 5%/10%/15% DD)
+        -> arbitrator (single-source intent + intent-hash dedup)
+        -> verification (re-gate the intent against fresh data)
+        -> dual-mode execution:
+          AI_MODE=live -> real MT5/Exness trades via execution.py
+          AI_MODE=test -> paper trades in test_trades table (test_ai.py)
+        -> SL/TP monitor (manage_open_positions) closes hits
+
+The bot trades ONLY config.TRADING_UNIVERSE -- the Exness forex / metals /
+energy / indices instruments on MT5.
 
 Run:
     python bot.py                 # one full cycle, real execution (paper)
     python bot.py --dry-run       # journal intents without touching a broker
-    python bot.py --symbol BTC/USDT
+    python bot.py --symbol EUR/USD
     python bot.py loop [--dry-run]  # scheduled cycles every BOT_LOOP_SECONDS
 """
 
@@ -34,102 +47,81 @@ except Exception:
 
 import config
 import database
-import signals
 import verification
-from arbitrator import arbitrate, proposal_from_signal_dict, Proposal
+from arbitrator import arbitrate, Proposal
 import execution
-import proprietary_signals
 import market_data
-import reviewer
+
+# Token registry for unified symbol management
+try:
+    from . import token_registry
+except ImportError:
+    import token_registry
 
 
-def _strategy_proposals(conn) -> dict[str, Proposal]:
-    """Source A via the validated mean-reversion v2 (strategy.compute_signal,
-    imported, never edited) — full entry/SL/TP intents + filter diagnostics."""
-    import indicators
-    import strategy
+def _ai_news_proposals(conn, symbols: list[str]) -> dict[str, Proposal]:
+    """The ONLY trade source since 2026-08-17: the Groq news analyst.
+
+    news_analyst.signal_for(conn, symbol) runs the full 6-layer pipeline:
+        1. Raw sentiment  2. Freshness  3. Calendar guard
+        4. AI confirm (regime+technical+session)
+        5. DXY master filter  6. Smart money confluence
+    and returns LONG / SHORT / HOLD with all confirmation metadata.
+
+    When AI_CONFLUENCE_GATE is on, agent 3 (ai_agents.gate_news_trade)
+    verifies each LONG/SHORT against the live chart structure — DIVERGENCE
+    / TRAP setups are dropped before they become proposals.
+
+    Entry/SL/TP levels are filled by the executor (live price entry, ATR
+    stops) — or agent 3's calculated stop when the gate supplied one.
+    Returns {} when no LLM transport is configured (the bot then simply
+    holds everything; nothing else generates trades anymore)."""
+    if not config.NEWS_ANALYST_ENABLED or not config.llm_available():
+        return {}
+    import news_analyst
+    import ai_agents
+
     out = {}
-    for symbol in config.SYMBOLS:
+    for symbol in symbols:
         try:
-            df = indicators.add_all(
-                database.load_candles(conn, symbol, "1h", limit=300))
-            if df.empty or len(df) < 60:
-                continue
-            r = strategy.compute_signal(df)
-            if r["direction"] not in ("LONG", "SHORT"):
-                continue
-            reasons = []
-            if r.get("adx") is not None:
-                reasons.append(f"ADX={r['adx']:.1f} "
-                               f"({'ranging' if r['ranging'] else 'trending'})")
-            if r.get("z") is not None:
-                reasons.append(f"z={r['z']:.2f} (entry |z|≥2, SMA{strategy.DEFAULT_PARAMS.n})")
-            reasons.append("strategy v2 mean-reversion (validated backtest)")
-            out[symbol] = Proposal(
-                symbol=symbol, direction=r["direction"], confidence=55.0,
-                entry=r.get("entry"), stop_loss=r.get("stop_loss"),
-                take_profit=r.get("take_profit"),
-                source="strategy_v2", window="1h", reasons=reasons)
+            s = news_analyst.signal_for(conn, symbol)
         except Exception:
-            continue  # one bad symbol must not kill source A
+            continue  # one bad symbol must not kill the source
+        if s.get("action") not in ("LONG", "SHORT"):
+            continue
+        # Chart-confluence gate (agent 3) — opt-in, see config.
+        gate = ai_agents.gate_news_trade(conn, symbol, s["action"])
+        if not gate["pass"]:
+            continue  # chart invalidates the news signal — drop the proposal
+        stop_loss = None
+        verdict = gate.get("verdict") or {}
+        if verdict.get("calculated_stop_loss"):
+            stop_loss = float(verdict["calculated_stop_loss"])
+        why = [f"ai/news {s['action']}: {s.get('reason')}"]
+        if s.get("horizon"):
+            why.append(f"impact horizon: {s['horizon']}")
+        if gate.get("reason") and "unavailable" not in str(gate["reason"]):
+            why.append(str(gate["reason"]))
+        # Carry the full confirmation metadata into the proposal so the
+        # executor and test_ai engine can use it for sizing and logging.
+        out[symbol] = Proposal(
+            symbol=symbol, direction=s["action"],
+            confidence=round(max(30.0, min(75.0,
+                float(s.get("confidence") or 0.5) * 100.0)), 1),
+            entry=None, stop_loss=stop_loss, take_profit=None,
+            source="ai_news", window="news", reasons=why,
+            # Extended metadata from the 6-layer pipeline:
+            regime=s.get("regime"),
+            confirm_score=s.get("confirm_score", 0),
+            dxy_score=s.get("dxy_score", 0),
+            smc_score=s.get("smc_score", 0),
+            session=s.get("session"),
+            session_mult=s.get("session_mult", 1.0),
+            block_reasons=s.get("block_reasons", []),
+            # AI-suggested SL/TP percentages:
+            stop_loss_pct=float(s.get("stop_loss_pct") or 0.0),
+            take_profit_pct=float(s.get("take_profit_pct") or 0.0))
     return out
-
-
-def _math_engine_proposals(conn) -> dict[str, Proposal]:
-    """Source A via the strict-calibrated math engine (default)."""
-    all_signals = signals.generate_all_signals(conn)
-    return {s["symbol"]: proposal_from_signal_dict(s, source="math_engine",
-                                                    window="1h")
-            for s in all_signals["signals"]}
-
-
-def _hybrid_proposals(conn) -> dict[str, Proposal]:
-    """Source A as a union of math_engine + strategy v2. Either generator can
-    fire; when BOTH fire the same direction the stronger wins with reasons
-    merged; opposing active opinions abstain (treated as HOLD, so they never
-    conflict-trade). Gives source A more activity than either generator
-    alone while staying conservative when the two disagree."""
-    me = _math_engine_proposals(conn)
-    st = _strategy_proposals(conn)
-    out = {}
-    for sym in set(me) | set(st):
-        a, b = me.get(sym), st.get(sym)
-        if a is None:
-            out[sym] = b
-        elif b is None:
-            out[sym] = a
-        elif a.direction == b.direction and a.direction in ("LONG", "SHORT"):
-            # Both generators agree → keep the stronger, merge the reasons.
-            p = a if a.confidence >= b.confidence else b
-            other = b if p is a else a
-            merged = list(p.reasons or [])
-            for r in other.reasons or []:
-                if r not in merged:
-                    merged.append(r)
-            p.reasons = merged
-            out[sym] = p
-        elif a.direction == "HOLD":
-            out[sym] = b
-        elif b.direction == "HOLD":
-            out[sym] = a
-        else:
-            continue  # opposing active opinions → abstain
-    return out
-
-
-def _source_a_proposals(conn) -> dict[str, Proposal]:
-    """Build source A's per-symbol proposals from the configured generator.
-
-    "math_engine" (default): signals.py Bayesian fusion + factors.
-    "strategy": the validated mean-reversion v2 (strategy.compute_signal,
-    imported, never edited) — full entry/SL/TP intents + filter diagnostics.
-    "hybrid": union of both (see _hybrid_proposals).
-    """
-    if config.SIGNAL_SOURCE_A == "strategy":
-        return _strategy_proposals(conn)
-    if config.SIGNAL_SOURCE_A == "hybrid":
-        return _hybrid_proposals(conn)
-    return _math_engine_proposals(conn)
 
 
 def run_once(conn, symbols: list[str] | None = None,
@@ -140,11 +132,16 @@ def run_once(conn, symbols: list[str] | None = None,
                "dry_run": dry_run, "elapsed_s": 0.0, "blocked": False,
                "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
-    # Kill-switch: never trade live on a test-only (single-source) gate.
-    if not dry_run and config.ARBITRATION_MIN_SOURCES < 2 \
-            and not config.ALLOW_LIVE_SINGLE_SOURCE:
+    # Kill-switch: a LEGACY engine in single-source test mode must never
+    # trade live. The ai_news path is a single production source BY DESIGN
+    # (the news analyst applies its own confidence floor, then the
+    # chart-confluence agent + data gates verify), so it is exempt.
+    if (config.SIGNAL_SOURCE_A in ("math_engine", "strategy", "hybrid")
+            and config.ARBITRATION_MIN_SOURCES < 2
+            and not config.ALLOW_LIVE_SINGLE_SOURCE and not dry_run):
         summary["blocked"] = True
         summary["block_reason"] = (
+            f"SIGNAL_SOURCE_A={config.SIGNAL_SOURCE_A} with "
             "ARBITRATION_MIN_SOURCES=1 (test gate) blocks LIVE runs — set "
             "ALLOW_LIVE_SINGLE_SOURCE=true in .env to override, or use "
             "ARBITRATION_MIN_SOURCES=2. Dry runs are always allowed.")
@@ -164,13 +161,44 @@ def run_once(conn, symbols: list[str] | None = None,
         except Exception as e:
             summary["errors"].append({"symbol": "*", "error": f"reconcile: {e}"})
 
-    # ── Source A: configured generator (one call, all symbols) ────────────
-    proposals_a = _source_a_proposals(conn)
+    # ── Loss guard: a circuit breaker that stops NEW exposure when the
+    # journal is bleeding (daily loss or drawdown over the config caps).
+    # Open positions are still SL/TP-managed below — closing is not new
+    # exposure — but no fresh entries are placed while the guard is tripped.
+    loss_guard = execution.loss_guard_status(conn)
+    summary["loss_guard"] = loss_guard
 
-    # ── Source B: proprietary signals (independent generator) ─────────────
-    proposals_b = {p.symbol: p for p in proprietary_signals.generate_all_proposals(conn)}
+    # ── Tiered circuit breaker (2026-08-17 upgrade): step-down protocol
+    # based on drawdown severity. Supplements the loss guard with finer-
+    # grained risk reduction (25%/50%/micro-lots) instead of a binary block.
+    import circuit_breaker
+    cb_state = circuit_breaker.current_risk_state(conn)
+    summary["circuit_breaker"] = cb_state
 
-    wanted = set(symbols or config.SYMBOLS)
+    # ── AI mode: live (real MT5 trades) or test (paper trades in DB) ──
+    ai_mode = config.AI_MODE  # "live" or "test" (default)
+    summary["ai_mode"] = ai_mode
+
+    # Get trading universe from token registry (single source of truth)
+    # Filter by venue based on execution broker mode
+    if symbols:
+        wanted = set(symbols)
+    else:
+        if config.EXECUTION_BROKER == "binance":
+            wanted = {s.symbol for s in token_registry.get_symbols_by_venue(token_registry.Venue.BINANCE)}
+        elif config.EXECUTION_BROKER == "alpaca":
+            wanted = {s.symbol for s in token_registry.get_symbols_by_venue(token_registry.Venue.ALPACA)}
+        elif config.EXECUTION_BROKER == "mt5":
+            wanted = {s.symbol for s in token_registry.get_symbols_by_venue(token_registry.Venue.EXNESS_MT5)}
+        elif config.EXECUTION_BROKER == "hybrid":
+            # Hybrid: all active symbols (Binance + MT5 + Alpaca)
+            wanted = {s.symbol for s in token_registry.get_active_symbols()}
+        else:
+            # Paper broker: all active symbols
+            wanted = {s.symbol for s in token_registry.get_active_symbols()}
+
+    # ── AI/news source: the Groq news analyst (one call, all symbols) ─────
+    proposals = _ai_news_proposals(conn, sorted(wanted))
 
     # Broker capability filters: skip assets the broker can't trade and
     # directions it can't take, instead of firing orders that 422/403.
@@ -186,32 +214,41 @@ def run_once(conn, symbols: list[str] | None = None,
         wanted &= supported
 
     for symbol in sorted(wanted):
-        proposal_a = proposals_a.get(symbol)
-        proposal_b = proposals_b.get(symbol)
-        if proposal_a is None:
-            # Source A has no opinion for this symbol (quiet by design).
-            summary["held"].append({"symbol": symbol, "reason": "no_signal_a",
-                                    "a": "HOLD",
-                                    "b": proposal_b.direction if proposal_b else "off"})
+        proposal = proposals.get(symbol)
+        if loss_guard["blocked"]:
+            summary["held"].append({"symbol": symbol, "reason": "loss_guard",
+                                    "detail": loss_guard["reason"]})
+            continue
+        # Circuit breaker level 4 = full stop (max drawdown exceeded)
+        if cb_state["level"] >= 4:
+            summary["held"].append({"symbol": symbol, "reason": "circuit_breaker",
+                                    "detail": cb_state["status"]})
+            continue
+        if proposal is None:
+            # The AI/news analyst has no opinion for this symbol (no
+            # headline signal above the noise threshold — quiet by design).
+            summary["held"].append({"symbol": symbol, "reason": "no_signal_ai",
+                                    "a": "HOLD", "b": "HOLD"})
             continue
         try:
-            # Data gate BEFORE trusting either source.
+            # Data gate BEFORE trusting the news signal. Pass the symbol so
+            # market-hours instruments (forex, equity indices) get the
+            # weekend-tolerant staleness window — their bars are stale on
+            # Monday pre-market by design.
             checks = verification.verify_candle_df(
-                _load_frame(conn, symbol), interval="1h")
+                _load_frame(conn, symbol), interval="1h", symbol=symbol)
             if not checks["ok"]:
                 summary["held"].append({"symbol": symbol, "reason": "data",
                                         "detail": checks["checks"]})
                 continue
 
-            # Agreement gate: both sources by default; a single high-
-            # confidence source when ARBITRATION_MIN_SOURCES=1 (testing).
-            intent = arbitrate(proposal_a, proposal_b,
-                               min_sources=config.ARBITRATION_MIN_SOURCES,
-                               min_confidence=config.ARBITRATION_MIN_CONFIDENCE)
+            # Single-source intent: the news analyst IS the signal, and its
+            # own confidence floor (NEWS_SIGNAL_MIN_CONFIDENCE) was already
+            # applied inside signal_for — so no extra agreement gate here.
+            intent = arbitrate(proposal, None, min_sources=1, min_confidence=0)
             if intent is None:
-                summary["held"].append({"symbol": symbol, "reason": "no_agreement",
-                                        "a": proposal_a.direction,
-                                        "b": proposal_b.direction if proposal_b else "off"})
+                summary["held"].append({"symbol": symbol, "reason": "no_signal_ai",
+                                        "a": proposal.direction, "b": "HOLD"})
                 continue
             if broker_spot and intent.direction == "SHORT":
                 # Spot brokers (Alpaca crypto, Binance spot) can't short —
@@ -219,27 +256,10 @@ def run_once(conn, symbols: list[str] | None = None,
                 summary["held"].append({"symbol": symbol, "reason": "no_short_on_spot"})
                 continue
 
-            # News verification (the confirmation layer): once the signal
-            # sources agree, the news review checks the trade. Strongly
-            # opposing headlines VETO it; an extreme score in EITHER
-            # direction means a big move is expected, so the bot stands
-            # aside instead of trading into the whipsaw. Aligned headlines
-            # CONFIRM it (the intent is journaled with a "news confirms"
-            # reason). Neutral / no news never blocks a trade.
-            if config.NEWS_VERIFY_ENABLED:
-                nv = reviewer.verify_trade(conn, symbol, intent.direction)
-                # Journal the decision so the dashboard can show how often
-                # the confirmation layer vetoes / confirms / stays neutral.
-                database.record_news_verdict(
-                    conn, symbol, intent.direction, nv.get("verdict"),
-                    nv.get("score"), nv.get("big_move"), nv.get("mode"),
-                    nv.get("message"))
-                if nv.get("verdict") == "veto":
-                    summary["held"].append({"symbol": symbol, "reason": "news_veto",
-                                            "detail": nv})
-                    continue
-                if nv.get("verdict") == "confirm":
-                    intent.reasons = list(intent.reasons or []) + [nv.get("message", "news confirms")]
+            # No reviewer.verify_trade news gate here (retired 2026-08-17):
+            # the trade signal itself comes from the news analyst, so a
+            # second news review would double-gate the same headlines. The
+            # chart-confluence agent already validated the setup upstream.
 
             # Re-gate the intent right before execution (fresh data).
             v = verification.verify_intent(intent, conn, interval="1h")
@@ -265,38 +285,85 @@ def run_once(conn, symbols: list[str] | None = None,
             # Concurrent-position limit: don't stack more exposure than the
             # account can fund when a burst of signals agrees at once.
             if not dry_run and config.MAX_OPEN_POSITIONS > 0:
-                open_now = len([o for o in database.load_orders(conn, limit=1000)
+                # Only the CURRENT broker's positions count against the cap —
+                # a retired account's phantom rows must not freeze new entries.
+                open_now = len([o for o in database.load_orders(
+                                    conn, source=config.EXECUTION_BROKER, limit=1000)
                                 if o.get("status") in ("filled", "open")])
                 if open_now >= config.MAX_OPEN_POSITIONS:
                     summary["held"].append({"symbol": symbol,
                                             "reason": "max_positions"})
                     continue
 
-            result = execution.execute_intent(conn, intent, dry_run=dry_run)
-            if result.get("duplicate"):
-                summary["held"].append({"symbol": symbol, "reason": "duplicate"})
-                continue
-            order = result.get("order") or {}
-            status = order.get("status", "?")
-            if status == "error":
-                summary["errors"].append({"symbol": symbol,
-                                          "error": order.get("error")})
+            # ── Dual-mode execution ───────────────────────────────────
+            # AI_MODE=test → paper trade in test_trades table (no broker)
+            # AI_MODE=live → real MT5/Exness trade via execution.execute_intent
+            if ai_mode == "test":
+                import test_ai
+                result = test_ai.record_paper_trade(
+                    conn, proposal, intent, dry_run=dry_run)
+                if result.get("duplicate"):
+                    summary["held"].append({"symbol": symbol, "reason": "duplicate"})
+                    continue
+                trade = result.get("trade") or {}
+                summary["executed"].append({
+                    "symbol": symbol,
+                    "direction": intent.direction,
+                    "qty": trade.get("entry_price", 0),
+                    "status": "test_trade",
+                    "sources": intent.sources,
+                    "reasons": intent.reasons or [],
+                    "confirm_score": proposal.confirm_score,
+                    "dxy_score": proposal.dxy_score,
+                    "smc_score": proposal.smc_score,
+                    "regime": proposal.regime,
+                    "session": proposal.session})
+                if verbose:
+                    print(f"  {symbol}: TEST {intent.direction} "
+                          f"tc={proposal.confirm_score} dxy={proposal.dxy_score} "
+                          f"smc={proposal.smc_score} regime={proposal.regime}")
             else:
-                summary["executed"].append({"symbol": symbol,
-                                            "direction": intent.direction,
-                                            "qty": order.get("qty"),
-                                            "status": status,
-                                            "sources": intent.sources,
-                                            "reasons": intent.reasons or []})
-            if verbose:
-                print(f"  {symbol}: {intent.direction} qty={order.get('qty')} "
-                      f"status={status} src={intent.sources}")
+                # Live mode — apply circuit breaker risk multiplier to sizing
+                result = execution.execute_intent(
+                    conn, intent, dry_run=dry_run)
+                if result.get("duplicate"):
+                    summary["held"].append({"symbol": symbol, "reason": "duplicate"})
+                    continue
+                order = result.get("order") or {}
+                status = order.get("status", "?")
+                if status == "error":
+                    summary["errors"].append({"symbol": symbol,
+                                              "error": order.get("error")})
+                else:
+                    summary["executed"].append({
+                        "symbol": symbol,
+                        "direction": intent.direction,
+                        "qty": order.get("qty"),
+                        "status": status,
+                        "sources": intent.sources,
+                        "reasons": intent.reasons or [],
+                        "confirm_score": proposal.confirm_score,
+                        "dxy_score": proposal.dxy_score,
+                        "smc_score": proposal.smc_score,
+                        "regime": proposal.regime,
+                        "session": proposal.session,
+                        "cb_level": cb_state["level"],
+                        "cb_mult": cb_state["risk_multiplier"]})
+                if verbose:
+                    print(f"  {symbol}: {intent.direction} qty={order.get('qty')} "
+                          f"status={status} src={intent.sources} "
+                          f"cb={cb_state['level']}x{cb_state['risk_multiplier']}")
         except Exception as e:
             summary["errors"].append({"symbol": symbol, "error": str(e)})
 
     # ── SL/TP monitor: close any open position that hit its levels ──────
     if not dry_run:
-        summary["closed"] = execution.manage_open_positions(conn)
+        try:
+            summary["closed"] = execution.manage_open_positions(conn)
+        except Exception as e:
+            # One broker hiccup in the monitor must never kill the cycle.
+            summary["errors"].append({"symbol": "*",
+                                      "error": f"sl/tp monitor: {e}"})
 
     summary["elapsed_s"] = round(time.time() - t0, 2)
     return summary

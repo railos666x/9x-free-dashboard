@@ -224,9 +224,10 @@ def generate_all_signals(conn, news_limit: int = 60) -> dict:
     coin_scores = {c["symbol"]: c["score"] for c in review.get("coins", [])}
 
     # Load the cross-sectional universe ONCE instead of once per symbol
-    # (was 87 × 87 DB loads ≈ 4.6 min per refresh).
+    # (was 87 × 87 DB loads ≈ 4.6 min per refresh). Includes the US Bitcoin
+    # ETFs (config.TRADABLE_UNIVERSE) so the AI can signal on them too.
     all_coins_data = {}
-    for s in config.SYMBOLS:
+    for s in config.TRADABLE_UNIVERSE:
         s_df = database.load_candles(conn, s, "1h", limit=200)
         if not s_df.empty:
             all_coins_data[s] = indicators.add_all(s_df)
@@ -234,16 +235,17 @@ def generate_all_signals(conn, news_limit: int = 60) -> dict:
     # Prefetch funding for every symbol IN PARALLEL so the per-symbol loop
     # below is pure cache hits. Sequential network calls measured ~2.6 s
     # each → 87 × 2.6 s ≈ 3.8 min cold; 8 threads bring that to ~30 s, and
-    # the DB-first path makes later cold starts instant.
+    # the DB-first path makes later cold starts instant. Non-Binance symbols
+    # (ETFs) simply cache a None — the carry factor treats that as neutral.
     try:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(lambda s: _funding_rate_cached(conn, s), config.SYMBOLS))
+            list(pool.map(lambda s: _funding_rate_cached(conn, s), config.TRADABLE_UNIVERSE))
     except Exception:
         pass  # prefetch is best-effort; the per-symbol call still falls back
 
     signals = []
-    for symbol in config.SYMBOLS:
+    for symbol in config.TRADABLE_UNIVERSE:
         raw = coin_scores.get(symbol, 0)
         ns = max(-1.0, min(1.0, raw / 100.0))
         sig = generate_signal(conn, symbol, news_score=ns,

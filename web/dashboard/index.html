@@ -44,6 +44,7 @@
     </div>
 
     <div class="topbar-actions">
+      <span class="reconnect-badge" id="reconnectBadge" hidden><svg class="ic ic-sm"><use href="#i-refresh"/></svg> Reconnecting…</span>
       <span class="server-dot" id="serverDot" title="Backend status"></span>
       <button class="icon-btn" title="Search assets" onclick="focusSearch()"><svg class="ic"><use href="#i-search"/></svg></button>
       <button class="btn-primary" id="btnConnect" onclick="openConnect()">Connect exchange</button>
@@ -59,11 +60,13 @@
         <a class="nav-item" data-view="assets" href="#"><svg class="ic"><use href="#i-coins"/></svg> Assets</a>
         <a class="nav-item" data-view="portfolio" href="#"><svg class="ic"><use href="#i-briefcase"/></svg> My portfolio</a>
         <a class="nav-item" data-view="bots" href="#"><svg class="ic"><use href="#i-settings"/></svg> Bots</a>
+        <a class="nav-item" data-view="learn" href="#"><svg class="ic"><use href="#i-book"/></svg> Learn</a>
       </div>
       <div class="nav-group">
         <div class="nav-label">Trading</div>
         <a class="nav-item" data-view="orders" href="#"><svg class="ic"><use href="#i-book"/></svg> Orders</a>
         <a class="nav-item" data-view="signals" href="#"><svg class="ic"><use href="#i-zap"/></svg> Signals</a>
+        <a class="nav-item" data-view="aitest" href="#"><svg class="ic"><use href="#i-flask"/></svg> AI Test</a>
       </div>
     </aside>
 
@@ -120,6 +123,79 @@
               <div class="balance-sub" id="balanceSub"></div>
               <div class="dist-bar" id="distBar"></div>
               <div class="dist-legend" id="distLegend"></div>
+            </section>
+          </div>
+        </div>
+
+        <!-- ═══════════ Row 3: Stats + Radar + Heatmap ═══════════ -->
+        <div class="row3">
+          <div class="stats-grid">
+            <div class="stat-card" id="statTodayPnl">
+              <div class="stat-label">Today</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted"></div>
+            </div>
+            <div class="stat-card" id="statBalance">
+              <div class="stat-label">Current Balance</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted">Broker account</div>
+            </div>
+            <div class="stat-card" id="statTotalPnl">
+              <div class="stat-label">Total P&L</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted"></div>
+            </div>
+            <div class="stat-card" id="statStreak">
+              <div class="stat-label">Streak</div>
+              <div class="stat-value">0</div>
+              <div class="stat-sub muted"></div>
+            </div>
+            <div class="stat-card" id="statProfitFactor">
+              <div class="stat-label">Profit Factor</div>
+              <div class="stat-value">0.00</div>
+              <div class="stat-sub muted"></div>
+            </div>
+            <div class="stat-card" id="statBiggestWin">
+              <div class="stat-label">Biggest Win</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted">Single trade best</div>
+            </div>
+            <div class="stat-card" id="statBestDay">
+              <div class="stat-label">Best Day</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted"></div>
+            </div>
+          </div>
+
+          <div class="row3-bottom">
+            <section class="card radar-card">
+              <div class="card-head">
+                <div class="card-title">Trade Score</div>
+                <div class="radar-score" id="radarScore">0</div>
+              </div>
+              <div class="radar-sub muted" id="radarLabel">Your overall trading performance</div>
+              <div id="radarChart" class="chart radar-chart"></div>
+            </section>
+
+            <section class="card heatmap-card">
+              <div class="card-head">
+                <div class="card-title">Trading Activity</div>
+                <span class="muted" id="heatmapMeta"></span>
+              </div>
+              <div class="heatmap-legend">
+                <span class="muted">Loss</span>
+                <span class="heatmap-dot hl-red"></span>
+                <span class="heatmap-dot hl-red"></span>
+                <span class="heatmap-dot hl-red"></span>
+                <span class="heatmap-dot hl-red"></span>
+                <span class="heatmap-dot hl-green"></span>
+                <span class="heatmap-dot hl-green"></span>
+                <span class="heatmap-dot hl-green"></span>
+                <span class="heatmap-dot hl-green"></span>
+                <span class="muted">Profit</span>
+              </div>
+              <div id="heatmapChart" class="chart heatmap-chart"></div>
+              <div class="heatmap-stats" id="heatmapStats"></div>
             </section>
           </div>
         </div>
@@ -233,10 +309,8 @@
             </div>
             <div class="bot-source-ctl">
               <label>Source A
-                <select id="botSourceSelect" title="Signal source A generator — change only while the bot is stopped">
-                  <option value="math_engine">math_engine (strict)</option>
-                  <option value="strategy">strategy v2 (mean-reversion)</option>
-                  <option value="hybrid">hybrid (both, union)</option>
+                <select id="botSourceSelect" title="Signal source — the AI/news analyst is the only trade source since the candle-factor engines were retired">
+                  <option value="ai_news">ai_news (AI + news APIs)</option>
                 </select>
               </label>
               <button class="btn-primary" id="btnApplySource" onclick="applyBotSource()">Apply</button>
@@ -296,10 +370,17 @@
               <div class="card-title">Profit by currency</div>
               <span class="muted" id="pnlDonutMeta"></span>
             </div>
-            <div class="pnl-layout">
-              <div id="pnlDonut" class="chart pnl-donut"></div>
-              <div id="pnlBreakdown" class="pnl-breakdown"><div class="muted">Loading…</div></div>
+            <div class="dual-donut-wrap">
+              <div class="donut-pane">
+                <div class="donut-pane-label"><span class="broker-dot dot-mt5"></span> MT5 / Exness</div>
+                <div id="pnlDonutMt5" class="chart pnl-donut"></div>
+              </div>
+              <div class="donut-pane">
+                <div class="donut-pane-label"><span class="broker-dot dot-binance"></span> Binance</div>
+                <div id="pnlDonutBinance" class="chart pnl-donut"></div>
+              </div>
             </div>
+            <div id="pnlBreakdown" class="pnl-breakdown"><div class="muted">Loading…</div></div>
             <div class="closed-trades-head">
               <div class="card-title">Every closed trade</div>
               <span class="muted" id="closedTradesMeta"></span>
@@ -329,12 +410,85 @@
           <table class="crypto-table orders-table">
             <thead>
               <tr>
-                <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Fill</th>
-                <th>Exit</th><th>PnL</th><th>Unreal</th><th>Status</th><th>Source</th>
-                <th>Current</th><th>Mkt value</th><th>24h chart</th><th>Why</th><th>Time</th>
+                <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>SL</th><th>TP</th>
+                <th>Exit</th><th>PnL</th><th>Status</th><th>Broker</th>
+                <th>Why</th><th>Time</th>
               </tr>
             </thead>
-            <tbody id="ordersBody"><tr><td colspan="15" class="muted">No orders yet.</td></tr></tbody>
+            <tbody id="ordersBody"><tr><td colspan="12" class="muted">No orders yet.</td></tr></tbody>
+          </table>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: Learn (trading tutor) ═══════════ -->
+      <section class="view" id="view-learn">
+        <div class="tutor-grid">
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Trading tutor</div>
+              <span class="muted">basics + advanced, tied to this system</span>
+            </div>
+            <div id="tutorTopicsList" class="tutor-topics"></div>
+            <div id="tutorBody" class="tutor-body"><div class="muted">Loading…</div></div>
+          </section>
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Why this trade?</div>
+              <span class="muted">last bot cycle explained</span>
+            </div>
+            <div id="tradeExplainBody" class="tutor-body"><div class="muted">Loading…</div></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ═══════════ View: AI Test (paper-trading + confirmation pipeline) ═══════════ -->
+      <section class="view" id="view-aitest">
+        <!-- AI Confirmation Pipeline Status -->
+        <section class="card bots-card">
+          <div class="card-head">
+            <div class="card-title">AI Confirmation Pipeline</div>
+            <span class="muted" id="aiLayersMeta">6-layer gate</span>
+          </div>
+          <div id="aiLayersBody" class="ai-layers-body"><div class="muted">Loading…</div></div>
+        </section>
+
+        <!-- Circuit Breaker + Feedback -->
+        <div class="ai-test-grid" style="margin-top:16px;">
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Circuit Breaker</div>
+              <span class="muted" id="cbMeta">tiered risk control</span>
+            </div>
+            <div id="circuitBreakerBody" class="cb-body"><div class="muted">Loading…</div></div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Feedback Calibration</div>
+              <span class="muted" id="feedbackMeta">adaptive thresholds</span>
+            </div>
+            <div id="feedbackBody" class="feedback-body"><div class="muted">Loading…</div></div>
+          </section>
+        </div>
+
+        <!-- Test Trades Table -->
+        <section class="card crypto-table-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">AI Paper Trades</div>
+            <div class="assets-head-right">
+              <span class="signal-badge" id="testTradeModeBadge">MODE: ?</span>
+              <span class="muted" id="testTradeStats"></span>
+            </div>
+          </div>
+          <table class="crypto-table orders-table">
+            <thead>
+              <tr>
+                <th>Time</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th>
+                <th>TP</th><th>Exit</th><th>PnL</th><th>TC</th><th>DXY</th>
+                <th>SMC</th><th>Regime</th><th>Session</th><th>Outcome</th>
+              </tr>
+            </thead>
+            <tbody id="testTradesBody"><tr><td colspan="14" class="muted">No test trades yet.</td></tr></tbody>
           </table>
         </section>
       </section>

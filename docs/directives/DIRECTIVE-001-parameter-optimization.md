@@ -39,9 +39,9 @@ for 15m/4h sweeps only.
    results.
 4. If the optimizer imports `backtester.run_backtest`, call it with
    `strategy="mean_reversion"` and `params=MeanReversionParams(...)`.
-5. Append results to `documentation/RESEARCH_NOTES.md` and update the
+5. Append results to `docs/RESEARCH_NOTES.md` and update the
    directive's status below when done. Log your changes in
-   `documentation/CHANGELOG.md`.
+   `docs/CHANGELOG.md`.
 
 ## Work plan (modular steps — do in order, report after each)
 
@@ -79,7 +79,7 @@ Re-run the top config on BTC with:
   in your optimizer process only.)
 
 ### Step 5 — Report & recommendation
-Write a section into `documentation/RESEARCH_NOTES.md` with:
+Write a section into `docs/RESEARCH_NOTES.md` with:
 - the sensitivity table summary, top-3 configs, hold-out numbers
 - one recommended config, or an explicit statement that none qualify
 - acceptance check: **PF > 1.1 AND MC P(profit) > 0.7 AND WR ≥ 60% with CI

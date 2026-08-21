@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 BACKUP_DIR = Path(__file__).resolve().parent.parent / "backups"
-DB_PATH = Path(__file__).resolve().parent.parent / "crypto_data.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "crypto_data.db"
 
 
 def backup_db(db_path: Path, backup_dir: Path, keep: int = 10) -> Path:

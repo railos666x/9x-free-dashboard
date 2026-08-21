@@ -21,6 +21,27 @@ except Exception:
 import traceback
 
 
+class FakeResp:
+    """Minimal requests.Response stand-in with the fields the reviewer reads."""
+
+    def __init__(self, content):
+        self._content = content
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"choices": [{"message": {"content": self._content}}]}
+
+
+def _headline_df():
+    import pandas as pd
+    return pd.DataFrame([{
+        "sentiment": "bullish", "title": "Bitcoin ETF inflows surge",
+        "source": "CoinDesk", "published_at": None,
+    }])
+
+
 def main():
     errors = []
 
@@ -56,28 +77,14 @@ def main():
     # 2. Failover: primary down -> fallback answers
     print("\n2. Testing provider failover (primary down → fallback)...")
     try:
-        import pandas as pd
         import reviewer
 
         reviewer._llm_cooldown_until = 0.0  # reset any cooldown
 
         # Stub the DB so the reviewer sees headlines without touching SQLite.
-        reviewer.database.load_news = lambda conn, limit: pd.DataFrame([{
-            "sentiment": "bullish", "title": "Bitcoin ETF inflows surge",
-            "source": "CoinDesk", "published_at": None,
-        }])
+        reviewer.database.load_news = lambda conn, limit: _headline_df()
 
         calls = []
-
-        class FakeResp:
-            def __init__(self, content):
-                self._content = content
-
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return {"choices": [{"message": {"content": self._content}}]}
 
         def fake_post(url, **kw):
             calls.append(url)
@@ -113,33 +120,59 @@ def main():
         traceback.print_exc()
         errors.append(("failover", e))
 
+    # 2b. _parse_llm_json handles prose-wrapped code fences (seen live:
+    # models reply "Based on the headlines...\n\n```\n{...}\n```")
+    print("\n2b. Testing prose-wrapped JSON parsing...")
+    try:
+        import reviewer
+        prose = ('Based on recent headlines, here is my analysis:\n\n'
+                 '```json\n{"BTC": {"score": 8, "stance": "bullish", '
+                 '"reasons": "institutional adoption"}}\n```')
+        parsed = reviewer._parse_llm_json(prose)
+        assert parsed and parsed["BTC"]["score"] == 8, f"got {parsed!r}"
+        assert parsed["BTC"]["stance"] == "bullish"
+        # Garbage still yields None.
+        assert reviewer._parse_llm_json("not json at all") is None
+        print("   ✅ Prose-wrapped JSON extracted; garbage → None")
+    except Exception as e:
+        print(f"   ❌ Prose-wrapped parse error: {e}")
+        traceback.print_exc()
+        errors.append(("parse_llm_json", e))
+
     # 3. All providers fail -> None + cooldown; next call skips network
     print("\n3. Testing all-fail → cooldown...")
     try:
         import reviewer
 
-        reviewer._llm_cooldown_until = 0.0
-        reviewer._llm_result_cache = {"at": 0.0, "data": None}  # isolate: no cached verdict
-        reviewer.requests.post = lambda url, **kw: (_ for _ in ()).throw(
-            IOError("down"))
+        # Isolate: this section counts the EXACT cloud-provider chain
+        # (primary + fallbacks), so keep the local OmniRoute gateway out.
+        omni_was = reviewer.config.OMNIROUTE_ENABLED
+        reviewer.config.OMNIROUTE_ENABLED = False
+        try:
+            reviewer._llm_cooldown_until = 0.0
+            reviewer._llm_result_cache = {"at": 0.0, "data": None}
+            reviewer.requests.post = lambda url, **kw: (_ for _ in ()).throw(
+                IOError("down"))
 
-        n_calls = {"n": 0}
-        orig_post = reviewer.requests.post
+            n_calls = {"n": 0}
+            orig_post = reviewer.requests.post
 
-        def counting_post(url, **kw):
-            n_calls["n"] += 1
-            return orig_post(url, **kw)
+            def counting_post(url, **kw):
+                n_calls["n"] += 1
+                return orig_post(url, **kw)
 
-        reviewer.requests.post = counting_post
+            reviewer.requests.post = counting_post
 
-        assert reviewer._llm_review(None, limit=20) is None, "all-fail must return None"
-        assert reviewer._llm_cooldown_until > 0, "cooldown must be armed after total failure"
-        assert n_calls["n"] == 2, f"both providers should be tried, got {n_calls['n']}"
+            assert reviewer._llm_review(None, limit=20) is None, "all-fail must return None"
+            assert reviewer._llm_cooldown_until > 0, "cooldown must be armed after total failure"
+            assert n_calls["n"] == 2, f"both providers should be tried, got {n_calls['n']}"
 
-        # Immediately after, the cooldown must short-circuit (no network).
-        before = n_calls["n"]
-        assert reviewer._llm_review(None, limit=20) is None
-        assert n_calls["n"] == before, "cooldown must skip provider calls"
+            # Immediately after, the cooldown must short-circuit (no network).
+            before = n_calls["n"]
+            assert reviewer._llm_review(None, limit=20) is None
+            assert n_calls["n"] == before, "cooldown must skip provider calls"
+        finally:
+            reviewer.config.OMNIROUTE_ENABLED = omni_was
         print("   ✅ Total failure → None, cooldown armed, retries suppressed")
     except Exception as e:
         print(f"   ❌ Cooldown error: {e}")
@@ -158,10 +191,7 @@ def main():
         class FakeConn:
             pass
 
-        reviewer.database.load_news = lambda conn, limit: pd.DataFrame([{
-            "sentiment": "bullish", "title": "Bitcoin ETF inflows surge",
-            "source": "CoinDesk", "published_at": None,
-        }])
+        reviewer.database.load_news = lambda conn, limit: _headline_df()
 
         out = reviewer.review_market(FakeConn(), limit=40)
         assert out["mode"] == "rule", f"expected rule mode, got {out['mode']!r}"
@@ -235,56 +265,102 @@ def main():
     try:
         import reviewer
 
-        # Keyless cloud providers must be skipped (would 401 on every cycle).
-        reviewer.config.LLM_BASE_URL = "https://api.openai.com/v1"
-        reviewer.config.LLM_MODEL = "gpt-4o-mini"
-        reviewer.config.LLM_API_KEY = ""
-        reviewer.config.LLM_FALLBACKS = [{"base_url": "https://api.groq.com/openai/v1",
-                                          "model": "llama-3.3-70b-versatile",
-                                          "api_key": ""}]
-        provs = reviewer._llm_providers()
-        assert provs == [], f"keyless cloud providers must be skipped, got {provs}"
-        reviewer.config.LLM_FALLBACKS = [{"base_url": "http://localhost:11434/v1",
-                                          "model": "local-model", "api_key": ""}]
-        provs = reviewer._llm_providers()
-        assert len(provs) == 1, "localhost keyless providers must be allowed"
-
-        # Free-tier throttle: the second call inside the window must reuse
-        # the cached verdict without any network call.
-        reviewer._llm_cooldown_until = 0.0
-        reviewer._llm_result_cache = {"at": 0.0, "data": None}
-        reviewer.config.LLM_MIN_INTERVAL_SECONDS = 600
-        reviewer.config.LLM_BASE_URL = "https://api.groq.com/openai/v1"
-        reviewer.config.LLM_MODEL = "llama-3.3-70b-versatile"
-        reviewer.config.LLM_API_KEY = "gsk-fake"
-        reviewer.config.LLM_FALLBACKS = []
-        reviewer.database.load_news = lambda conn, limit: pd.DataFrame([{
-            "sentiment": "bullish", "title": "Bitcoin ETF inflows surge",
-            "source": "CoinDesk", "published_at": None,
-        }])
-        n = {"calls": 0}
-        orig_post = reviewer.requests.post
-        def counting_post(url, **kw):
-            n["calls"] += 1
-            return FakeResp('{"BTC": {"score": 30, "stance": "bullish", '
-                            '"reasons": "ETF inflows"}}')
-        reviewer.requests.post = counting_post
+        # Isolate the cloud chain: keep the local OmniRoute gateway out of
+        # the count (its own enable/disable behavior is covered in §6b).
+        omni_was = reviewer.config.OMNIROUTE_ENABLED
+        reviewer.config.OMNIROUTE_ENABLED = False
         try:
-            r1 = reviewer._llm_review(None, limit=20)
-            assert r1 and r1["mode"] == "llm", r1
-            r2 = reviewer._llm_review(None, limit=20)  # inside the 600s window
-            assert n["calls"] == 1, f"cache must serve 2nd call, got {n['calls']}"
-            assert r2 == r1, "cached verdict must equal the first"
-            reviewer._llm_result_cache["at"] = 0.0  # expire the window
-            r3 = reviewer._llm_review(None, limit=20)
-            assert n["calls"] == 2, "expired cache must re-ask the provider"
+            # Keyless cloud providers must be skipped (would 401 every cycle).
+            reviewer.config.LLM_BASE_URL = "https://api.openai.com/v1"
+            reviewer.config.LLM_MODEL = "gpt-4o-mini"
+            reviewer.config.LLM_API_KEY = ""
+            reviewer.config.LLM_FALLBACKS = [{"base_url": "https://api.groq.com/openai/v1",
+                                              "model": "llama-3.3-70b-versatile",
+                                              "api_key": ""}]
+            provs = reviewer._llm_providers()
+            assert provs == [], f"keyless cloud providers must be skipped, got {provs}"
+            reviewer.config.LLM_FALLBACKS = [{"base_url": "http://localhost:11434/v1",
+                                              "model": "local-model", "api_key": ""}]
+            provs = reviewer._llm_providers()
+            assert len(provs) == 1, "localhost keyless providers must be allowed"
+
+            # Free-tier throttle: the second call inside the window must reuse
+            # the cached verdict without any network call.
+            reviewer._llm_cooldown_until = 0.0
+            reviewer._llm_result_cache = {"at": 0.0, "data": None}
+            reviewer.config.LLM_MIN_INTERVAL_SECONDS = 600
+            reviewer.config.LLM_BASE_URL = "https://api.groq.com/openai/v1"
+            reviewer.config.LLM_MODEL = "llama-3.3-70b-versatile"
+            reviewer.config.LLM_API_KEY = "gsk-fake"
+            reviewer.config.LLM_FALLBACKS = []
+            reviewer.database.load_news = lambda conn, limit: _headline_df()
+            n = {"calls": 0}
+            orig_post = reviewer.requests.post
+
+            def counting_post(url, **kw):
+                n["calls"] += 1
+                return FakeResp('{"BTC": {"score": 30, "stance": "bullish", '
+                                '"reasons": "ETF inflows"}}')
+
+            reviewer.requests.post = counting_post
+            try:
+                r1 = reviewer._llm_review(None, limit=20)
+                assert r1 and r1["mode"] == "llm", r1
+                r2 = reviewer._llm_review(None, limit=20)  # inside the 600s window
+                assert n["calls"] == 1, f"cache must serve 2nd call, got {n['calls']}"
+                assert r2 == r1, "cached verdict must equal the first"
+                reviewer._llm_result_cache["at"] = 0.0  # expire the window
+                r3 = reviewer._llm_review(None, limit=20)
+                assert n["calls"] == 2, "expired cache must re-ask the provider"
+            finally:
+                reviewer.requests.post = orig_post
         finally:
-            reviewer.requests.post = orig_post
+            reviewer.config.OMNIROUTE_ENABLED = omni_was
         print("   ✅ Keyless clouds skipped; cached verdict served for 600s (free-tier safe)")
     except Exception as e:
         print(f"   ❌ Throttle error: {e}")
         traceback.print_exc()
         errors.append(("throttle", e))
+
+    # 6b. OmniRoute — keyless LOCAL provider joins the chain when enabled
+    print("\n6b. Testing OmniRoute in the provider chain...")
+    try:
+        import reviewer
+
+        omni_was = reviewer.config.OMNIROUTE_ENABLED
+        base_was = reviewer.config.OMNIROUTE_BASE_URL
+        model_was = reviewer.config.OMNIROUTE_MODEL
+        key_was = reviewer.config.OMNIROUTE_API_KEY
+        try:
+            reviewer.config.OMNIROUTE_ENABLED = True
+            reviewer.config.OMNIROUTE_BASE_URL = "http://localhost:20128/v1"
+            reviewer.config.OMNIROUTE_MODEL = "auto"
+            reviewer.config.OMNIROUTE_API_KEY = ""
+            # Keyless clouds are still skipped; only local (OmniRoute) remains.
+            reviewer.config.LLM_BASE_URL = "https://api.openai.com/v1"
+            reviewer.config.LLM_MODEL = "gpt-4o-mini"
+            reviewer.config.LLM_API_KEY = ""
+            reviewer.config.LLM_FALLBACKS = [{"base_url": "https://api.groq.com/openai/v1",
+                                              "model": "llama-3.3-70b-versatile",
+                                              "api_key": ""}]
+            provs = reviewer._llm_providers()
+            assert len(provs) == 1 and provs[0]["base_url"] == "http://localhost:20128/v1", \
+                f"OmniRoute must be the keyless local provider, got {provs}"
+            assert provs[0]["model"] == "auto"
+            # Disabled → gone from the chain.
+            reviewer.config.OMNIROUTE_ENABLED = False
+            assert reviewer._llm_providers() == [], \
+                "disabled OmniRoute must not appear"
+        finally:
+            reviewer.config.OMNIROUTE_ENABLED = omni_was
+            reviewer.config.OMNIROUTE_BASE_URL = base_was
+            reviewer.config.OMNIROUTE_MODEL = model_was
+            reviewer.config.OMNIROUTE_API_KEY = key_was
+        print("   ✅ OmniRoute in the chain when enabled; gone when disabled")
+    except Exception as e:
+        print(f"   ❌ OmniRoute chain error: {e}")
+        traceback.print_exc()
+        errors.append(("omniroute_chain", e))
 
     # 7. verdict_for — pure helper shared by the bot gate + signal cards
     print("\n7. Testing verdict_for (pure verdict helper)...")

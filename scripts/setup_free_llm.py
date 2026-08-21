@@ -2,7 +2,7 @@
 cryptoautomation — one-command setup for the FREE AI news-review chain.
 
 Wires three free, OpenAI-compatible providers into .env (see
-documentation/tool-evaluation-free-ai-trading-tools.md and .env.example):
+docs/tool-evaluation.md and .env.example):
 
     Primary : Gemini Flash   — free key from https://aistudio.google.com/apikey
     Fallback: OpenRouter     — free key from https://openrouter.ai/keys

@@ -5,6 +5,148 @@ agent must be appended here.
 
 ---
 
+## 2026-08-19 — Error fixes + full docs refresh (README / CLAUDE / ARCHITECTURE / CHANGELOG)
+
+- **MT5 filling-type bug (live-rejection risk)** — `execution.py` read the
+  symbol's `filling_mode` bitmask but always sent `ORDER_FILLING_FOK`;
+  symbols that only advertise IOC would be rejected. Now: FOK if bit 0 of
+  `filling_mode` is set, else IOC.
+- **test_mt5_broker — 2 errors fixed** — `_FakeMT5` was missing
+  `ORDER_FILLING_FOK` (and had wrong constant values); now matches the real
+  MetaTrader5 constants (FOK=0, IOC=1, RETURN=2).
+- **test_news_analyst — 2 failures fixed** — the threshold checks depended
+  on live `.env` values; the test now pins
+  `AI_SENTIMENT_LONG/SHORT` + `AI_CONFIDENCE_FLOOR` to a known baseline so it
+  asserts the threshold LOGIC regardless of environment.
+  ⚠️ Note: `.env` currently sets very permissive live thresholds
+  (`AI_SENTIMENT_LONG=0.05`, `AI_SENTIMENT_SHORT=-0.05`,
+  `AI_CONFIDENCE_FLOOR=0.10`) vs the calibrated code defaults
+  (`0.50 / -0.50 / 0.70`). Pending owner decision.
+- **Docs refreshed** — README (new AI-only architecture, fixed a leftover
+  git merge conflict, correct port 8501), CLAUDE.md (overview, pipeline,
+  key files, ownership list, status), docs/ARCHITECTURE.md (rewritten for
+  the 2026-08-17 pivot).
+- **Verified**: all 15 test suites pass (130+ checks); all 47 backend
+  modules import clean; server smoke test — `/api/health`, `/api/bot/status`,
+  `/api/circuit-breaker`, `/api/ai-layers`, `/api/fear-greed`,
+  `/api/test-trades`, `/api/portfolio` all 200 on port 8501.
+
+### Binance leg fixes (hybrid routing, `execution.py` BinanceBroker)
+Why the Binance side of the dashboard showed no trades: crypto was
+re-enabled 2026-08-18 (`config.CRYPTO_SYMBOLS` → Binance testnet via the
+`hybrid` broker), the bot WAS firing BTC/ETH/SOL orders — but they were all
+rejected:
+- **`-1013 Filter failure: LOT_SIZE`** (BTC, ETH today) — precision bug:
+  `int(-log10(stepSize))` truncates (0.00001→4 places, not 5) and float
+  `floor(q/step)*step` drifts off-grid. Now: exact decimal floor via
+  `Decimal` to the `MARKET_LOT_SIZE` step grid, precision from the step's
+  string form (`_step_decimals` / `_floor_to_step`), minQty re-checked
+  AFTER the floor.
+- **`-2010 insufficient balance`** (SOL 08-18) — the Binance account lacks
+  USDT for the sized notional. Now pre-checked locally (`_free_balance`:
+  free USDT for BUYs, free base asset for SELLs) → readable journal reason
+  ("fund the account or lower risk size") instead of a wasted order.
+  Fail-open when the balance call itself fails. **Account funding still
+  needed for the Binance leg to trade.**
+- **`ConnectionError / RemoteDisconnected`** (SOL today) — order send now
+  retries 3× with backoff on connection-level failures; deterministic 4xx
+  (e.g. -1013) are NOT retried.
+- Verified offline (fake exchangeInfo/balance/post): on-grid quantities
+  (0.04181 for BTCUSDT), BUY/SELL balance guards, fail-open, retry path.
+ Regression suites (execution, mt5, system, strategy, arbitrator,
+  verification) all pass; server restarted so the fix is live.
+
+---
+
+## 2026-08-17 → 2026-08-19 — AI-only trading pivot: news-driven bot, Exness MT5, 6-layer confirmation, external data stack
+
+### The decision (user)
+The system now trades **100% on AI/news signals**. The local quant engines
+(mean reversion, z-score, RSI2, Bayesian fusion) caused losses and are
+**retired from the trade path** — they remain in the codebase for
+`/api/signals` (dashboard display) and the backtester only. All trade
+decisions come from `news_analyst → ai_agents confluence gate → execution`;
+technical code may confirm AI signals but never generate them.
+
+### Trade pipeline (new core: bot.py + confirmations)
+- **`bot.py`** — single orchestrator. One cycle: verification → news analyst
+  → 6-layer confirmation → circuit breaker → arbitrator (intent +
+  intent-hash dedup) → verification re-gate → dual-mode execution → SL/TP
+  monitor. `run_once` / `loop [BOT_LOOP_SECONDS]` / `--dry-run`.
+- **`news_analyst.py`** — Groq LLM news sentiment & analytics (per-asset
+  sentiment -1..1, confidence, impact horizon, rationale). Provider chain:
+  Groq (`GROQ_MODEL`, default `openai/gpt-oss-120b` after the 2026-08-17
+  model audit found `qwen/qwen3.6-27b` quota-exhausted and
+  `llama-3.3-70b-versatile` not a real Groq model) → local OmniRoute
+  gateway (keyless) → rule-based backfill. 10-min cache; never raises.
+- **6-layer confirmation** — (1) raw sentiment, (2) freshness,
+  (3) `calendar_guard.py` NFP/FOMC/CPI/GDP block + spread check,
+  (4) `ai_confirm.py` regime (ADX/EMA/ATR) + 6-factor technicals + session
+  filter, (5) `dxy_filter.py` USD-pair master filter (Dollar Smile, SMT
+  divergence), (6) `smart_money.py` ICT confluence (order blocks, FVG,
+  liquidity sweeps, BOS/CHoCH).
+- **`ai_agents.py`** — 3 production agents on the same Groq transport:
+  catalyst sentiment (black-swan flag), HODL/deep research, chart confluence
+  (`AI_CONFLUENCE_GATE`, off by default). Answers journaled in `ai_analyses`.
+- **`circuit_breaker.py`** — tiered step-down (5%/10%/15% DD bands,
+  micro-lots, full halt) + step-up recovery ladder + 3-consecutive-loss
+  breaker + strategy-decay flag.
+- **`ai_feedback.py`** — records outcomes, per-layer win analysis, suggests
+  threshold calibration (suggests, does not silently auto-apply).
+- **Trade universe** — the bot trades ONLY `config.TRADING_UNIVERSE`: the
+  Exness forex / metals / energy / indices instruments
+  (`EXNESS_SYMBOLS`, `EXNESS_MT5_SYMBOLS` mapping, e.g. XAU/USD → XAUUSD).
+  Crypto pairs + Bitcoin ETFs retired from trading (2026-08-17).
+- **`SIGNAL_SOURCE_A=ai_news`** is the default and single-source by design
+  (exempt from the legacy two-source gate; legacy engines still require
+  `ARBITRATION_MIN_SOURCES=2` for live).
+
+### Execution & safety
+- **MT5/Exness broker** in `execution.py` (the only module that touches a
+  broker): `AI_MODE=live` → real MT5 orders via `MetaTrader5`;
+  `AI_MODE=test` → paper trades in the `test_trades` table (`test_ai.py`).
+  `EXECUTION_BROKER=hybrid` routes MT5 + Binance; min-lot flooring, lot-size
+  precision, `MT5_POSITION_PCT` sizing.
+- Safety rails: `BOT_AUTO_LOOP_LIVE` refuses real-money brokers and falls
+  back to dry-run; legacy live mode needs `ALLOW_LIVE_SINGLE_SOURCE`;
+  verification gates are hard rejects (staleness, OHLC sanity, spike w/o
+  volume, cross-source price agreement).
+
+### Data stack (new free sources, `external_data.py` aggregator)
+Coingecko, CoinPaprika, DefiLlama, Etherscan (V2), FRED (keyless), eCON,
+Fed/Treasury, Frankfurter (ECB), ExchangeRate-API, Fear & Greed (alternative.me
++ CoinGecko), MarketAux, Mempool.space, NewsData.io, Finnhub (optional),
+Tavily/Firecrawl article scraping. Each module is fail-safe (never raises,
+permissive defaults) and individually toggleable via `config`.
+
+### Dashboard & ops
+- New endpoints: `/api/bot/{run,loop,status,source,reconcile}`,
+  `/api/circuit-breaker`, `/api/ai-layers`,
+  `/api/feedback/{calibration,thresholds}`, `/api/tutor` (+ `/trade`),
+  `/api/trade-stats`, `/api/test-trades`, `/api/test-portfolio`,
+  `/api/fear-greed`, `/api/news/{stats,analytics,analyze,article}`,
+  `/api/portfolio/{analyze,holds}`, `/api/trade/verify`.
+- `tutor.py` educational layer ("why this trade" explainers from the live
+  journal). Ops scripts: `check_bot_status/check_orders/check_positions/
+  check_sl_tp`, `run_bot_fresh`, debug scripts for LLM/MT5/news/pipeline.
+
+### Docs
+- `documentation/` → `docs/` (single docs tree: ADRs, directives,
+  math_system specs incl. `07-ai-agents.md`, updates, data-sources);
+  `documentation/` now holds deep research (competitive intelligence,
+  API integration plan).
+- README rewritten for the AI-only architecture; `.env.example` documents
+  every new key (Groq model audit note, OmniRoute, MT5, thresholds).
+
+### Status
+- ✅ Paper loop (`AI_MODE=test`) verified end-to-end; MT5 broker wired
+  against Exness
+- 📊 Win-rate calibration in progress via `ai_feedback.py`
+- ⚠️ None of the 2026-08-17→19 work is committed yet (untracked/modified in
+  git as of 2026-08-19)
+
+---
+
 ## 2026-08-15 — Trades analytics: date-range filter, every-closed-trade list, live-trades panel
 
 - **Date-range filter** (Orders view): Today / 7 days / 30 days / All presets

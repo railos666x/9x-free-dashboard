@@ -70,9 +70,49 @@ COIN_HINTS = {
     "NDX/USD": ["nasdaq"],
     "DOW/USD": ["dow jones", "dow"],
     "VIX": ["vix", "volatility index"],
-    "DXY": ["dollar index", "dxy"],
-    "EUR/USD": ["euro", "eur/usd"],
-    "USD/JPY": ["yen", "usd/jpy"],
+    "DXY": ["dollar index", "dxy", "greenback", "us dollar"],
+    "EUR/USD": ["euro", "eur/usd", "single currency"],
+    "GBP/USD": ["pound", "sterling", "gbp/usd", "british pound"],
+    "USD/JPY": ["yen", "usd/jpy", "japanese yen"],
+    "USD/CHF": ["swiss franc", "franc", "usd/chf"],
+    "AUD/USD": ["aussie", "australian dollar", "aud/usd"],
+    "USD/CAD": ["loonie", "canadian dollar", "usd/cad"],
+    "USD/CNY": ["yuan", "renminbi", "chinese yuan", "usd/cny"],
+    "EUR/GBP": ["eur/gbp", "pound-euro", "euro-sterling"],
+    "EUR/JPY": ["eur/jpy", "euro-yen"],
+    "GBP/JPY": ["gbp/jpy", "pound-yen", "sterling-yen"],
+    "AUD/JPY": ["aud/jpy", "aussie-yen"],
+    "NZD/USD": ["kiwi", "nzd/usd", "new zealand dollar"],
+    "USD/SGD": ["singapore dollar", "usd/sgd"],
+    "USD/MXN": ["mexican peso", "usd/mxn", "peso"],
+    "EUR/CHF": ["eur/chf", "euro-franc"],
+    "EUR/AUD": ["eur/aud", "euro-australian"],
+    "EUR/CAD": ["eur/cad", "euro-canadian"],
+    "EUR/NZD": ["eur/nzd"],
+    "GBP/AUD": ["gbp/aud", "pound-aussie"],
+    "GBP/CAD": ["gbp/cad"],
+    "GBP/NZD": ["gbp/nzd"],
+    "GBP/CHF": ["gbp/chf", "pound-franc"],
+    "AUD/CAD": ["aud/cad"],
+    "AUD/NZD": ["aud/nzd", "trans-tasman"],
+    "NZD/CHF": ["nzd/chf"],
+    "CAD/JPY": ["cad/jpy"],
+    "CHF/JPY": ["chf/jpy"],
+    "NZD/JPY": ["nzd/jpy"],
+    "USD/ZAR": ["rand", "usd/zar", "south african rand"],
+    "USD/TRY": ["lira", "usd/try", "turkish lira"],
+    "USD/SEK": ["swedish krona", "usd/sek"],
+    "USD/NOK": ["norwegian krone", "usd/nok"],
+    "USD/PLN": ["zloty", "usd/pln", "polish zloty"],
+    "DAX": ["dax", "german index", "german stocks"],
+    "NIKKEI": ["nikkei", "japanese index", "japan stocks"],
+    "FTSE": ["ftse", "ftse 100", "uk stocks", "british stocks"],
+    "EUROSTOXX": ["euro stoxx", "stoxx 50", "european stocks", "eurostoxx"],
+    "HANG_SENG": ["hang seng", "hsi", "hong kong stocks", "hk50"],
+    "FR40": ["cac 40", "cac", "french stocks", "fr40"],
+    "ES35": ["ibex", "spanish stocks", "es35"],
+    "ITA40": ["ftse mib", "italian stocks", "ita40"],
+    "AU200": ["asx 200", "asx", "australian stocks", "au200"],
     "US10Y": ["treasury yield", "10-year", "10 year", "bonds"],
 }
 
@@ -214,17 +254,22 @@ _llm_result_cache = {"at": 0.0, "data": None}
 
 
 def _llm_providers() -> list[dict]:
-    """Primary provider first (LLM_*), then every configured fallback.
+    """Primary provider first (LLM_*), then every configured fallback, then
+    the local OmniRoute gateway when enabled (keyless, config.OMNIROUTE_BASE_URL).
 
     Providers without an API key are skipped UNLESS they are local
-    (localhost / 127.0.0.1, e.g. llama.cpp). Cloud free tiers all require
-    a key — a keyless cloud entry would just burn a guaranteed 401 on
-    every cycle, so it's filtered out instead."""
+    (localhost / 127.0.0.1, e.g. llama.cpp, OmniRoute). Cloud free tiers
+    all require a key — a keyless cloud entry would just burn a guaranteed
+    401 on every cycle, so it's filtered out instead."""
     providers = [
         {"base_url": config.LLM_BASE_URL, "model": config.LLM_MODEL,
          "api_key": config.LLM_API_KEY}
     ]
     providers += list(config.LLM_FALLBACKS)
+    if config.OMNIROUTE_ENABLED and config.OMNIROUTE_BASE_URL:
+        providers.append({"base_url": config.OMNIROUTE_BASE_URL,
+                          "model": config.OMNIROUTE_MODEL,
+                          "api_key": config.OMNIROUTE_API_KEY})
     out = []
     for p in providers:
         base = (p.get("base_url") or "").rstrip("/")
@@ -238,13 +283,31 @@ def _llm_providers() -> list[dict]:
 
 
 def _parse_llm_json(content: str):
-    """Strip markdown fences and parse provider JSON. Returns dict or None."""
+    """Strip markdown fences / prose and parse provider JSON.
+
+    Models often wrap the answer in a code fence with a lead-in sentence
+    ("Based on the headlines...\n\n```json\n{...}\n```") — the fence
+    regex alone misses that, so as a fallback we extract the first
+    balanced-looking {…} block and parse it. Returns dict or None.
+    """
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.I)
     try:
         data = json.loads(text)
+        if isinstance(data, dict):
+            return data
     except (TypeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+        pass
+    # Prose-wrapped JSON: pull the first {…} block out and try again.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict):
+                return data
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def _llm_request(provider: dict, prompt: str):
@@ -419,7 +482,21 @@ def verify_trade(conn, symbol: str, direction: str) -> dict:
 # Public entry point
 # ----------------------------------------------------------------------
 def review_market(conn, limit: int = 40, hours: float = 48.0) -> dict:
-    """Market review: rule-based view, optionally overlaid by the LLM."""
+    """Market review: Groq news analyst (the main engine) when enabled and
+    keyed, otherwise rule-based view, optionally overlaid by the LLM."""
+    # Groq analyst first — it returns structured per-asset sentiment with
+    # confidence/horizon and back-fills every coin from the rule-based
+    # scorer, so this is a strict upgrade when an LLM is available (Groq
+    # key or the OmniRoute local gateway).
+    if config.NEWS_ANALYST_ENABLED and config.llm_available():
+        from news_analyst import analyze_market  # lazy — avoids circular import
+        try:
+            groq = analyze_market(conn, limit=limit)
+            if groq and groq.get("coins"):
+                return groq
+        except Exception:
+            pass  # fall through to the existing chain on any failure
+
     result = _rule_review(conn, limit, hours)
 
     # LLM overlay is enabled if LLM_ENABLED=true AND at least one provider is

@@ -80,8 +80,14 @@ def main():
         cap_qty = (10000 * 0.15) / 50290
         assert abs(order["qty"] - min((10000 * 0.01) / 490, cap_qty)) < 1e-6, order
         assert order["fees"] > 0, "fees must be charged"
+        # Regression: the fill's broker_ref must reach the journal —
+        # reconciliation matches on it, and without it every real order is
+        # orphaned from the broker (no status sync, no broker-side closes).
+        assert order["broker_ref"].startswith("paper-"), order
+        db_row = database.load_orders(conn, status="filled")[0]
+        assert db_row["broker_ref"] == order["broker_ref"], db_row
         print(f"   ✅ Paper fill: qty={order['qty']:.4f} fill={order['fill_price']:.2f} "
-              f"fees={order['fees']:.4f}")
+              f"fees={order['fees']:.4f} broker_ref={order['broker_ref']}")
     except Exception as e:
         print(f"   ❌ Paper broker error: {e}")
         traceback.print_exc()
@@ -271,12 +277,157 @@ def main():
         _config.EXECUTION_BROKER = "paper"
         execution._assets_cache = {"at": 0.0, "tradable": None}
         all_syms = execution.broker_supported_symbols()
-        assert all_syms == set(_config.SYMBOLS), "paper broker trades everything"
+        assert all_syms == set(_config.TRADABLE_UNIVERSE), "paper broker trades everything"
         print(f"   ✅ Alpaca failure → empty set ({len(out)} held); paper → all {len(all_syms)} symbols")
+
+        # Success path: the crypto assets API + the US Bitcoin ETFs (they're
+        # equity assets, invisible to the crypto asset_class query) are both
+        # tradable — the AI's extra tradeable universe.
+        _config.EXECUTION_BROKER = "alpaca"
+        execution._assets_cache = {"at": 0.0, "tradable": None}
+        def fake_assets(*a, **k):
+            class R:
+                def raise_for_status(self):
+                    pass
+                def json(self):
+                    return [{"symbol": "BTC/USD", "tradable": True},
+                            {"symbol": "DOGE/USD", "tradable": True},
+                            {"symbol": "IBIT", "tradable": True}]
+            return R()
+        execution.requests.get = fake_assets
+        try:
+            ok = execution.broker_supported_symbols()
+        finally:
+            execution.requests.get = orig_get
+        assert "IBIT" in ok and "BITB" in ok, "ETFs must be tradable on Alpaca"
+        assert "BTC/USDT" in ok and "DOGE/USDT" in ok, "crypto pairs still matched"
+        assert len(ok) == 2 + len(_config.ETF_SYMBOLS), f"got {len(ok)}"
+        print(f"   ✅ Alpaca success → crypto pairs + all {len(_config.ETF_SYMBOLS)} ETFs tradable")
     except Exception as e:
         print(f"   ❌ broker_supported_symbols error: {e}")
         traceback.print_exc()
         errors.append(("broker_supported_symbols", e))
+
+    print("\n8. Testing the loss guard (circuit breaker)...")
+    try:
+        import execution
+
+        conn = _fresh_db()
+        _config.EXECUTION_BROKER = "paper"
+        _config.MAX_DAILY_LOSS_PCT = 3.0
+        _config.MAX_DRAWDOWN_PCT = 10.0
+
+        # Flat journal → never blocked.
+        g = execution.loss_guard_status(conn)
+        assert g["blocked"] is False, g
+
+        # Seed two closed losing trades today (exit_time today): total -$400
+        # on a $10k book = 4% daily loss → guard trips.
+        today = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        conn.execute(
+            """INSERT INTO orders (intent_hash, symbol, side, qty, entry, status,
+               source, fill_price, fill_time, exit_time, fees, pnl, created_at)
+               VALUES ('l1', 'BTC/USDT', 'LONG', 0.1, 50000, 'closed', 'paper',
+                       50000, ?, ?, 10, -200, ?)""",
+            (today, today, today))
+        conn.execute(
+            """INSERT INTO orders (intent_hash, symbol, side, qty, entry, status,
+               source, fill_price, fill_time, exit_time, fees, pnl, created_at)
+               VALUES ('l2', 'ETH/USDT', 'LONG', 1.0, 3000, 'closed', 'paper',
+                       3000, ?, ?, 5, -200, ?)""",
+            (today, today, today))
+        conn.commit()
+        g = execution.loss_guard_status(conn)
+        assert g["blocked"] is True, g
+        assert g["daily_loss_pct"] >= 3.0, g
+        assert "daily loss guard" in g["reason"], g
+
+        # A win today offsets the losses → unblocked again.
+        conn.execute(
+            """INSERT INTO orders (intent_hash, symbol, side, qty, entry, status,
+               source, fill_price, fill_time, exit_time, fees, pnl, created_at)
+               VALUES ('w1', 'SOL/USDT', 'SHORT', 2.0, 150, 'closed', 'paper',
+                       150, ?, ?, 5, 500, ?)""",
+            (today, today, today))
+        conn.commit()
+        g = execution.loss_guard_status(conn)
+        assert g["blocked"] is False, g
+
+        # Drawdown guard: peak equity 10k, equity down 15% → blocked.
+        conn = _fresh_db()
+        # Peak is set by a closed WIN first (chronologically), then a big loss.
+        conn.execute(
+            """INSERT INTO orders (intent_hash, symbol, side, qty, entry, status,
+               source, fill_price, fill_time, exit_time, fees, pnl, created_at)
+               VALUES ('pk', 'BTC/USDT', 'LONG', 0.1, 50000, 'closed', 'paper',
+                       50000, '2026-08-15T10:00:00Z', '2026-08-15T11:00:00Z',
+                       10, 1000, '2026-08-15T10:00:00Z')""")
+        conn.execute(
+            """INSERT INTO orders (intent_hash, symbol, side, qty, entry, status,
+               source, fill_price, fill_time, exit_time, fees, pnl, created_at)
+               VALUES ('dd', 'ETH/USDT', 'LONG', 1.0, 3000, 'closed', 'paper',
+                       3000, '2026-08-16T10:00:00Z', '2026-08-16T11:00:00Z',
+                       5, -2500, '2026-08-16T10:00:00Z')""")
+        conn.commit()
+        g = execution.loss_guard_status(conn)
+        assert g["peak_equity"] == 11000.0, g
+        assert g["equity_now"] == 8500.0, g
+        assert g["drawdown_pct"] >= 22.0, g  # 2500/11000 ≈ 22.7%
+        assert g["blocked"] is True, g
+        assert "drawdown guard" in g["reason"], g
+
+        # Disabled guard (threshold 0) never blocks.
+        _config.MAX_DAILY_LOSS_PCT = 0.0
+        _config.MAX_DRAWDOWN_PCT = 0.0
+        g = execution.loss_guard_status(conn)
+        assert g["blocked"] is False, g
+        print(f"   ✅ Loss guard: daily {g['daily_loss_pct']}% / "
+              f"drawdown {g['drawdown_pct']}% caps work + disabled = off")
+
+    except Exception as e:
+        print(f"   ❌ Loss guard error: {e}")
+        traceback.print_exc()
+        errors.append(("loss_guard", e))
+
+    print("\n8b. Account-retired exits don't trip the guard...")
+    try:
+        import execution
+
+        conn = _fresh_db()
+        _config.MAX_DAILY_LOSS_PCT = 3.0
+        _config.MAX_DRAWDOWN_PCT = 10.0
+        today = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # A big loss closed as account_retired (broker-swap bookkeeping) must
+        # not freeze the fresh account: -40% would trip a 10% drawdown cap.
+        conn.execute(
+            """INSERT INTO orders (intent_hash, symbol, side, qty, entry, status,
+               source, fill_price, fill_time, exit_time, fees, pnl, exit_reason, created_at)
+               VALUES ('ar1', 'BTC/USDT', 'LONG', 0.1, 50000, 'closed', 'paper',
+                       50000, ?, ?, 10, -4000, 'account_retired', ?)""",
+            (today, today, today))
+        conn.commit()
+        g = execution.loss_guard_status(conn)
+        assert g["blocked"] is False, g
+        assert g["equity_now"] == _config.INITIAL_CAPITAL, g
+        # Same loss WITHOUT the retirement flag trips the drawdown guard.
+        conn.execute(
+            """INSERT INTO orders (intent_hash, symbol, side, qty, entry, status,
+               source, fill_price, fill_time, exit_time, fees, pnl, exit_reason, created_at)
+               VALUES ('sl1', 'ETH/USDT', 'LONG', 1.0, 3000, 'closed', 'paper',
+                       3000, ?, ?, 5, -4000, 'sl', ?)""",
+            (today, today, today))
+        conn.commit()
+        g = execution.loss_guard_status(conn)
+        assert g["blocked"] is True and g["drawdown_pct"] >= 10.0, g
+        print("   ✅ account_retired exits excluded; real losses still trip the guard")
+    except Exception as e:
+        print(f"   ❌ Loss-guard retirement error: {e}")
+        traceback.print_exc()
+        errors.append(("loss_guard_retired", e))
+    except Exception as e:
+        print(f"   ❌ Loss guard error: {e}")
+        traceback.print_exc()
+        errors.append(("loss_guard", e))
 
     print("\n" + "═" * 50)
     if errors:

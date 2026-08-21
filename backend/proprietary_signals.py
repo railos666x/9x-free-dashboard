@@ -21,10 +21,17 @@ Two modes (config.PROPRIETARY_MODE):
       keys it degrades to HOLD for every symbol (never a hard dependency).
       Cached for PROPRIETARY_LLM_TTL seconds — news moves slowly.
 
+  "news" — the Groq news analyst (news_analyst.py) drives source B: LONG for
+      strongly positive sentiment with high confidence, SHORT for strongly
+      negative, HOLD inside the noise threshold (config NEWS_SIGNAL_*).
+      Requires GROQ_API_KEY + NEWS_ANALYST_ENABLED; degrades to HOLD (or []
+      when disabled) otherwise. Cached by the analyst (NEWS_ANALYST_CACHE_TTL).
+
 No entry/SL/TP levels are emitted — the arbitrator fills them from source A
-or the execution layer uses live prices. This is a *prototype* source: swap
-`generate_all_proposals` for your real proprietary generator (same shape:
-list of Proposal). Disabled entirely unless PROPRIETARY_SIGNALS_ENABLED=true.
+or the execution layer uses live prices (ATR-based defaults). This is a
+*prototype* source: swap `generate_all_proposals` for your real proprietary
+generator (same shape: list of Proposal). Disabled entirely unless
+PROPRIETARY_SIGNALS_ENABLED=true.
 """
 
 from __future__ import annotations
@@ -107,6 +114,48 @@ def _llm_proposals(conn) -> list[Proposal]:
     return props
 
 
+def _news_proposals(conn, symbols: list[str] | None = None) -> list[Proposal]:
+    """Source B driven by the Groq news analyst (news_analyst.signal_for).
+    [] when the analyst is off — never a hard dependency.
+
+    When config.AI_CONFLUENCE_GATE is on, every LONG/SHORT proposal is
+    verified against the live chart structure by agent 3 (ai_agents.
+    gate_news_trade): a BULLISH headline at heavy resistance that the
+    model flags as a DIVERGENCE / TRAP is dropped here, before the
+    arbitrator sees it. The gate never blocks a trade it can't run.
+    """
+    if not config.NEWS_ANALYST_ENABLED or not config.llm_available():
+        return []
+    from news_analyst import signal_for  # lazy — keeps imports flat
+    import ai_agents
+
+    props = []
+    for symbol in symbols or config.SYMBOLS:
+        try:
+            s = signal_for(conn, symbol)
+        except Exception:
+            continue  # one bad symbol must not kill the source
+        if s.get("action") not in ("LONG", "SHORT"):
+            continue
+        # Chart-confluence gate (agent 3) — opt-in, see config.
+        gate = ai_agents.gate_news_trade(conn, symbol, s["action"])
+        if not gate["pass"]:
+            continue  # chart invalidates the news signal — drop the proposal
+        why = [f"news {s['action']}: {s.get('reason')}"]
+        if s.get("horizon"):
+            why.append(f"impact horizon: {s['horizon']}")
+        if gate["verdict"]:
+            v = gate["verdict"]
+            why.append(f"chart confluence ok: support {v.get('support')}, "
+                       f"resistance {v.get('resistance')}")
+        props.append(Proposal(
+            symbol=symbol, direction=s["action"],
+            confidence=round(max(30.0, min(75.0, s.get("confidence", 0.5) * 100)), 1),
+            entry=None, stop_loss=None, take_profit=None,
+            source="proprietary-news", window="news", reasons=why))
+    return props
+
+
 def generate_all_proposals(conn, symbols: list[str] | None = None) -> list[Proposal]:
     """
     One Proposal per symbol from the proprietary source. Returns [] when
@@ -115,12 +164,14 @@ def generate_all_proposals(conn, symbols: list[str] | None = None) -> list[Propo
     if not config.PROPRIETARY_SIGNALS_ENABLED:
         return []
     mode = config.PROPRIETARY_MODE
+    if mode == "news":
+        return _news_proposals(conn, symbols)
     if mode == "llm":
         return _llm_proposals(conn)
 
     # rsi2 mode (default)
     out = []
-    for symbol in symbols or config.SYMBOLS:
+    for symbol in symbols or config.TRADABLE_UNIVERSE:
         try:
             df = indicators.add_all(
                 database.load_candles(conn, symbol, WINDOW, limit=200)

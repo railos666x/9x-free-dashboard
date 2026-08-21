@@ -3,17 +3,14 @@
 __pycache__/
 *.pyc
 
-# Data + local files
+# Data + local files (DB, logs, optimizer cache, exchange keys)
+data/
 *.db
 *.db-wal
 *.db-shm
 .env
 
-# Runtime artifacts (logs, optimizer output)
-data/
-
-# Server log + local editor config (never commit these)
-server.log
+# Local editor config (never commit)
 .vscode/
 
 # Database snapshots (scripts/backup_db.py)

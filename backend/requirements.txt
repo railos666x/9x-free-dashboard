@@ -10,3 +10,5 @@ requests           # Binance REST API + CryptoPanic
 feedparser         # RSS news feeds
 python-dotenv      # read the API key from .env
 websockets         # real-time Binance WebSocket streams
+smartmoneyconcepts # ICT smart money indicators (OB, FVG, liquidity, BOS/CHoCH)
+MetaTrader5        # Exness MT5 broker integration (Windows)

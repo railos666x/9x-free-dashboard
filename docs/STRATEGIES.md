@@ -75,7 +75,7 @@ at current data depth (overfitting risk). Needs walk-forward + purged CV.
 
 ## Active Workstreams
 
-1. **Parameter optimization with held-out fold** → `documentation/directives/DIRECTIVE-001-parameter-optimization.md`
+1. **Parameter optimization with held-out fold** → `docs/directives/DIRECTIVE-001-parameter-optimization.md`
 2. **Full data backfill** (all 87 symbols, new depths) — one agent at a time.
 3. **Cost sensitivity** — quantify fee/slippage burden (5 bps futures vs 10 bps spot).
 4. **Timeframe scan** — 15m / 4h to find where the reversion edge is strongest.

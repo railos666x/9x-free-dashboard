@@ -69,12 +69,20 @@ def main() -> None:
         return
 
     # ── 2. Funding rates ──────────────────────────────────────────
-    print("\n[2/3] Funding rates (perpetual futures)")
+    print("\n[2/4] Funding rates (perpetual futures)")
     collector.backfill_funding(conn)
 
     # ── 3. Macro assets ───────────────────────────────────────────
-    print("\n[3/3] Macro assets (gold + S&P 500)")
+    print("\n[3/4] Macro assets (metals/energy/forex/indices/rates)")
     macro_data.backfill_macro(conn, days=config.INTERVAL_BACKFILL_DAYS.get("1d", 730))
+
+    # ── 4. Bitcoin ETF candles (Yahoo 1h → the AI-tradeable universe) ──
+    print("\n[4/5] Bitcoin ETF 1h candles (IBIT/BITB/FBTC/BTCW/BTCO/HODL/EZBC/ARKB)")
+    macro_data.backfill_etf_candles(conn, days=400)
+
+    # ── 5. Exness instruments (Yahoo 1h → the MT5-tradeable universe) ──
+    print("\n[5/5] Exness 1h candles (forex/metals/indices/BTC/ETH)")
+    macro_data.backfill_exness_candles(conn, days=120)
 
     _done(t0)
 

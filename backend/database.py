@@ -10,12 +10,42 @@ dashboard reads, without "database is locked" errors.
 """
 
 import hashlib
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import pandas as pd
 
 import config
+
+
+def normalize_news_ts(raw) -> str:
+    """Normalize a news published_at to ISO-8601 UTC for SORTABLE storage.
+
+    Sources send a mix of RFC 2822 ("Wed, 12 Aug 2026 21:04:18 GMT") and
+    ISO strings ("2026-08-17T14:00:00Z"). Lexicographic ORDER BY on the
+    raw strings is garbage across formats ("Wed" > "Mon", and ISO beats
+    RFC because '2' > 'M'), which buried fresh macro stories behind older
+    RSS rows and starved the news analyst of the stories the bot trades.
+    Returns the input unchanged when unparseable."""
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    try:
+        dt = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return text  # leave unknown formats alone
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 def connect() -> sqlite3.Connection:
@@ -138,6 +168,59 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_news_verdicts_created ON news_verdicts(created_at);
+
+        CREATE TABLE IF NOT EXISTS ai_analyses (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent      TEXT,                -- news_sentiment | hold_research | chart_confluence
+            symbol     TEXT,
+            request    TEXT,                -- headline / catalyst / trade context asked
+            verdict    TEXT,                -- normalized outcome (BULLISH, ACCUMULATE_AND_HOLD, VALID, ...)
+            payload    TEXT,                -- the structured JSON answer, as text
+            model      TEXT,                -- which Groq model answered
+            created_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ai_analyses_created ON ai_analyses(created_at);
+
+        CREATE TABLE IF NOT EXISTS article_content (
+            url_hash   TEXT PRIMARY KEY,  -- sha256(url), for lookups
+            url        TEXT,
+            title      TEXT,
+            content    TEXT,              -- clean markdown body (main content only)
+            fetched_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS test_trades (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ran_at          TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            symbol          TEXT,
+            direction       TEXT,
+            sentiment       REAL,
+            confidence      REAL,
+            confirm_score   INTEGER,
+            regime          TEXT,
+            dxy_score       INTEGER,
+            smc_score       INTEGER,
+            session         TEXT,
+            calendar_blocked INTEGER,
+            entry_price     REAL,
+            stop_loss       REAL,
+            take_profit     REAL,
+            trailing_stop   REAL,
+            partial_close_price REAL,
+            exit_price      REAL,
+            exit_at         TEXT,
+            exit_reason     TEXT,
+            pnl             REAL,
+            pnl_pct         REAL,
+            ai_model        TEXT,
+            ai_reason       TEXT,
+            outcome         TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_test_trades_symbol ON test_trades(symbol);
+        CREATE INDEX IF NOT EXISTS idx_test_trades_outcome ON test_trades(outcome);
+        CREATE INDEX IF NOT EXISTS idx_test_trades_ran_at ON test_trades(ran_at);
         """
     )
     # Migrate older orders tables that predate the exit columns.
@@ -333,7 +416,7 @@ def save_news(conn, items: list) -> int:
                 item.get("source", ""),
                 item.get("title", ""),
                 item.get("url", ""),
-                item.get("published_at", ""),
+                normalize_news_ts(item.get("published_at", "")),
                 item.get("sentiment", "neutral"),
                 float(item.get("sentiment_score", 0.0)),
                 item.get("symbols", ""),
@@ -343,6 +426,23 @@ def save_news(conn, items: list) -> int:
         added += 1
     conn.commit()
     return added
+
+
+def backfill_news_ts(conn) -> int:
+    """One-time migration: normalize every non-ISO published_at so ORDER BY
+    published_at DESC is chronological. Returns rows updated."""
+    rows = conn.execute(
+        "SELECT id, published_at FROM news WHERE published_at != ''").fetchall()
+    updated = 0
+    for nid, raw in rows:
+        fixed = normalize_news_ts(raw)
+        if fixed and fixed != raw:
+            conn.execute("UPDATE news SET published_at = ? WHERE id = ?",
+                         (fixed, nid))
+            updated += 1
+    if updated:
+        conn.commit()
+    return updated
 
 
 def load_news(conn, limit: int = 50, sentiment=None, symbol=None) -> pd.DataFrame:
@@ -435,11 +535,16 @@ def discard_dry_run(conn, intent_hash: str) -> bool:
 
 
 def load_orders(conn, symbol: str = None, status: str = None,
+                source: str = None,
                 created_from: str = None, created_to: str = None,
+                exit_from: str = None, exit_to: str = None,
                 limit: int = 100) -> list[dict]:
-    """Recent orders, newest first. Optionally filter by symbol/status and
-    a created-at window (ISO datetimes — plain dates "YYYY-MM-DD" are
-    widened to the full day)."""
+    """Recent orders, newest first. Optionally filter by symbol/status,
+    source (which broker placed it — used to keep old accounts' trades off
+    the dashboard), a created-at window and/or an exit-time window (when a
+    CLOSED trade actually closed — open rows have no exit_time and drop out
+    of an exit window). ISO datetimes — plain dates "YYYY-MM-DD" are
+    widened to the full day."""
     query = "SELECT * FROM orders WHERE 1=1"
     params = []
     if symbol:
@@ -448,6 +553,9 @@ def load_orders(conn, symbol: str = None, status: str = None,
     if status:
         query += " AND status = ?"
         params.append(status)
+    if source:
+        query += " AND source = ?"
+        params.append(source)
     frm = _day_start(created_from) if created_from else None
     to = _day_end(created_to) if created_to else None
     if frm:
@@ -456,6 +564,14 @@ def load_orders(conn, symbol: str = None, status: str = None,
     if to:
         query += " AND created_at <= ?"
         params.append(to)
+    efrm = _day_start(exit_from) if exit_from else None
+    eto = _day_end(exit_to) if exit_to else None
+    if efrm:
+        query += " AND exit_time >= ?"
+        params.append(efrm)
+    if eto:
+        query += " AND exit_time <= ?"
+        params.append(eto)
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
     rows = conn.execute(query, params).fetchall()
@@ -488,6 +604,88 @@ def record_news_verdict(conn, symbol: str, direction: str, verdict: str,
          datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
+
+
+# ----------------------------------------------------------------------
+# Firecrawl article cache (see web_scraper.py)
+# ----------------------------------------------------------------------
+def get_article_cache(conn, url: str) -> dict | None:
+    """Cached scraped article for a URL if fresh (within the configured
+    TTL). Returns {title, content, fetched_at} or None."""
+    h = hashlib.sha256((url or "").encode()).hexdigest()
+    row = conn.execute(
+        "SELECT url, title, content, fetched_at FROM article_content "
+        "WHERE url_hash = ?", (h,)).fetchone()
+    if not row:
+        return None
+    age_h = ((datetime.now(timezone.utc) -
+              datetime.fromisoformat(row["fetched_at"])).total_seconds() / 3600)
+    if age_h > config.FIRECRAWL_CACHE_TTL_HOURS:
+        return None  # stale — caller rescrapes
+    return {"title": row["title"], "content": row["content"],
+            "fetched_at": row["fetched_at"]}
+
+
+def set_article_cache(conn, url: str, title: str, content: str) -> None:
+    """Store a scraped article (idempotent upsert). Never raises."""
+    h = hashlib.sha256((url or "").encode()).hexdigest()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO article_content
+               (url_hash, url, title, content, fetched_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (h, url, (title or "")[:400], content or "",
+             datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------
+# AI agent journal (see ai_agents.py — the three production agent prompts)
+# ----------------------------------------------------------------------
+def record_ai_analysis(conn, agent: str, symbol: str, request: str,
+                       verdict: str, payload: dict, model: str = "") -> None:
+    """Journal one agent answer (news sentiment / HODL research / chart
+    confluence) so the dashboard and the trade explainer can show why an
+    agent said what it said. Never raises — the journal is best-effort."""
+    try:
+        conn.execute(
+            """INSERT INTO ai_analyses
+               (agent, symbol, request, verdict, payload, model, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (agent, symbol or "", (request or "")[:400],
+             verdict or "", json.dumps(payload, default=str)[:8000],
+             model or "", datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def load_ai_analyses(conn, agent: str = None, limit: int = 20) -> list[dict]:
+    """Recent agent journal rows, newest first. Each row's `payload` is the
+    parsed JSON answer (falling back to the raw text on parse failure)."""
+    query = "SELECT id, agent, symbol, request, verdict, payload, model, created_at " \
+            "FROM ai_analyses"
+    params: list = []
+    if agent:
+        query += " WHERE agent = ?"
+        params.append(agent)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(min(limit, 200))
+    rows = []
+    try:
+        for r in conn.execute(query, params):
+            row = dict(r)
+            try:
+                row["payload"] = json.loads(row.get("payload") or "{}")
+            except (TypeError, ValueError):
+                row["payload"] = {"raw": (row.get("payload") or "")[:2000]}
+            rows.append(row)
+    except Exception:
+        return []
+    return rows
 
 
 def news_verdict_stats(conn, days: int = 7) -> dict:
@@ -526,3 +724,90 @@ def update_order_exit(conn, order_id: int, exit_price: float, exit_time: str,
         (exit_price, exit_time, exit_reason, pnl, fees, order_id),
     )
     conn.commit()
+
+
+# ----------------------------------------------------------------------
+# Test trades (AI paper-trading engine)
+# ----------------------------------------------------------------------
+def record_test_trade(conn, symbol: str, direction: str,
+                      sentiment: float = 0.0, confidence: float = 0.0,
+                      confirm_score: int = 0, regime: str = None,
+                      dxy_score: int = 0, smc_score: int = 0,
+                      session: str = None, calendar_blocked: int = 0,
+                      entry_price: float = 0.0, stop_loss: float = 0.0,
+                      take_profit: float = 0.0, ai_model: str = None,
+                      ai_reason: str = None) -> int:
+    """Insert a test trade and return its id."""
+    cur = conn.execute(
+        """
+        INSERT INTO test_trades
+            (symbol, direction, sentiment, confidence, confirm_score,
+             regime, dxy_score, smc_score, session, calendar_blocked,
+             entry_price, stop_loss, take_profit, ai_model, ai_reason,
+             outcome)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+        """,
+        (symbol, direction, sentiment, confidence, confirm_score,
+         regime, dxy_score, smc_score, session, calendar_blocked,
+         entry_price, stop_loss, take_profit, ai_model, ai_reason),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def load_test_trades(conn, limit: int = 100,
+                     status: str = None) -> list[dict]:
+    """Load test trades, optionally filtered by outcome status."""
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM test_trades WHERE outcome = ? "
+            "ORDER BY ran_at DESC LIMIT ?",
+            (status, limit)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM test_trades ORDER BY ran_at DESC LIMIT ?",
+            (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_test_trade_exit(conn, trade_id: int,
+                           exit_price: float = None,
+                           reason: str = None,
+                           pnl: float = None) -> None:
+    """Close a test trade with exit info."""
+    exit_at = datetime.now(timezone.utc).isoformat()
+    outcome = "open"
+    if pnl is not None:
+        outcome = "win" if pnl > 0 else "loss" if pnl < 0 else "breakeven"
+    conn.execute(
+        """
+        UPDATE test_trades
+        SET exit_price = COALESCE(?, exit_price),
+            exit_at = ?, exit_reason = COALESCE(?, exit_reason),
+            pnl = COALESCE(?, pnl), outcome = ?
+        WHERE id = ?
+        """,
+        (exit_price, exit_at, reason, pnl, outcome, trade_id),
+    )
+    conn.commit()
+
+
+def test_trade_stats(conn) -> dict:
+    """Summary statistics for test trades."""
+    rows = conn.execute(
+        "SELECT outcome, COUNT(*) as cnt, "
+        "COALESCE(SUM(pnl), 0) as total_pnl "
+        "FROM test_trades WHERE outcome IN ('win','loss','breakeven') "
+        "GROUP BY outcome"
+    ).fetchall()
+    total = sum(r["cnt"] for r in rows)
+    wins = next((r["cnt"] for r in rows if r["outcome"] == "win"), 0)
+    total_pnl = sum(r["total_pnl"] for r in rows)
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": next((r["cnt"] for r in rows if r["outcome"] == "loss"), 0),
+        "breakevens": next((r["cnt"] for r in rows if r["outcome"] == "breakeven"), 0),
+        "win_rate": round(wins / total, 3) if total > 0 else 0.0,
+        "total_pnl": round(total_pnl, 2),
+    }

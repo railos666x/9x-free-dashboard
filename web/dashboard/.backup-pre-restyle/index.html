@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>cryptoautomation · Dashboard</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="/dash-assets/dashboard.css" />
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body>
+
+<div class="page-bg"></div>
+
+<div class="app">
+  <!-- Inline SVG icon set (stroke, currentColor — professional, no emoji, no CDN) -->
+  <svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-logo" viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-coins" viewBox="0 0 24 24"><circle cx="9" cy="9" r="6"/><path d="M15 6.5A6 6 0 1 1 10 18"/></symbol>
+    <symbol id="i-briefcase" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M3 13h18"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10"/><path d="M20.5 15a9 9 0 0 1-14.9 3.4L1 14"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"/></symbol>
+    <symbol id="i-flask" viewBox="0 0 24 24"><path d="M9 3h6"/><path d="M10 3v6.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V3"/><path d="M7.5 15h9"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="M10 14L21 3"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+    <symbol id="i-caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  </svg>
+
+  <!-- ═══════════ Top bar ═══════════ -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo"><svg class="ic"><use href="#i-logo"/></svg></div>
+      <span class="brand-name">crypto<span class="brand-accent">automation</span></span>
+    </div>
+
+    <div class="ticker-pills" id="tickerPills">
+      <!-- filled by JS -->
+    </div>
+
+    <div class="topbar-actions">
+      <span class="reconnect-badge" id="reconnectBadge" hidden><svg class="ic ic-sm"><use href="#i-refresh"/></svg> Reconnecting…</span>
+      <span class="server-dot" id="serverDot" title="Backend status"></span>
+      <button class="icon-btn" title="Search assets" onclick="focusSearch()"><svg class="ic"><use href="#i-search"/></svg></button>
+      <button class="btn-primary" id="btnConnect" onclick="openConnect()">Connect exchange</button>
+    </div>
+  </header>
+
+  <!-- ═══════════ Sidebar + main ═══════════ -->
+  <div class="body">
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-label">Main menu</div>
+        <a class="nav-item active" data-view="dashboard" href="#"><svg class="ic"><use href="#i-grid"/></svg> Dashboard</a>
+        <a class="nav-item" data-view="assets" href="#"><svg class="ic"><use href="#i-coins"/></svg> Assets</a>
+        <a class="nav-item" data-view="portfolio" href="#"><svg class="ic"><use href="#i-briefcase"/></svg> My portfolio</a>
+        <a class="nav-item" data-view="bots" href="#"><svg class="ic"><use href="#i-settings"/></svg> Bots</a>
+        <a class="nav-item" data-view="learn" href="#"><svg class="ic"><use href="#i-book"/></svg> Learn</a>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">Trading</div>
+        <a class="nav-item" data-view="orders" href="#"><svg class="ic"><use href="#i-book"/></svg> Orders</a>
+        <a class="nav-item" data-view="signals" href="#"><svg class="ic"><use href="#i-zap"/></svg> Signals</a>
+        <a class="nav-item" data-view="aitest" href="#"><svg class="ic"><use href="#i-flask"/></svg> AI Test</a>
+      </div>
+    </aside>
+
+    <main class="content">
+
+      <!-- ═══════════ View: Dashboard ═══════════ -->
+      <section class="view active" id="view-dashboard">
+        <div class="row1">
+          <div class="asset-cards" id="assetCards">
+            <!-- 4 cards by JS -->
+          </div>
+          <section class="card port-value">
+            <div class="card-head">
+              <div class="card-title">Portfolio value</div>
+            </div>
+            <div id="portValueChart" class="chart"></div>
+          </section>
+        </div>
+
+        <div class="row2">
+          <section class="card total-assets">
+            <div class="card-head">
+              <div class="card-title">Total assets</div>
+            </div>
+            <div class="total-value" id="totalValue">$0.00</div>
+            <div class="tf-pills" id="tfPills">
+              <button class="tf-pill" data-range="1">1h</button>
+              <button class="tf-pill" data-range="7">Day</button>
+              <button class="tf-pill active" data-range="7">Wk</button>
+              <button class="tf-pill" data-range="30">Mh</button>
+              <button class="tf-pill" data-range="90">1Y</button>
+              <button class="tf-pill" data-range="365">All</button>
+            </div>
+            <div id="totalAssetsChart" class="chart"></div>
+          </section>
+
+          <div class="right-col">
+            <section class="card portfolio-list">
+              <div class="card-head">
+                <div class="card-title">Portfolio</div>
+              </div>
+              <div class="mini-tabs">
+                <button class="mini-tab active" data-tab="coin">By Coin</button>
+                <button class="mini-tab" data-tab="exchange">By Exchange</button>
+              </div>
+              <div id="portfolioList"></div>
+            </section>
+
+            <section class="card balance">
+              <div class="card-head">
+                <div class="card-title">Balance</div>
+              </div>
+              <div class="balance-value" id="balanceValue">$0.00 USD</div>
+              <div class="balance-sub" id="balanceSub"></div>
+              <div class="dist-bar" id="distBar"></div>
+              <div class="dist-legend" id="distLegend"></div>
+            </section>
+          </div>
+        </div>
+
+        <!-- ═══════════ Row 3: Stats + Radar + Heatmap ═══════════ -->
+        <div class="row3">
+          <div class="stats-grid">
+            <div class="stat-card" id="statTodayPnl">
+              <div class="stat-label">Today</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted"></div>
+            </div>
+            <div class="stat-card" id="statBalance">
+              <div class="stat-label">Current Balance</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted">Broker account</div>
+            </div>
+            <div class="stat-card" id="statTotalPnl">
+              <div class="stat-label">Total P&L</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted"></div>
+            </div>
+            <div class="stat-card" id="statStreak">
+              <div class="stat-label">Streak</div>
+              <div class="stat-value">0</div>
+              <div class="stat-sub muted"></div>
+            </div>
+            <div class="stat-card" id="statProfitFactor">
+              <div class="stat-label">Profit Factor</div>
+              <div class="stat-value">0.00</div>
+              <div class="stat-sub muted"></div>
+            </div>
+            <div class="stat-card" id="statBiggestWin">
+              <div class="stat-label">Biggest Win</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted">Single trade best</div>
+            </div>
+            <div class="stat-card" id="statBestDay">
+              <div class="stat-label">Best Day</div>
+              <div class="stat-value">$0.00</div>
+              <div class="stat-sub muted"></div>
+            </div>
+          </div>
+
+          <div class="row3-bottom">
+            <section class="card radar-card">
+              <div class="card-head">
+                <div class="card-title">Trade Score</div>
+                <div class="radar-score" id="radarScore">0</div>
+              </div>
+              <div class="radar-sub muted" id="radarLabel">Your overall trading performance</div>
+              <div id="radarChart" class="chart radar-chart"></div>
+            </section>
+
+            <section class="card heatmap-card">
+              <div class="card-head">
+                <div class="card-title">Trading Activity</div>
+                <span class="muted" id="heatmapMeta"></span>
+              </div>
+              <div class="heatmap-legend">
+                <span class="muted">Loss</span>
+                <span class="heatmap-dot hl-red"></span>
+                <span class="heatmap-dot hl-red"></span>
+                <span class="heatmap-dot hl-red"></span>
+                <span class="heatmap-dot hl-red"></span>
+                <span class="heatmap-dot hl-green"></span>
+                <span class="heatmap-dot hl-green"></span>
+                <span class="heatmap-dot hl-green"></span>
+                <span class="heatmap-dot hl-green"></span>
+                <span class="muted">Profit</span>
+              </div>
+              <div id="heatmapChart" class="chart heatmap-chart"></div>
+              <div class="heatmap-stats" id="heatmapStats"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════════ View: Assets ═══════════ -->
+      <section class="view" id="view-assets">
+        <section class="card crypto-table-card">
+          <div class="card-head">
+            <div class="card-title">All Crypto</div>
+            <div class="assets-head-right">
+              <div class="tf-pills table-tf" id="tableTfPills">
+                <button class="tf-pill" data-interval="1m">1m</button>
+                <button class="tf-pill" data-interval="5m">5m</button>
+                <button class="tf-pill" data-interval="15m">15m</button>
+                <button class="tf-pill active" data-interval="1h">1h</button>
+                <button class="tf-pill" data-interval="4h">4h</button>
+                <button class="tf-pill" data-interval="1d">1d</button>
+              </div>
+              <input class="table-search" id="tableSearch" placeholder="Search…" oninput="filterTable()" />
+            </div>
+          </div>
+          <table class="crypto-table">
+            <thead>
+              <tr>
+                <th>Asset</th><th>Price</th><th>Change</th><th>RSI</th><th>Volume</th><th>Spark</th>
+              </tr>
+            </thead>
+            <tbody id="cryptoTableBody"></tbody>
+          </table>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: My portfolio ═══════════ -->
+      <section class="view" id="view-portfolio">
+        <div class="pf-grid">
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Holdings</div>
+              <div class="mini-tabs">
+                <button class="mini-tab active" data-tab="coin">By Coin</button>
+                <button class="mini-tab" data-tab="exchange">By Exchange</button>
+              </div>
+            </div>
+            <div id="portfolioListFull"></div>
+          </section>
+
+          <section class="card balance">
+            <div class="card-head">
+              <div class="card-title">Balance</div>
+            </div>
+            <div class="balance-value" id="balanceValue2">$0.00 USD</div>
+            <div class="balance-sub" id="balanceSub2"></div>
+            <div class="dist-bar" id="distBar2"></div>
+            <div class="dist-legend" id="distLegend2"></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ═══════════ View: Bots ═══════════ -->
+      <section class="view" id="view-bots">
+        <section class="card bots-card">
+          <div class="card-head">
+            <div class="card-title">Signal Bot — strategy backtest</div>
+          </div>
+          <div class="bot-controls">
+            <label class="ap-label">Symbol
+              <div class="ap-wrap" id="assetPicker">
+                <div class="asset-picker">
+                  <div class="ap-input-row">
+                    <span class="ap-search-ico"><svg class="ic"><use href="#i-search"/></svg></span>
+                    <input id="apInput" type="text" autocomplete="off" spellcheck="false" placeholder="Search…" />
+                    <span class="ap-caret"><svg class="ic ic-sm"><use href="#i-caret"/></svg></span>
+                  </div>
+                  <div class="ap-list" id="apList" hidden></div>
+                </div>
+                <div class="ap-quick" id="apQuick"></div>
+              </div>
+            </label>
+            <label>Timeframe
+              <div class="asset-picker ap-select" id="intervalPicker">
+                <div class="ap-input-row" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="false">
+                  <span class="ap-value" id="intervalValue">1h</span>
+                  <span class="ap-caret"><svg class="ic ic-sm"><use href="#i-caret"/></svg></span>
+                </div>
+                <div class="ap-list" id="intervalList" hidden role="listbox"></div>
+              </div>
+            </label>
+            <button class="btn-primary" id="btnRunBacktest" onclick="runBacktest()">Run backtest</button>
+          </div>
+          <div id="btResults" class="bt-results">
+            <div class="muted">Pick a symbol and run a backtest of the v2 mean-reversion strategy (net of fees + slippage).</div>
+          </div>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: Orders (bot status + trade journal) ═══════════ -->
+      <section class="view" id="view-orders">
+        <section class="card bots-card">
+          <div class="card-head">
+            <div class="card-title">Bot status</div>
+            <span class="muted" id="botStatusMeta"></span>
+          </div>
+          <div id="botStatusBody" class="bot-status-body"><div class="muted">Loading…</div></div>
+          <div id="heldReasons" class="held-reasons"></div>
+          <div class="bot-controls-row">
+            <div class="bot-loop-ctl">
+              <span class="muted">Auto loop:</span>
+              <span id="botLoopBadge" class="signal-badge badge-hold">…</span>
+              <button class="btn-primary" id="btnToggleLoop" onclick="toggleBotLoop()">Start</button>
+            </div>
+            <div class="bot-source-ctl">
+              <label>Source A
+                <select id="botSourceSelect" title="Signal source — the AI/news analyst is the only trade source since the candle-factor engines were retired">
+                  <option value="ai_news">ai_news (AI + news APIs)</option>
+                </select>
+              </label>
+              <button class="btn-primary" id="btnApplySource" onclick="applyBotSource()">Apply</button>
+              <span class="muted" id="botSourceMsg"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card ord-chart-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title" id="ordChartTitle">Position chart</div>
+            <div class="dash-controls">
+              <label class="ap-label">Asset
+                <div class="ap-wrap" id="ordPickerWrap">
+                  <div class="asset-picker">
+                    <div class="ap-input-row">
+                      <span class="ap-search-ico"><svg class="ic"><use href="#i-search"/></svg></span>
+                      <input id="ordInput" type="text" autocomplete="off" spellcheck="false" placeholder="Search…" />
+                      <span class="ap-caret"><svg class="ic ic-sm"><use href="#i-caret"/></svg></span>
+                    </div>
+                    <div class="ap-list" id="ordList" hidden></div>
+                  </div>
+                  <div class="ap-quick" id="ordQuick"></div>
+                </div>
+              </label>
+              <div class="tf-pills" id="ordTfPills">
+                <button class="tf-pill" data-interval="1m">1m</button>
+                <button class="tf-pill" data-interval="5m">5m</button>
+                <button class="tf-pill" data-interval="15m">15m</button>
+                <button class="tf-pill active" data-interval="1h">1h</button>
+                <button class="tf-pill" data-interval="4h">4h</button>
+                <button class="tf-pill" data-interval="1d">1d</button>
+              </div>
+            </div>
+          </div>
+          <div id="ordChart" class="chart ord-chart"></div>
+          <div class="sig-level-legend muted" id="ordLevelLegend"></div>
+        </section>
+
+        <div class="trades-filter" style="margin-top:16px;">
+          <span class="muted">Closed trades period:</span>
+          <div class="tf-pills" id="tradeRangePills">
+            <button class="tf-pill" data-range="today">Today</button>
+            <button class="tf-pill active" data-range="7d">7 days</button>
+            <button class="tf-pill" data-range="30d">30 days</button>
+            <button class="tf-pill" data-range="all">All</button>
+          </div>
+          <label class="muted">From <input type="date" id="tradeFrom"></label>
+          <label class="muted">To <input type="date" id="tradeTo"></label>
+          <button class="btn-primary" id="btnApplyTradeRange">Apply</button>
+          <span class="muted" id="tradeRangeMeta"></span>
+        </div>
+
+        <div class="trades-grid" style="margin-top:16px;">
+          <section class="card pnl-card">
+            <div class="card-head">
+              <div class="card-title">Profit by currency</div>
+              <span class="muted" id="pnlDonutMeta"></span>
+            </div>
+            <div class="dual-donut-wrap">
+              <div class="donut-pane">
+                <div class="donut-pane-label"><span class="broker-dot dot-mt5"></span> MT5 / Exness</div>
+                <div id="pnlDonutMt5" class="chart pnl-donut"></div>
+              </div>
+              <div class="donut-pane">
+                <div class="donut-pane-label"><span class="broker-dot dot-binance"></span> Binance</div>
+                <div id="pnlDonutBinance" class="chart pnl-donut"></div>
+              </div>
+            </div>
+            <div id="pnlBreakdown" class="pnl-breakdown"><div class="muted">Loading…</div></div>
+            <div class="closed-trades-head">
+              <div class="card-title">Every closed trade</div>
+              <span class="muted" id="closedTradesMeta"></span>
+            </div>
+            <div id="closedTradesList" class="closed-trades-list"><div class="muted">No closed trades in this period.</div></div>
+          </section>
+
+          <section class="card live-card">
+            <div class="card-head">
+              <div class="card-title">Live trades</div>
+              <span class="muted" id="liveTradesMeta">—</span>
+            </div>
+            <div id="liveTradesBody" class="live-trades-body"><div class="muted">Loading…</div></div>
+          </section>
+        </div>
+
+        <section class="card crypto-table-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">Trade journal</div>
+            <div class="assets-head-right">
+              <span class="signal-badge badge-hold" id="botModeBadge" title="Bot run mode (set by the Auto loop control)">AUTO: ?</span>
+              <button class="btn-primary" id="btnRunBotDry" onclick="runBotCycle(true)"><svg class="ic"><use href="#i-flask"/></svg> Dry test</button>
+              <button class="btn-warn" id="btnRunBotLive" onclick="runBotCycle(false)"><svg class="ic"><use href="#i-play"/></svg> Live test</button>
+            </div>
+          </div>
+          <div id="journalSummary" class="journal-summary muted"></div>
+          <table class="crypto-table orders-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>SL</th><th>TP</th>
+                <th>Exit</th><th>PnL</th><th>Status</th><th>Broker</th>
+                <th>Why</th><th>Time</th>
+              </tr>
+            </thead>
+            <tbody id="ordersBody"><tr><td colspan="12" class="muted">No orders yet.</td></tr></tbody>
+          </table>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: Learn (trading tutor) ═══════════ -->
+      <section class="view" id="view-learn">
+        <div class="tutor-grid">
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Trading tutor</div>
+              <span class="muted">basics + advanced, tied to this system</span>
+            </div>
+            <div id="tutorTopicsList" class="tutor-topics"></div>
+            <div id="tutorBody" class="tutor-body"><div class="muted">Loading…</div></div>
+          </section>
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Why this trade?</div>
+              <span class="muted">last bot cycle explained</span>
+            </div>
+            <div id="tradeExplainBody" class="tutor-body"><div class="muted">Loading…</div></div>
+          </section>
+        </div>
+      </section>
+
+      <!-- ═══════════ View: AI Test (paper-trading + confirmation pipeline) ═══════════ -->
+      <section class="view" id="view-aitest">
+        <!-- AI Confirmation Pipeline Status -->
+        <section class="card bots-card">
+          <div class="card-head">
+            <div class="card-title">AI Confirmation Pipeline</div>
+            <span class="muted" id="aiLayersMeta">6-layer gate</span>
+          </div>
+          <div id="aiLayersBody" class="ai-layers-body"><div class="muted">Loading…</div></div>
+        </section>
+
+        <!-- Circuit Breaker + Feedback -->
+        <div class="ai-test-grid" style="margin-top:16px;">
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Circuit Breaker</div>
+              <span class="muted" id="cbMeta">tiered risk control</span>
+            </div>
+            <div id="circuitBreakerBody" class="cb-body"><div class="muted">Loading…</div></div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Feedback Calibration</div>
+              <span class="muted" id="feedbackMeta">adaptive thresholds</span>
+            </div>
+            <div id="feedbackBody" class="feedback-body"><div class="muted">Loading…</div></div>
+          </section>
+        </div>
+
+        <!-- Test Trades Table -->
+        <section class="card crypto-table-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">AI Paper Trades</div>
+            <div class="assets-head-right">
+              <span class="signal-badge" id="testTradeModeBadge">MODE: ?</span>
+              <span class="muted" id="testTradeStats"></span>
+            </div>
+          </div>
+          <table class="crypto-table orders-table">
+            <thead>
+              <tr>
+                <th>Time</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th>
+                <th>TP</th><th>Exit</th><th>PnL</th><th>TC</th><th>DXY</th>
+                <th>SMC</th><th>Regime</th><th>Session</th><th>Outcome</th>
+              </tr>
+            </thead>
+            <tbody id="testTradesBody"><tr><td colspan="14" class="muted">No test trades yet.</td></tr></tbody>
+          </table>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: Signals ═══════════ -->
+      <section class="view" id="view-signals">
+        <div class="sig-layout">
+          <section class="card signals-card">
+            <div class="card-head">
+              <div class="card-title">Trading signals</div>
+              <span class="muted" id="signalsMeta"></span>
+            </div>
+            <div class="sig-picker-row">
+              <label class="ap-label">Jump to asset
+                <div class="ap-wrap" id="sigPickerWrap">
+                  <div class="asset-picker">
+                    <div class="ap-input-row">
+                      <span class="ap-search-ico"><svg class="ic"><use href="#i-search"/></svg></span>
+                      <input id="sigInput" type="text" autocomplete="off" spellcheck="false" placeholder="Search…" />
+                      <span class="ap-caret"><svg class="ic ic-sm"><use href="#i-caret"/></svg></span>
+                    </div>
+                    <div class="ap-list" id="sigList" hidden></div>
+                  </div>
+                  <div class="ap-quick" id="sigQuick"></div>
+                </div>
+              </label>
+              <span class="sig-hint muted">Click a signal card to chart it</span>
+            </div>
+            <div id="signalsList" class="sig-list"><div class="muted">Loading signals…</div></div>
+          </section>
+
+          <section class="card sig-chart-card">
+            <div class="card-head">
+              <div class="card-title" id="sigChartTitle">Chart</div>
+              <div class="tf-pills sig-tf" id="sigTfPills">
+                <button class="tf-pill" data-interval="1m">1m</button>
+                <button class="tf-pill" data-interval="5m">5m</button>
+                <button class="tf-pill" data-interval="15m">15m</button>
+                <button class="tf-pill active" data-interval="1h">1h</button>
+                <button class="tf-pill" data-interval="4h">4h</button>
+                <button class="tf-pill" data-interval="1d">1d</button>
+              </div>
+            </div>
+            <div id="sigChart" class="chart sig-chart"></div>
+            <div class="sig-level-legend muted" id="sigLevelLegend"></div>
+          </section>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<!-- ═══════════ Connect exchange modal ═══════════ -->
+<div class="modal-overlay" id="connectModal" style="display:none;">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">Connect exchange <span class="binance-tag">Binance</span></div>
+      <button class="modal-close" onclick="closeConnect()">✕</button>
+    </div>
+    <div class="modal-tabs">
+      <button class="modal-tab">Fast Connect</button>
+      <button class="modal-tab active">Connect with API keys</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-sub">Connect keys securely ⓘ</div>
+      <ol class="steps">
+        <li>Log in to your exchange account and go to API settings.</li>
+        <li>Turn on IP whitelisting and copy/paste the following list of IP addresses:
+          <div class="ip-box">
+            <code>192.26.9.10 193.26.9.14 194.26.9.18</code>
+            <button class="copy-btn" onclick="copyIPs()">⧉</button>
+          </div>
+        </li>
+        <li>Paste generated data in inputs below.</li>
+      </ol>
+      <div class="form-field">
+        <label>Name</label>
+        <input id="keyName" value="My Binance" />
+      </div>
+      <div class="form-field">
+        <label>API Key</label>
+        <input id="keyApi" placeholder="Enter api key..." />
+      </div>
+      <div class="form-field">
+        <label>API Secret</label>
+        <input id="keySecret" type="password" placeholder="Enter api secret..." />
+      </div>
+      <a class="link" href="#">Available account types</a>
+      <div class="warn">Keys are stored locally and sent only to Binance. Enable IP whitelisting.</div>
+      <button class="btn-primary btn-wide" id="btnConnectSubmit" onclick="submitConnect()">Connect Binance</button>
+      <div class="modal-foot">Don't have an account? <a class="link" href="#">Register</a></div>
+    </div>
+  </div>
+</div>
+
+<script src="/dash-assets/dashboard.js"></script>
+</body>
+</html>

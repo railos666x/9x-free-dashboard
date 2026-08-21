@@ -32,6 +32,13 @@ import database
 # collector's own polling cadence.
 MAX_STALE_MULT = 2.5
 
+# Symbols WITHOUT a quote part ("IBIT", not "BTC/USDT") are US ETFs/stocks:
+# they trade exchange hours only, so on a Monday pre-market the newest 1h
+# bar is Friday's close (~64h old). The crypto window would hold every ETF
+# signal until the market prints fresh bars. 3.5 days covers a weekend +
+# holiday while still rejecting a genuinely dead feed.
+ETF_STALE_MULT = 84.0
+
 # A close-to-close move above this many ATRs is treated as a possible
 # bad tick UNLESS volume confirms it (volume > this multiple of its
 # 20-bar median).
@@ -139,8 +146,10 @@ def cross_source_ok(price_a: float, price_b: float,
     return diff <= tolerance_pct
 
 
-def verify_candle_df(df: pd.DataFrame, interval: str) -> dict:
-    """Full data-quality gate over a candles DataFrame. Returns {ok, checks}."""
+def verify_candle_df(df: pd.DataFrame, interval: str, symbol: str = "") -> dict:
+    """Full data-quality gate over a candles DataFrame. Returns {ok, checks}.
+    `symbol` tunes the staleness window: non-pair symbols (US ETFs/stocks)
+    trade market hours, so they get a weekend-tolerant window."""
     checks = {}
     sanity = candle_sanity(df)
     checks["sanity"] = sanity
@@ -148,7 +157,8 @@ def verify_candle_df(df: pd.DataFrame, interval: str) -> dict:
         return {"ok": False, "checks": checks}
 
     last_open = float(df["open_time"].iloc[-1]) if "open_time" in df.columns else None
-    stale = staleness_ok(last_open, interval) if last_open else False
+    max_stale = ETF_STALE_MULT if (symbol and "/" not in symbol) else MAX_STALE_MULT
+    stale = staleness_ok(last_open, interval, max_stale_mult=max_stale) if last_open else False
     checks["fresh"] = {"ok": stale, "last_open_ms": last_open}
     if not stale:
         return {"ok": False, "checks": checks}
@@ -171,7 +181,7 @@ def verify_intent(intent, conn, interval: str = "1h") -> dict:
     Returns {ok, checks}.
     """
     df = database.load_candles(conn, intent.symbol, interval, limit=100)
-    data = verify_candle_df(df, interval)
+    data = verify_candle_df(df, interval, symbol=intent.symbol)
     checks = {"data": data}
     if not data["ok"]:
         return {"ok": False, "checks": checks}

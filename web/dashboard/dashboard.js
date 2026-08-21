@@ -6,9 +6,9 @@
 
 const $ = (id) => document.getElementById(id);
 
-const ACCENT = "#4c9aff";
-const UP = "#2ecc8f";
-const DOWN = "#ff5c5c";
+const ACCENT = "#0ecb81";
+const UP = "#0ecb81";
+const DOWN = "#f6465d";
 
 const fmt = (n, d = 2) => {
   if (n === null || n === undefined || !isFinite(n)) return "—";
@@ -24,7 +24,15 @@ const fmtCompact = (n) => {
   if (a >= 1e3) return `$${(n / 1e3).toFixed(2)}K`;
   return `$${fmt(n)}`;
 };
-const symOf = (symbol) => symbol.split("/")[0];
+const symOf = (symbol) => {
+  // For crypto (ending in /USDT or USDT), show base currency only
+  const s = symbol.toUpperCase();
+  if (s.endsWith("/USDT") || s.endsWith("USDT")) {
+    return s.split("/")[0].replace("USDT", "");
+  }
+  // For forex/commodities/indices, show full symbol
+  return symbol;
+};
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 // Price formatting that keeps significant digits for micro-priced coins (SHIB etc).
 // Professional inline-SVG icon from the sprite in index.html (no emoji).
@@ -41,6 +49,17 @@ const fmtPrice = (n) => {
 };
 
 // ── API helper with timeout + one retry on transient failures ───────
+// Consecutive failed polls flip a visible "Reconnecting…" badge in the
+// topbar (server restart / brief downtime) instead of silent console
+// noise. Any successful response clears it.
+let _connFailures = 0;
+const RECONNECT_SHOW_AFTER = 2;   // show the badge after this many misses
+
+function _setReconnecting(show) {
+  const b = $("reconnectBadge");
+  if (b) b.hidden = !show;
+}
+
 async function api(path, opts = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), opts.timeout || 20000);
@@ -51,7 +70,10 @@ async function api(path, opts = {}) {
       ...opts,
     });
     if (!res.ok) throw new Error(`${path} → ${res.status}`);
-    return await res.json();
+    const data = await res.json();
+    _connFailures = 0;                       // any success = we're back
+    _setReconnecting(false);
+    return data;
   } catch (e) {
     // A connection reset/refused usually means the server was mid-restart.
     // GETs retry once after a short pause so the page self-heals; POSTs
@@ -61,6 +83,8 @@ async function api(path, opts = {}) {
       await new Promise((r) => setTimeout(r, 1500));
       return api(path, { ...opts, _retried: true });
     }
+    _connFailures += 1;
+    if (_connFailures >= RECONNECT_SHOW_AFTER) _setReconnecting(true);
     throw e;
   } finally {
     clearTimeout(timer);
@@ -81,7 +105,7 @@ const state = {
 };
 
 // ── View switching (sidebar) ────────────────────────────────────────
-const VIEWS = ["dashboard", "assets", "portfolio", "bots", "orders", "signals"];
+const VIEWS = ["dashboard", "assets", "portfolio", "bots", "orders", "signals", "learn", "aitest"];
 
 function switchView(name) {
   if (!VIEWS.includes(name)) name = "dashboard";
@@ -91,7 +115,7 @@ function switchView(name) {
     v.classList.toggle("active", v.id === `view-${name}`));
   // Charts initialised inside a hidden view have zero size — resize on show.
   requestAnimationFrame(() => {
-    [portValueChart, totalChart, sigChart, pnlChart].forEach((c) => c && c.resize());
+    [portValueChart, totalChart, sigChart, pnlChartMt5, pnlChartBinance].forEach((c) => c && c.resize());
   });
   if (name === "assets") loadWatchlist();
   if (name === "orders") {
@@ -108,6 +132,7 @@ function switchView(name) {
     if (pendingSigCandles) { renderSigChart(pendingSigCandles); pendingSigCandles = null; }
     else if (state.sigSymbol) loadSigChart();
   }
+  if (name === "learn") loadTutor();
 }
 
 // ── Orders view: bot status + trade journal ─────────────────────────
@@ -161,8 +186,8 @@ function renderBotStatus(s) {
     : `active (${s.llm_providers} provider${s.llm_providers > 1 ? "s" : ""})`;
   const stats = [
     ["Broker", brokerLabel],
-    ["Source A", esc(s.signal_source_a || "math_engine")],
-    ["Source B (proprietary)", s.proprietary_enabled ? "on" : "off — bot holds"],
+    ["Source", esc(s.signal_source_a || "ai_news")],
+    ["Source B (proprietary)", s.proprietary_enabled ? "on (legacy)" : "retired — AI/news only"],
     ["LLM overlay", llmLbl],
     ["Agreement gate", gateLabel],
     ["Live safety", liveBlocked ? `${icon("alert")} blocked (test gate)` : "ok"],
@@ -208,7 +233,7 @@ function renderBotStatus(s) {
   const sel = $("botSourceSelect");
   const applyBtn = $("btnApplySource");
   const srcMsg = $("botSourceMsg");
-  if (sel) sel.value = s.signal_source_a || "math_engine";
+  if (sel) sel.value = s.signal_source_a || "ai_news";
   if (applyBtn) applyBtn.disabled = loopRunning;
   if (srcMsg) srcMsg.innerHTML = loopRunning ? `${icon("lock", "ic-sm")} stop the loop to change source` : "";
   let cycleHtml = '<div class="muted">No cycle run yet — press “Dry test” or “Live test”.</div>';
@@ -307,6 +332,16 @@ function _rangeQuery() {
   return q.toString();
 }
 
+// The closed-trades panel (donut + every-closed-trade list) is a PERIOD of
+// closed trades: window by EXIT time (when the trade actually closed), not
+// created time. Open rows have no exit_time and drop out automatically.
+function _closedRangeQuery() {
+  const q = new URLSearchParams({ limit: "500", detail: "1", status: "closed" });
+  if (tradesRange.from) q.set("exitFrom", tradesRange.from);
+  if (tradesRange.to) q.set("exitTo", tradesRange.to);
+  return q.toString();
+}
+
 function _periodLabel() {
   const r = tradesRange;
   if (r.preset === "today") return "today";
@@ -372,6 +407,23 @@ async function loadOrders() {
   } catch (e) {
     const b = $("ordersBody");
     if (b) b.innerHTML = `<tr><td colspan="15" class="muted">Orders unavailable — ${esc(e.message)}</td></tr>`;
+  }
+  loadClosedTrades(); // keep the period panel in sync with every poll/preset
+}
+
+// Closed-trades panel: donut + every-closed-trade list, windowed by the
+// trade's EXIT time (see _closedRangeQuery).
+async function loadClosedTrades() {
+  try {
+    // Donut needs ALL trades (open + closed) to show unrealized PnL too
+    const donutData = await api("/api/orders?limit=500&detail=1");
+    renderPnlDonut(donutData.summary);
+    // List shows only closed trades in the selected date range
+    const data = await api("/api/orders?" + _closedRangeQuery());
+    renderClosedTrades(data.orders || []);
+  } catch (e) {
+    const box = $("closedTradesList");
+    if (box) box.innerHTML = `<div class="muted">Closed trades unavailable — ${esc(e.message)}</div>`;
   }
 }
 
@@ -495,23 +547,28 @@ function renderClosedTrades(orders) {
   const box = $("closedTradesList"), meta = $("closedTradesMeta");
   if (!box) return;
   const closed = orders.filter((o) => o.status === "closed");
-  if (meta) meta.textContent = `${closed.length} trade${closed.length === 1 ? "" : "s"} · ${_periodLabel()}`;
+  if (meta) meta.textContent = `${closed.length} trade${closed.length === 1 ? "" : "s"} \u00b7 ${_periodLabel()}`;
   if (!closed.length) {
     box.innerHTML = '<div class="muted">No closed trades in this period.</div>';
     return;
   }
   const shown = closed.slice(0, 200);
-  const more = closed.length > shown.length ? `<div class="muted" style="margin-top:8px">… +${closed.length - shown.length} more (widen the date range to see them)</div>` : "";
+  const more = closed.length > shown.length ? `<div class="muted" style="margin-top:8px">\u2026 +${closed.length - shown.length} more (widen the date range to see them)</div>` : "";
   box.innerHTML = shown.map((o) => {
     const long = o.side === "LONG";
     const pnlCls = o.pnl > 0 ? "up" : o.pnl < 0 ? "down" : "";
-    const exit = o.exit_price != null ? fmtPrice(o.exit_price) : "—";
+    const exit = o.exit_price != null ? fmtPrice(o.exit_price) : "\u2014";
     const t = String(o.exit_time || o.created_at || "").slice(0, 16).replace("T", " ");
+    const broker = _brokerOf(o);
+    const brokerTag = broker === "binance"
+      ? '<span class="broker-tag tag-binance" title="Binance">B</span>'
+      : '<span class="broker-tag tag-mt5" title="MT5/Exness">M</span>';
     return `<div class="closed-trade">
+      ${brokerTag}
       <span class="sym">${symOf(o.symbol)}</span>
-      <span class="signal-badge ${long ? "badge-long" : "badge-short"}">${long ? "▲" : "▼"}</span>
+      <span class="signal-badge ${long ? "badge-long" : "badge-short"}">${long ? "\u25B2" : "\u25BC"}</span>
       <span class="muted">${fmt(o.qty, 2)}</span>
-      <span class="muted">${fmtPrice(o.entry)} → ${exit}${o.exit_reason ? ` <span class="muted">(${esc(o.exit_reason)})</span>` : ""}</span>
+      <span class="muted">${fmtPrice(o.entry)} \u2192 ${exit}${o.exit_reason ? ` <span class="muted">(${esc(o.exit_reason)})</span>` : ""}</span>
       <span class="ct-pnl ${pnlCls}">${o.pnl > 0 ? "+" : ""}${fmt(o.pnl, 2)}</span>
       <span class="muted">${esc(t)}</span>
     </div>`;
@@ -519,10 +576,10 @@ function renderClosedTrades(orders) {
 }
 
 function renderOrders(orders, summary) {
+  // Journal table + strip only — the closed-trades donut/list are rendered
+  // by loadClosedTrades() on the exit-time window (see _closedRangeQuery).
   const b = $("ordersBody");
   if (!b) return;
-  renderPnlDonut(summary);
-  renderClosedTrades(orders);
   const strip = $("journalSummary");
   if (strip) {
     if (summary) {
@@ -534,108 +591,167 @@ function renderOrders(orders, summary) {
         `Dry-run rows: <b>${summary.dry_run}</b> · ` +
         `Realized PnL: <b class="${pnlCls}">${summary.realized_pnl > 0 ? "+" : ""}$${fmt(summary.realized_pnl, 2)}</b>` +
         ` · Unrealized: <b class="${unCls}">${(summary.unrealized_pnl || 0) > 0 ? "+" : ""}$${fmt(summary.unrealized_pnl || 0, 2)}</b>` +
-        ` <button class="icon-btn" style="padding:2px 10px;font-size:12px;" onclick="reconcileBroker()" title="Sync journal statuses with the broker">⟳ Reconcile</button>`;
+        ` <button class="icon-btn" style="padding:2px 10px;font-size:12px;" onclick="reconcileBroker()" title="Sync journal statuses with the broker">\u27F3 Reconcile</button>`;
     } else {
       strip.innerHTML = "";
     }
   }
   if (!orders.length) {
-    b.innerHTML = '<tr><td colspan="15" class="muted">No orders yet.</td></tr>';
+    b.innerHTML = '<tr><td colspan="12" class="muted">No orders yet.</td></tr>';
     return;
   }
   b.innerHTML = orders.map((o) => {
     const long = o.side === "LONG";
-    const pnl = o.pnl == null ? "—" : `${o.pnl > 0 ? "+" : ""}${fmt(o.pnl, 2)}`;
+    const pnl = o.pnl == null ? "\u2014" : `${o.pnl > 0 ? "+" : ""}${fmt(o.pnl, 2)}`;
     const pnlCls = o.pnl > 0 ? "up" : o.pnl < 0 ? "down" : "";
-    const unreal = o.unrealized_pnl == null ? "—"
-      : `${o.unrealized_pnl > 0 ? "+" : ""}${fmt(o.unrealized_pnl, 2)}`;
-    const unrealCls = o.unrealized_pnl > 0 ? "up" : o.unrealized_pnl < 0 ? "down" : "";
     const t = String(o.fill_time || o.created_at || "").slice(0, 19).replace("T", " ");
-    const why = o.reasons
-      ? `<span title="${esc(String(o.reasons))}">${esc(String(o.reasons).split(";")[0].trim())}${String(o.reasons).includes(";") ? " …" : ""}</span>`
-      : "—";
+    const sl = o.stop_loss != null ? fmtPrice(o.stop_loss) : "\u2014";
+    const tp = o.take_profit != null ? fmtPrice(o.take_profit) : "\u2014";
+    const broker = _brokerOf(o);
+    const brokerTag = broker === "binance"
+      ? '<span class="broker-tag tag-binance" title="Binance">B</span>'
+      : '<span class="broker-tag tag-mt5" title="MT5/Exness">M</span>';
+    // Why column: show full reason with tooltip
+    const reasons = String(o.reasons || "");
+    const whyShort = reasons ? reasons.split(";")[0].trim().slice(0, 60) : "\u2014";
+    const whyFull = reasons ? esc(reasons.replace(/;/g, " \u00b7 ")) : "\u2014";
+    const why = `<span class="why-text" title="${whyFull}">${esc(whyShort)}${reasons.length > 60 ? " \u2026" : ""}</span>`;
+    // Status with error tooltip
+    const statusBadge = `<span class="signal-badge ${ORDER_BADGES[o.status] || "badge-hold"}"${o.error ? ` title="${esc(o.error)}"` : ""}>${esc(o.status)}</span>`;
+    const exitCell = o.exit_price != null 
+      ? `${fmtPrice(o.exit_price)}${o.exit_reason ? ` <span class="muted">(${esc(o.exit_reason)})</span>` : ""}`
+      : "\u2014";
     return `<tr>
       <td class="sym">${symOf(o.symbol)}</td>
-      <td><span class="signal-badge ${long ? "badge-long" : "badge-short"}">${long ? "▲ LONG" : "▼ SHORT"}</span></td>
+      <td><span class="signal-badge ${long ? "badge-long" : "badge-short"}">${long ? "\u25B2 LONG" : "\u25BC SHORT"}</span></td>
       <td>${fmt(o.qty, 4)}</td>
       <td>${fmtPrice(o.entry)}</td>
-      <td>${fmtPrice(o.fill_price)}</td>
-      <td>${o.exit_price != null ? fmtPrice(o.exit_price) : "—"}${o.exit_reason ? ` <span class="muted">(${esc(o.exit_reason)})</span>` : ""}</td>
+      <td class="muted">${sl}</td>
+      <td class="muted">${tp}</td>
+      <td>${exitCell}</td>
       <td class="${pnlCls}">${pnl}</td>
-      <td class="${unrealCls}">${unreal}</td>
-      <td><span class="signal-badge ${ORDER_BADGES[o.status] || "badge-hold"}">${esc(o.status)}</span></td>
-      <td class="muted">${esc(o.source)}</td>
-      <td class="muted">${fmtPrice(o.current_price)}</td>
-      <td class="muted">${o.market_value != null ? "$" + fmt(o.market_value, 2) : "—"}</td>
-      <td class="spark-cell">${sparkline(o.spark)}</td>
-      <td class="muted why-cell">${why}</td>
+      <td>${statusBadge}</td>
+      <td>${brokerTag}</td>
+      <td class="why-cell">${why}</td>
       <td class="muted">${esc(t)}</td>
     </tr>`;
   }).join("");
 }
 
-// ── Profit by currency (donut) ─────────────────────────────────────
-let pnlChart = null;
-function renderPnlDonut(summary) {
-  const el = $("pnlDonut");
-  const list = $("pnlBreakdown");
-  const meta = $("pnlDonutMeta");
-  if (!el || !summary) return;
-  const rows = (summary.by_symbol || []).filter((r) => Math.abs(r.pnl) > 0.005);
-  const total = summary.total_pnl || 0;
-  if (meta) {
-    const unreal = summary.unrealized_pnl || 0;
-    meta.textContent = rows.length
-      ? `${rows.length} currencies · realized ${summary.realized_pnl > 0 ? "+" : ""}$${fmt(summary.realized_pnl, 2)}`
-        + ` · unrealized ${unreal > 0 ? "+" : ""}$${fmt(unreal, 2)}`
-        + ` · ${_periodLabel()}`
-      : "";
+// ── Profit by currency (dual donut: MT5 + Binance) ─────────────────
+let pnlChartMt5 = null;
+let pnlChartBinance = null;
+
+function _brokerOf(order) {
+  // For "hybrid" source or missing source, determine from symbol
+  const src = (order.source || "").toLowerCase();
+  if (src === "hybrid" || !src) {
+    // Check symbol to determine actual broker
+    const sym = (order.symbol || "").toUpperCase();
+    if (sym.endsWith("/USDT") || sym.endsWith("USDT")) return "binance";
+    // Known crypto bases
+    const cryptoBases = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX",
+                         "DOT", "MATIC", "LINK", "UNI", "ATOM", "FIL", "ARB", "OP"];
+    const base = sym.includes("/") ? sym.split("/")[0] : sym.replace("USDT", "");
+    if (cryptoBases.includes(base)) return "binance";
+    return "mt5";
   }
+  if (src.includes("binance")) return "binance";
+  if (src.includes("mt5") || src.includes("exness")) return "mt5";
+  // Fallback: check symbol
+  const sym = (order.symbol || "").toUpperCase();
+  if (sym.endsWith("/USDT") || sym.endsWith("USDT")) return "binance";
+  return "mt5";
+}
+
+function _renderOneDonut(chart, el, rows, total, label) {
   if (!rows.length) {
-    if (list) list.innerHTML = '<div class="muted">No realized or unrealized PnL yet — dry/live test trades to populate the donut.</div>';
-    if (pnlChart) pnlChart.clear();
-    return;
+    if (chart) chart.clear();
+    return chart;
   }
-  if (!pnlChart) pnlChart = echarts.init(el);
+  if (!chart) {
+    chart = echarts.init(el);
+  }
   const totalCls = total >= 0 ? "#2ecc8f" : "#ff5c5c";
-  pnlChart.setOption({
+  chart.setOption({
     backgroundColor: "transparent",
     tooltip: {
       trigger: "item", backgroundColor: "#14161c", borderColor: "#24262e",
       textStyle: { color: "#e6e9f0" },
-      // p.value is the ABSOLUTE pnl (donut sizes by magnitude) — carry the
-      // real sign on each slice so losses don't render as "+$".
       formatter: (p) => {
         const v = (p.data && p.data.pnl != null) ? p.data.pnl : p.value;
-        return `${p.name}: ${v >= 0 ? "+" : "−"}$${fmt(Math.abs(v), 0)} (${p.percent}% of gross)`;
+        return `${p.name}: ${v >= 0 ? "+" : "\u2212"}$${fmt(Math.abs(v), 0)} (${p.percent}% of gross)`;
       },
     },
     title: {
-      text: `${total >= 0 ? "+" : "−"}$${fmt(Math.abs(total), 0)}`,
-      subtext: "Net PnL", left: "center", top: "37%",
-      textStyle: { color: totalCls, fontSize: 22, fontWeight: 700 },
-      subtextStyle: { color: "#8a94a6", fontSize: 11 },
+      text: `${total >= 0 ? "+" : "\u2212"}$${fmt(Math.abs(total), 0)}`,
+      subtext: label, left: "center", top: "37%",
+      textStyle: { color: totalCls, fontSize: 18, fontWeight: 700 },
+      subtextStyle: { color: "#8a94a6", fontSize: 10 },
     },
     series: [{
       type: "pie", radius: ["46%", "72%"], center: ["50%", "50%"],
       avoidLabelOverlap: true,
       itemStyle: { borderColor: "#121223", borderWidth: 2 },
-      label: { color: "#8a94a6", fontSize: 11, formatter: "{b} {d}%" },
+      label: { color: "#8a94a6", fontSize: 10, formatter: "{b} {d}%" },
       labelLine: { lineStyle: { color: "#3a4152" } },
       data: rows.map((r) => ({
         name: symOf(r.symbol),
         value: Math.abs(r.pnl),
-        pnl: r.pnl,                            // real sign for the tooltip
+        pnl: r.pnl,
         itemStyle: { color: r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c" },
       })),
     }],
   }, true);
+  return chart;
+}
+
+function renderPnlDonut(summary) {
+  const elMt5 = $("pnlDonutMt5");
+  const elBin = $("pnlDonutBinance");
+  const list = $("pnlBreakdown");
+  const meta = $("pnlDonutMeta");
+  if (!elMt5 || !elBin || !summary) return;
+
+  const allRows = (summary.by_symbol || []).filter((r) => Math.abs(r.pnl) > 0.005);
+  const total = summary.total_pnl || 0;
+
+  if (meta) {
+    const unreal = summary.unrealized_pnl || 0;
+    meta.textContent = allRows.length
+      ? `${allRows.length} currencies \u00b7 realized ${summary.realized_pnl > 0 ? "+" : ""}$${fmt(summary.realized_pnl, 2)}`
+        + ` \u00b7 unrealized ${unreal > 0 ? "+" : ""}$${fmt(unreal, 2)}`
+        + ` \u00b7 ${_periodLabel()}`
+      : "";
+  }
+
+  if (!allRows.length) {
+    if (list) list.innerHTML = '<div class="muted">No realized or unrealized PnL yet \u2014 dry/live test trades to populate the donut.</div>';
+    if (pnlChartMt5) pnlChartMt5.clear();
+    if (pnlChartBinance) pnlChartBinance.clear();
+    return;
+  }
+
+  // Split rows by broker
+  const mt5Rows = allRows.filter((r) => _brokerOf(r) === "mt5");
+  const binRows = allRows.filter((r) => _brokerOf(r) === "binance");
+  const mt5Total = mt5Rows.reduce((a, r) => a + r.pnl, 0);
+  const binTotal = binRows.reduce((a, r) => a + r.pnl, 0);
+
+  pnlChartMt5 = _renderOneDonut(pnlChartMt5, elMt5, mt5Rows, mt5Total, "MT5 PnL");
+  pnlChartBinance = _renderOneDonut(pnlChartBinance, elBin, binRows, binTotal, "Binance PnL");
+
   if (list) {
-    list.innerHTML = rows.map((r) => {
+    list.innerHTML = allRows.map((r) => {
       const pnlCls = r.pnl >= 0 ? "up" : "down";
       const sign = r.pnl >= 0 ? "+" : "";
+      const broker = _brokerOf(r);
+      const brokerTag = broker === "binance"
+        ? '<span class="broker-tag tag-binance">B</span>'
+        : '<span class="broker-tag tag-mt5">M</span>';
       return `<div class="pnl-row">
         <span class="pnl-dot" style="background:${r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c"}"></span>
+        ${brokerTag}
         <span class="sym">${symOf(r.symbol)}</span>
         <span class="pnl-bar-wrap"><span class="pnl-bar" style="width:${Math.min(r.share, 100)}%;background:${r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c"}"></span></span>
         <span class="pnl-val ${pnlCls}">${sign}$${fmt(r.pnl, 0)}</span>
@@ -1855,12 +1971,484 @@ async function loadPortfolio() {
   }
 }
 
+// ── Learn view: trading tutor + why-this-trade ─────────────────────
+let tutorTopics = [];
+let tutorTopic = "";
+
+async function loadTutor() {
+  try {
+    const d = await api("/api/tutor");
+    tutorTopics = d.topics || [];
+    renderTutorTopics();
+    loadTradeExplain();
+    if (!tutorTopic && tutorTopics.length) showTutorTopic(tutorTopics[0].topic);
+  } catch (e) {
+    const box = $("tutorBody");
+    if (box) box.innerHTML = `<div class="muted">Tutor unavailable — ${esc(e.message)}</div>`;
+  }
+}
+
+function renderTutorTopics() {
+  const list = $("tutorTopicsList");
+  if (!list) return;
+  const basic = tutorTopics.filter((t) => t.category === "basic");
+  const adv = tutorTopics.filter((t) => t.category === "advanced");
+  const chips = (items) => items.map((t) =>
+    `<button class="ap-chip ${t.topic === tutorTopic ? "active" : ""}" data-topic="${esc(t.topic)}" title="${esc(t.title)}">${esc(t.title)}</button>`
+  ).join("");
+  list.innerHTML =
+    `<div class="sig-sec-label">Basics</div><div class="tutor-chips">${chips(basic) || '<span class="muted">—</span>'}</div>` +
+    `<div class="sig-sec-label" style="margin-top:10px">Advanced</div><div class="tutor-chips">${chips(adv) || '<span class="muted">—</span>'}</div>`;
+  list.querySelectorAll("[data-topic]").forEach((b) => {
+    b.addEventListener("click", () => showTutorTopic(b.dataset.topic));
+  });
+}
+
+async function showTutorTopic(topic) {
+  tutorTopic = topic;
+  renderTutorTopics();
+  const box = $("tutorBody");
+  if (!box) return;
+  box.innerHTML = '<div class="muted">Loading…</div>';
+  try {
+    const d = await api("/api/tutor?topic=" + encodeURIComponent(topic));
+    if (!d.ok) { box.innerHTML = `<div class="muted">${esc(d.error || "unknown topic")}</div>`; return; }
+    box.innerHTML =
+      `<div class="tutor-title">${esc(d.title)} <span class="signal-badge badge-hold">${esc(d.category)}</span></div>` +
+      `<div class="tutor-body-text">${esc(d.explanation).replace(/\n\n/g, "<br><br>").replace(/\n/g, "<br>")}</div>` +
+      (d.example ? `<div class="tutor-example"><b>Example</b> — ${esc(d.example)}</div>` : "") +
+      `<div class="tutor-why"><b>Why it matters</b> — ${esc(d.why_it_matters)}</div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="muted">Tutor error — ${esc(e.message)}</div>`;
+  }
+}
+
+async function loadTradeExplain() {
+  const box = $("tradeExplainBody");
+  if (!box) return;
+  try {
+    const d = await api("/api/tutor/trade");
+    if (!d.ok) { box.innerHTML = `<div class="muted">${esc(d.message || "—")}</div>`; return; }
+    let held = "";
+    if (d.held_top && d.held_top.length) {
+      held = `<div class="held-reasons-title" style="margin-top:8px">Why symbols were skipped last cycle</div>` +
+        d.held_top.map((h) =>
+          `<div class="held-reason"><span class="held-reason-n">${h.count}</span><span class="held-reason-k">${esc(h.reason)}</span></div>`
+        ).join("");
+    }
+    box.innerHTML = `<div class="tutor-why">${esc(d.headline)}<br>${esc(d.why)}</div>${held}`;
+  } catch (e) {
+    box.innerHTML = `<div class="muted">Explain unavailable — ${esc(e.message)}</div>`;
+  }
+}
+
+// ── AI Test view (paper trades + confirmation pipeline) ────────────
+async function loadAiTest() {
+  try {
+    const [layers, cb, testTrades, feedback] = await Promise.all([
+      api("/api/ai-layers").catch(() => null),
+      api("/api/circuit-breaker").catch(() => null),
+      api("/api/test-trades?limit=50").catch(() => null),
+      api("/api/feedback/calibration?days=30").catch(() => null),
+    ]);
+    renderAiLayers(layers);
+    renderCircuitBreaker(cb);
+    renderTestTrades(testTrades);
+    renderFeedback(feedback);
+  } catch (e) {
+    console.warn("loadAiTest failed:", e);
+  }
+}
+
+function renderAiLayers(d) {
+  const body = $("aiLayersBody");
+  const meta = $("aiLayersMeta");
+  if (!body) return;
+  if (!d) { body.innerHTML = '<div class="muted">Unavailable</div>'; return; }
+  meta.textContent = `Mode: ${d.ai_mode || "?"}`;
+  const layers = d.layers || {};
+  const session = d.session || {};
+  const risk = d.risk || {};
+  const layerList = [
+    { name: "News Sentiment", key: "news_sentiment", icon: "📰" },
+    { name: "Freshness Gate", key: "freshness", icon: "🕐" },
+    { name: "Calendar Guard", key: "calendar_guard", icon: "📅" },
+    { name: "AI Confirm (6-factor)", key: "ai_confirm", icon: "🎯" },
+    { name: "DXY Master Filter", key: "dxy_filter", icon: "💵" },
+    { name: "Smart Money (OB/FVG)", key: "smart_money", icon: "🏦" },
+  ];
+  let html = '<div class="ai-pipeline">';
+  for (const l of layerList) {
+    const cfg = layers[l.key] || {};
+    const on = cfg.enabled !== false;
+    const cls = on ? "layer-on" : "layer-off";
+    html += `<div class="ai-layer-pill ${cls}">` +
+      `<span>${l.icon} ${l.name}</span>` +
+      `<span class="layer-status">${on ? "ON" : "OFF"}</span></div>`;
+  }
+  // Session + risk info
+  const sess = session.current || {};
+  html += '</div><div style="margin-top:12px;display:flex;gap:16px;flex-wrap:wrap">';
+  html += `<div class="muted">Session: <b>${esc(sess.session || "?")}</b> (mult: ${session.multiplier || 1.0})</div>`;
+  html += `<div class="muted">Trailing SL: <b>${risk.trailing_stop ? "ON" : "OFF"}</b></div>`;
+  html += `<div class="muted">Dynamic TP: <b>${risk.partial_tp ? "ON" : "OFF"}</b></div>`;
+  html += `<div class="muted">Max hold: <b>${risk.max_hold_bars || 12} bars</b></div>`;
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+function renderCircuitBreaker(d) {
+  const body = $("circuitBreakerBody");
+  const meta = $("cbMeta");
+  if (!body) return;
+  if (!d) { body.innerHTML = '<div class="muted">Unavailable</div>'; return; }
+  const s = d.state || {};
+  const h = d.health || {};
+  const levelColors = ["#2ecc8f", "#f0b429", "#ff8c42", "#ff5c5c", "#8b0000"];
+  const level = s.level || 0;
+  const color = levelColors[Math.min(level, 4)];
+  meta.innerHTML = `<span style="color:${color}">Level ${level}</span>`;
+  let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
+  html += `<div>Drawdown: <b>${fmt(s.drawdown_pct, 2)}%</b></div>`;
+  html += `<div>Risk mult: <b>${fmt(s.risk_multiplier, 2)}x</b></div>`;
+  html += `<div>Consec. losses: <b>${s.consecutive_losses || 0}</b></div>`;
+  html += `<div>Daily PnL: <b>${fmt(s.daily_pnl, 2)}</b></div>`;
+  html += `<div>Equity: <b>${fmt(s.current_equity, 0)}</b></div>`;
+  html += `<div>Peak: <b>${fmt(s.peak_equity, 0)}</b></div>`;
+  html += '</div>';
+  if (h.verdict) {
+    html += `<div style="margin-top:8px" class="muted">Strategy: <b>${esc(h.verdict)}</b>`;
+    if (h.rolling_wr !== undefined) html += ` (WR: ${fmt(h.rolling_wr * 100, 1)}%)`;
+    html += '</div>';
+  }
+  const ex = d.exposure || {};
+  if (ex.warning) {
+    html += `<div style="margin-top:4px;color:#ff5c5c">⚠ ${esc(ex.warning)}</div>`;
+  }
+  body.innerHTML = html;
+}
+
+function renderTestTrades(d) {
+  const body = $("testTradesBody");
+  const badge = $("testTradeModeBadge");
+  const stats = $("testTradeStats");
+  if (!body) return;
+  if (!d) { body.innerHTML = '<tr><td colspan="14" class="muted">No data</td></tr>'; return; }
+  const s = d.stats || {};
+  if (badge) badge.textContent = `WR: ${fmt((s.win_rate || 0) * 100, 1)}%`;
+  if (badge) badge.className = `signal-badge ${(s.win_rate || 0) >= 0.6 ? "badge-long" : "badge-hold"}`;
+  if (stats) stats.textContent = `${s.total || 0} trades | PnL: ${fmt(s.total_pnl, 2)}`;
+  const trades = d.trades || [];
+  if (!trades.length) {
+    body.innerHTML = '<tr><td colspan="14" class="muted">No test trades yet. Start the bot in test mode (AI_MODE=test).</td></tr>';
+    return;
+  }
+  body.innerHTML = trades.slice(0, 50).map((t) => {
+    const pnlCls = (t.pnl || 0) > 0 ? "pnl-pos" : (t.pnl || 0) < 0 ? "pnl-neg" : "";
+    const outCls = t.outcome === "win" ? "badge-long" : t.outcome === "loss" ? "badge-short" : "badge-hold";
+    return `<tr>` +
+      `<td class="muted">${esc((t.ran_at || "").slice(0, 16))}</td>` +
+      `<td><b>${esc(t.symbol || "")}</b></td>` +
+      `<td class="${t.direction === "LONG" ? "sig-long" : "sig-short"}">${esc(t.direction || "")}</td>` +
+      `<td>${fmtPrice(t.entry_price)}</td>` +
+      `<td>${fmtPrice(t.stop_loss)}</td>` +
+      `<td>${fmtPrice(t.take_profit)}</td>` +
+      `<td>${t.exit_price ? fmtPrice(t.exit_price) : "—"}</td>` +
+      `<td class="${pnlCls}">${t.pnl !== null && t.pnl !== undefined ? fmt(t.pnl, 4) : "—"}</td>` +
+      `<td>${t.confirm_score || 0}</td>` +
+      `<td>${t.dxy_score || 0}</td>` +
+      `<td>${t.smc_score || 0}</td>` +
+      `<td class="muted">${esc(t.regime || "—")}</td>` +
+      `<td class="muted">${esc(t.session || "—")}</td>` +
+      `<td><span class="signal-badge ${outCls}">${esc(t.outcome || "open")}</span></td>` +
+      `</tr>`;
+  }).join("");
+}
+
+function renderFeedback(d) {
+  const body = $("feedbackBody");
+  const meta = $("feedbackMeta");
+  if (!body) return;
+  if (!d || d.error) {
+    body.innerHTML = `<div class="muted">${d && d.error === "no_closed_trades" ? "No closed trades yet — need data to calibrate" : "Unavailable"}</div>`;
+    return;
+  }
+  meta.textContent = `${d.total_trades || 0} trades | WR: ${fmt((d.win_rate || 0) * 100, 1)}%`;
+  const recs = d.recommendations || [];
+  let html = '';
+  if (recs.length) {
+    html += '<div style="margin-bottom:8px">';
+    for (const r of recs.slice(0, 5)) {
+      const isStrong = r.startsWith("STRONG");
+      html += `<div style="color:${isStrong ? UP : DOWN};font-size:0.85em">${esc(r)}</div>`;
+    }
+    html += '</div>';
+  }
+  // Factor breakdown
+  const factors = d.by_factor || {};
+  if (Object.keys(factors).length) {
+    html += '<div style="font-size:0.85em">';
+    for (const [factor, buckets] of Object.entries(factors)) {
+      html += `<div style="margin-top:4px"><b>${esc(factor)}</b>: `;
+      const parts = Object.entries(buckets).map(([k, v]) =>
+        `${k}=${fmt((v.win_rate || 0) * 100, 0)}%(${v.total})`
+      );
+      html += parts.join(" | ") + '</div>';
+    }
+    html += '</div>';
+  }
+  body.innerHTML = html || '<div class="muted">Need more trades for calibration data.</div>';
+}
+
+// ── Trade Stats (TradinJournal-style dashboard cards + radar + heatmap) ─
+let radarChart = null;
+let heatmapChart = null;
+
+function _statColor(el, val) {
+  const v = parseFloat(val);
+  if (!isFinite(v)) return;
+  el.classList.toggle("up", v > 0);
+  el.classList.toggle("down", v < 0);
+}
+
+function _streakLabel(type, n) {
+  if (type === "win") return `${n} win${n > 1 ? "s" : ""}`;
+  if (type === "loss") return `${n} loss${n > 1 ? "es" : ""}`;
+  return "—";
+}
+
+function _pfLabel(pf) {
+  if (pf >= 2.0) return "Excellent";
+  if (pf >= 1.5) return "Good";
+  if (pf >= 1.0) return "Even";
+  return "Losing";
+}
+
+async function loadTradeStats() {
+  try {
+    const d = await api("/api/trade-stats");
+    renderTradeStats(d);
+  } catch (e) {
+    // silent — dashboard works without stats
+  }
+}
+
+function renderTradeStats(d) {
+  // Stat cards
+  const todayEl = $("statTodayPnl");
+  if (todayEl) {
+    const v = todayEl.querySelector(".stat-value");
+    v.textContent = `${d.today_pnl >= 0 ? "+" : ""}${fmtUSD(d.today_pnl)}`;
+    _statColor(v, d.today_pnl);
+    const sub = todayEl.querySelector(".stat-sub");
+    sub.textContent = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" });
+  }
+  const balEl = $("statBalance");
+  if (balEl) {
+    balEl.querySelector(".stat-value").textContent = fmtUSD(d.balance);
+  }
+  const totalEl = $("statTotalPnl");
+  if (totalEl) {
+    const v = totalEl.querySelector(".stat-value");
+    v.textContent = `${d.total_pnl >= 0 ? "+" : ""}${fmtUSD(d.total_pnl)}`;
+    _statColor(v, d.total_pnl);
+    const sub = totalEl.querySelector(".stat-sub");
+    sub.textContent = `${d.total_trades} trades · ${d.win_rate}% win rate`;
+  }
+  const streakEl = $("statStreak");
+  if (streakEl) {
+    const v = streakEl.querySelector(".stat-value");
+    v.textContent = d.current_streak;
+    v.classList.toggle("up", d.streak_type === "win");
+    v.classList.toggle("down", d.streak_type === "loss");
+    const sub = streakEl.querySelector(".stat-sub");
+    const fire = d.streak_type === "win" && d.current_streak >= 3 ? " 🔥" : "";
+    sub.textContent = _streakLabel(d.streak_type, d.current_streak) + fire;
+    if (d.streak_type === "win" && d.current_streak >= 3) sub.textContent += " — You're on fire!";
+  }
+  const pfEl = $("statProfitFactor");
+  if (pfEl) {
+    pfEl.querySelector(".stat-value").textContent = d.profit_factor.toFixed(2);
+    const sub = pfEl.querySelector(".stat-sub");
+    sub.textContent = _pfLabel(d.profit_factor);
+  }
+  const bwEl = $("statBiggestWin");
+  if (bwEl) {
+    const v = bwEl.querySelector(".stat-value");
+    v.textContent = `+${fmtUSD(d.biggest_win)}`;
+    v.classList.add("up");
+  }
+  const bdEl = $("statBestDay");
+  if (bdEl) {
+    const v = bdEl.querySelector(".stat-value");
+    v.textContent = `${d.best_day >= 0 ? "+" : ""}${fmtUSD(d.best_day)}`;
+    _statColor(v, d.best_day);
+  }
+
+  // Radar chart
+  renderRadar(d.radar, d.trade_score);
+
+  // Calendar heatmap
+  renderHeatmap(d.heatmap, d);
+}
+
+function renderRadar(radar, score) {
+  const el = $("radarChart");
+  if (!el) return;
+  if (!radarChart) radarChart = echarts.init(el);
+  const indicators = Object.keys(radar).map((k) => ({ name: k, max: 100 }));
+  const values = Object.values(radar);
+  const scoreEl = $("radarScore");
+  if (scoreEl) scoreEl.textContent = score;
+  const labelEl = $("radarLabel");
+  if (labelEl) {
+    const adj = score >= 70 ? "Strong" : score >= 50 ? "Good" : score >= 30 ? "Needs work" : "Developing";
+    labelEl.textContent = `${adj} — your overall trading performance`;
+  }
+  radarChart.setOption({
+    backgroundColor: "transparent",
+    radar: {
+      indicator: indicators,
+      shape: "polygon",
+      radius: "65%",
+      axisName: { color: "#8a94a6", fontSize: 11 },
+      splitArea: { areaStyle: { color: ["rgba(76,154,255,0.02)", "rgba(76,154,255,0.04)", "rgba(76,154,255,0.06)", "rgba(76,154,255,0.08)"] } },
+      splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } },
+      axisLine: { lineStyle: { color: "rgba(255,255,255,0.08)" } },
+    },
+    series: [{
+      type: "radar",
+      data: [{
+        value: values,
+        areaStyle: { color: "rgba(76,154,255,0.15)" },
+        lineStyle: { color: ACCENT, width: 2 },
+        itemStyle: { color: ACCENT },
+      }],
+    }],
+  }, true);
+}
+
+function renderHeatmap(heatmap, d) {
+  const el = $("heatmapChart");
+  if (!el) return;
+  if (!heatmapChart) heatmapChart = echarts.init(el);
+  const meta = $("heatmapMeta");
+  if (meta) meta.textContent = `${d.total_trades} trades in ${new Date().getFullYear()}`;
+
+  // Build a date->pnl map
+  const pnlMap = {};
+  let maxAbs = 1;
+  for (const h of heatmap) {
+    pnlMap[h.date] = h.pnl;
+    maxAbs = Math.max(maxAbs, Math.abs(h.pnl));
+  }
+
+  // Generate all dates in the range (last 180 days)
+  const today = new Date();
+  const start = new Date(today);
+  start.setDate(start.getDate() - 180);
+  const allDays = [];
+  for (let d = new Date(start); d <= today; d.setDate(d.getDate() + 1)) {
+    allDays.push(d.toISOString().slice(0, 10));
+  }
+
+  // Build week x day matrix for ECharts calendar-like heatmap
+  // ECharts heatmap: [weekIndex, dayOfWeek, value]
+  const dayNames = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const data = [];
+  for (const dateStr of allDays) {
+    const dt = new Date(dateStr + "T12:00:00Z");
+    const dow = (dt.getDay() + 6) % 7; // 0=Mon, 6=Sun
+    const weekNum = Math.floor((dt - start) / (7 * 864e5));
+    const pnl = pnlMap[dateStr] || 0;
+    const hasTrade = dateStr in pnlMap;
+    // Color: green for profit, red for loss, dim for no trade
+    let color = "rgba(255,255,255,0.03)"; // no trade
+    if (hasTrade) {
+      const intensity = Math.min(Math.abs(pnl) / maxAbs, 1);
+      if (pnl > 0) {
+        color = `rgba(46,204,143,${0.2 + intensity * 0.6})`;
+      } else if (pnl < 0) {
+        color = `rgba(255,72,72,${0.2 + intensity * 0.6})`;
+      } else {
+        color = "rgba(255,255,255,0.08)";
+      }
+    }
+    data.push({
+      value: [weekNum, dow, pnl],
+      itemStyle: { color, borderColor: "transparent", borderWidth: 1 },
+      hasTrade,
+    });
+  }
+
+  heatmapChart.setOption({
+    backgroundColor: "transparent",
+    tooltip: {
+      formatter: (p) => {
+        const date = allDays[p.data.value[0] * 7 + p.data.value[1]] || "";
+        const pnl = p.data.value[2];
+        return `${date}<br/>P&L: <b style="color:${pnl >= 0 ? "#2ecc8f" : "#ff5c5c"}">${pnl >= 0 ? "+" : ""}${fmtUSD(pnl)}</b>`;
+      },
+      backgroundColor: "#14161c",
+      borderColor: "#24262e",
+      textStyle: { color: "#e6e9f0" },
+    },
+    grid: { left: 30, right: 8, top: 4, bottom: 4 },
+    xAxis: {
+      type: "category",
+      data: dayNames,
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { color: "#8a94a6", fontSize: 10 },
+      splitLine: { show: false },
+    },
+    yAxis: {
+      type: "category",
+      data: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { color: "#8a94a6", fontSize: 10 },
+      splitLine: { show: false },
+      inverse: true,
+    },
+    series: [{
+      type: "heatmap",
+      data: data.map((d) => [d.value[0], d.value[1], d.value[2]]),
+      itemStyle: { borderColor: "transparent", borderWidth: 2, borderRadius: 3 },
+      emphasis: { itemStyle: { borderColor: "#4c9aff", borderWidth: 1 } },
+    }],
+    visualMap: {
+      show: false,
+      min: -maxAbs,
+      max: maxAbs,
+      inRange: {
+        color: ["rgba(255,72,72,0.7)", "rgba(255,72,72,0.2)", "rgba(255,255,255,0.03)", "rgba(46,204,143,0.2)", "rgba(46,204,143,0.7)"],
+      },
+    },
+  }, true);
+
+  // Bottom stats
+  const statsEl = $("heatmapStats");
+  if (statsEl) {
+    statsEl.innerHTML = `
+      <div><span class="hs-val">${d.trading_days}</span> <span class="hs-label">Trading Days</span></div>
+      <div><span class="hs-val">${d.current_streak}</span> <span class="hs-label">Current Streak</span></div>
+      <div><span class="hs-val">${d.longest_streak}</span> <span class="hs-label">Longest Streak</span></div>
+      <div><span class="hs-val ${d.total_pnl >= 0 ? "up" : "down"}">${d.total_pnl >= 0 ? "+" : ""}${fmtUSD(d.total_pnl)}</span> <span class="hs-label">Total P&L</span></div>
+    `;
+  }
+}
+
 // ── Boot ────────────────────────────────────────────────────────────
 window.addEventListener("resize", () => {
   if (portValueChart) portValueChart.resize();
   if (totalChart) totalChart.resize();
   if (sigChart) sigChart.resize();
   if (ordChart) ordChart.resize();
+  if (pnlChartMt5) pnlChartMt5.resize();
+  if (pnlChartBinance) pnlChartBinance.resize();
+  if (radarChart) radarChart.resize();
+  if (heatmapChart) heatmapChart.resize();
 });
 
 bindSidebar();
@@ -1899,3 +2487,8 @@ setInterval(loadWatchlist, 120000);
 setInterval(loadSignals, 60000);
 setInterval(loadOrders, 15000);
 setInterval(loadBotStatus, 15000);
+loadTutor();
+loadAiTest();
+setInterval(loadAiTest, 30000);
+loadTradeStats();
+setInterval(loadTradeStats, 30000);

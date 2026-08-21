@@ -21,6 +21,12 @@ import requests
 import config
 import database
 
+# Token registry for unified symbol management
+try:
+    from . import token_registry
+except ImportError:
+    import token_registry
+
 # Public Binance REST endpoint for candlesticks (klines).
 KLINES_URL = "https://api.binance.com/api/v3/klines"
 # Public Binance USD-M futures endpoint for funding-rate history (no key).
@@ -151,7 +157,9 @@ def backfill_funding(conn, symbols: list = None) -> None:
     `funding` table. Symbols without a perpetual listing are skipped
     (they're spot-only or delisted) without aborting the run.
     """
-    symbols = symbols or [s.replace("/", "") for s in config.SYMBOLS]
+    if symbols is None:
+        binance_symbols = [s.symbol for s in token_registry.get_symbols_by_venue(token_registry.Venue.BINANCE)]
+        symbols = [s.replace("/", "") for s in binance_symbols]
     failed = []
     for sym in symbols:
         try:
@@ -187,12 +195,14 @@ def live_loop(conn, refresh_seconds: int = None) -> None:
         return time.time() - last_fetch.get(interval, 0.0) >= cadence
 
     print("Live loop started — every timeframe on its own cadence. Ctrl+C to stop.")
+    # Get Binance symbols from token registry
+    binance_symbols = [s.symbol for s in token_registry.get_symbols_by_venue(token_registry.Venue.BINANCE)]
     while True:
         for interval in config.INTERVALS:
             if not due(interval):
                 continue
             last_fetch[interval] = time.time()
-            for symbol in config.SYMBOLS:
+            for symbol in binance_symbols:
                 try:
                     # Repair any gap left by collector downtime (cheap: only
                     # fires when the newest candle is stale).
@@ -217,7 +227,9 @@ def main() -> None:
 
     if cmd == "backfill":
         failed = []
-        for symbol in config.SYMBOLS:
+        # Get Binance symbols from token registry
+        binance_symbols = [s.symbol for s in token_registry.get_symbols_by_venue(token_registry.Venue.BINANCE)]
+        for symbol in binance_symbols:
             for interval in config.INTERVALS:
                 days = config.INTERVAL_BACKFILL_DAYS.get(interval, config.BACKFILL_DAYS)
                 try:
