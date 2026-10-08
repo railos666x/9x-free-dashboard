@@ -1107,3 +1107,48 @@ Nothing sent." — confirmed with a fetch counter: **0 requests posted**.
 ### Suite
 
 151 passed; `node --check` clean; cache tag `?v=20261008g`.
+
+---
+
+## 2026-10-08 08:45 UTC — two balances, one screen, 130k apart: the mislabelled tile
+
+### What the screenshot showed
+
+While checking the user's KPI-tile screenshot, one tile did not add up:
+
+| On screen | Value |
+|---|---|
+| Tile "CURRENT BALANCE / Broker account" | **$11,512.57** |
+| Balance card (Exness MT5 + Alpaca paper) | **$143,427.93** |
+
+Two numbers called "balance", 130k apart, on the same screen.
+
+### Root cause (not a math bug — a label bug)
+
+`/api/trade-stats.balance` = **$10,000 seed + $1,512.57 realized (closed) P&L**.
+It is journal-derived and it matches the equity the loss guard uses
+(`equity_now 10004.07` in the same cycle readout), so the figure itself is fine —
+calling it the "Broker account" balance was simply false. A trader who spots that
+discrepancy stops trusting every number on the page.
+
+### Fix
+
+- Tile relabelled to **"Realized balance"**, with the derivation printed from its
+  own numbers: `$10,000 seed · +$1,512.57 closed`.
+- Tooltip: "Journal-derived: opening balance plus realized (closed) P&L. This is
+  not the broker equity — see the Balance card for that."
+- The seed is computed (`balance − total_pnl`) rather than hardcoded, so a changed
+  seed updates the label instead of lying.
+
+### Verified live (`?v=20261008i`)
+
+- label `Realized balance` · value `$11,512.57` · sub `$10,000 seed · +$1,512.57 closed`
+- seed reconciles to exactly `10000` against the API payload
+- no double-sign artifacts in the rendered string
+
+### Note
+
+This is the third "the page disagreed with itself" defect of the session (donut
+vs closed-trades list, donut label collision, now balance vs balance). All three
+were label/derivation problems rather than data problems, which suggests the next
+useful hardening is a self-reconciliation pass over the headline figures.

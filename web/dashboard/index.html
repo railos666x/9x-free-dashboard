@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>cryptoautomation · Dashboard</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261008g" />
+<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261008i" />
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
@@ -150,10 +150,15 @@
               <div class="stat-value">$0.00</div>
               <div class="stat-sub muted"></div>
             </div>
+            <!-- NOT "Current Balance / Broker account" (2026-10-08): this
+                 figure is journal-derived (a $10,000 seed + closed P&L), not
+                 the broker's equity — the real equity sits in the Balance card
+                 right above it, and the two disagreed by 130k on the same
+                 screen. Say what it is. -->
             <div class="stat-card" id="statBalance">
-              <div class="stat-label">Current Balance</div>
+              <div class="stat-label">Realized balance</div>
               <div class="stat-value">$0.00</div>
-              <div class="stat-sub muted">Broker account</div>
+              <div class="stat-sub muted">journal: seed + closed P&L</div>
             </div>
             <div class="stat-card" id="statTotalPnl">
               <div class="stat-label">Total P&L</div>
@@ -740,6 +745,6 @@
   </div>
 </div>
 
-<script src="/dash-assets/dashboard.js?v=20261008g"></script>
+<script src="/dash-assets/dashboard.js?v=20261008i"></script>
 </body>
 </html>

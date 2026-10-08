@@ -3340,6 +3340,17 @@ function renderTradeStats(d) {
   const balEl = $("statBalance");
   if (balEl) {
     balEl.querySelector(".stat-value").textContent = fmtUSD(d.balance);
+    // Spell out the derivation so this can never be mistaken for the broker's
+    // equity again (the tile used to read "Broker account" while showing a
+    // journal figure 130k below the real equity): seed + realized P&L. The
+    // seed is whatever the balance is minus the closed P&L — no extra config.
+    const sub = balEl.querySelector(".stat-sub");
+    if (sub && isFinite(d.balance) && isFinite(d.total_pnl)) {
+      const seed = d.balance - d.total_pnl;
+      sub.textContent = `${fmtUSD(seed)} seed \u00b7 ${d.total_pnl >= 0 ? "+" : "\u2212"}${fmtUSD(Math.abs(d.total_pnl))} closed`;
+      sub.title = "Journal-derived: opening balance plus realized (closed) P&L. "
+        + "This is not the broker equity — see the Balance card for that.";
+    }
   }
   const totalEl = $("statTotalPnl");
   if (totalEl) {

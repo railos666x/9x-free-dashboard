@@ -7,6 +7,25 @@ agent must be appended here.
 
 ---
 
+## 2026-10-08 (08:45 UTC) — "Current Balance / Broker account" was neither: two different balances on one screen, 130k apart
+
+Spotted while checking the user's screenshot of the KPI tiles. The tile labelled
+**"Current Balance — Broker account"** showed **$11,512.57** while the Balance card
+immediately above it showed **$143,427.93** (Exness MT5 $45,429.48 + Alpaca paper
+$97,998.45). Two numbers, same word, 130k apart — a trader cannot trust a screen
+like that.
+
+- What the figure actually is: `/api/trade-stats.balance` = **$10,000 seed +
+  $1,512.57 realized (closed) P&L**. It is journal-derived, and it is identical
+  to the equity the loss guard uses (`equity_now 10004.07` in the cycle readout),
+  so it is a legitimate internal figure — just not the broker's account balance.
+- Fix: the tile now reads **"Realized balance"** with the derivation spelled out
+  from its own numbers — `$10,000 seed · +$1,512.57 closed` — plus a tooltip
+  stating it is not the broker equity and pointing at the Balance card. The seed
+  is computed (`balance − total_pnl`), so it stays correct if the seed changes.
+- Verified live (`?v=20261008i`): label "Realized balance", value $11,512.57,
+  sub `$10,000 seed · +$1,512.57 closed`, seed reconciles to exactly $10,000.
+
 ## 2026-10-08 (08:20 UTC) — "AI asks, I answer": side-flip bug fixed, AI opinions surfaced with Take this, wrong-side bracket refused client-side
 
 User question: "my manual i meant to cancel out ai trades or placing trades on
