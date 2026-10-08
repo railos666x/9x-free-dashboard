@@ -89,7 +89,8 @@ def _intent_hash(symbol: str, direction: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def record_paper_trade(conn, proposal, intent, dry_run: bool = False) -> dict:
+def record_paper_trade(conn, proposal, intent, dry_run: bool = False,
+                       ai_model: str | None = None) -> dict:
     """Record a paper trade in the test_trades table.
 
     This is the test-mode equivalent of execution.execute_intent().
@@ -101,6 +102,9 @@ def record_paper_trade(conn, proposal, intent, dry_run: bool = False) -> dict:
         proposal: the Proposal from _ai_news_proposals (has all metadata)
         intent: the Intent from arbitrate() (dedup-ready trade)
         dry_run: if True, don't actually record (preview mode)
+        ai_model: override the journaled model tag (2026-10-05: the
+            gov-shadow prototype journals 'groq-gov' here so its rows are
+            separable from the live 'groq' paper book).
 
     Returns:
         {trade: dict, duplicate: bool, dry_run: bool}
@@ -142,7 +146,7 @@ def record_paper_trade(conn, proposal, intent, dry_run: bool = False) -> dict:
         calendar_blocked = 0  # already filtered upstream if blocked
 
         # AI model info
-        ai_model = "groq"
+        ai_model = ai_model or "groq"
         ai_reason = "; ".join(getattr(intent, "reasons", None) or [])
 
         # Record the trade

@@ -12,9 +12,16 @@ so these are safe to use in a live or backtest system.
 import pandas as pd
 
 
-def sma(series: pd.Series, n: int = 20) -> pd.Series:
-    """Simple Moving Average: the mean of the last `n` closes."""
-    return series.rolling(window=n).mean()
+def sma(series: pd.Series, n: int = 20, min_periods: int | None = None) -> pd.Series:
+    """Simple Moving Average: the mean of the last `n` closes.
+
+    min_periods defaults to n (standard: null until n samples exist). Pass a
+    smaller min_periods to emit partial warmup values instead — an 80-bar
+    window shows the SMA-50 settling from bar 50 rather than popping in at
+    bar 50, but it must be explicit; silently computing SMA-50 over 30 bars
+    is NOT an SMA-50 (a data hole used to drag a 64k August price into a
+    78k September mean and drew a diagonal to 71k across the chart)."""
+    return series.rolling(window=n, min_periods=min_periods if min_periods is not None else n).mean()
 
 
 def ema(series: pd.Series, n: int = 20) -> pd.Series:

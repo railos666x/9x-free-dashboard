@@ -21,7 +21,10 @@ import config
 import database
 
 CRYPTOPANIC_URL = "https://cryptopanic.com/api/v1/posts/"
-USER_AGENT = "cryptoautomation/0.1 (personal research)"
+# Some outlets (FXStreet, CryptoSlate, Investing.com) 403 the default
+# python/feedparser UA — a browser UA keeps those feeds alive.
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
 # ----------------------------------------------------------------------
@@ -32,9 +35,21 @@ def _now_iso() -> str:
 
 
 def _normalize_time(raw) -> str:
-    """Best-effort conversion of a source timestamp to ISO format."""
+    """Best-effort conversion of a source timestamp to ISO-8601 UTC.
+
+    Delegates to database.normalize_news_ts (RFC 2822 + ISO aware): storing
+    everything in one sortable format is what keeps `ORDER BY published_at`
+    honest — raw RSS strings ("Tue, ...") lexicographically outrank ISO
+    ("2026-...") and bury fresh stories, which starved the analyst before."""
     if not raw:
         return _now_iso()
+    try:
+        import database
+        iso = database.normalize_news_ts(raw)
+        if iso:
+            return iso
+    except Exception:
+        pass
     if isinstance(raw, str):
         return raw
     try:
@@ -318,11 +333,21 @@ def fallback_sentiment(title: str) -> tuple:
 
 
 def fetch_rss(feeds: list) -> list:
-    """Pull the latest items from every RSS feed."""
+    """Pull the latest items from every RSS feed.
+
+    2026-10-01: feedparser's internal urllib has NO socket timeout — one
+    feed that accepts the connection but never sends a body hung the news
+    loop for 30+ minutes (no 'fetched N new' lines, wire frozen, bot never
+    re-scored → zero trades). Fetch through requests (timeout=10) and hand
+    feedparser the raw bytes, so a stalled feed costs 10s, not forever."""
     items = []
     for name, url in feeds:
         try:
-            feed = feedparser.parse(url)
+            # agent matters: several outlets 403 the default feedparser UA.
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT},
+                                timeout=10)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
         except Exception as e:
             print(f"  [RSS] {name}: failed ({e})")
             continue
@@ -331,6 +356,24 @@ def fetch_rss(feeds: list) -> list:
             title = entry.get("title", "").strip()
             if not title:
                 continue
+            published = _normalize_time(
+                entry.get("published", entry.get("updated", "")))
+            # Ingest-time freshness guard: a feed that kept its XML but froze
+            # its content (seen live: FXStreet served Aug-17 headlines for six
+            # weeks while CNBC/OilPrice crawled) must not re-enter the pool and
+            # poison the analyst's sentiment window. NEWS_MAX_AGE_HOURS governs
+            # read-time too; here we just stop archiving obvious fossils.
+            try:
+                from datetime import datetime, timezone
+                import database as _db
+                iso = _db.normalize_news_ts(published)
+                if iso:
+                    pub_dt = datetime.fromisoformat(iso)
+                    age_h = (datetime.now(timezone.utc) - pub_dt).total_seconds() / 3600.0
+                    if age_h > 7 * 24.0:  # a week old is never tradable news
+                        continue
+            except Exception:
+                pass  # unparseable timestamp — keep it, read-time filter still applies
             sentiment, score = fallback_sentiment(title)
             items.append(
                 {
@@ -378,6 +421,66 @@ def fetch_all() -> list:
     print(f"  Fetching {len(config.NEWS_FEEDS)} RSS feeds...")
     items += fetch_rss(config.NEWS_FEEDS)
     return items
+
+
+def fetch_gov_rss(feeds: list) -> list:
+    """Official .gov / central-bank releases (PROTOTYPE 2026-10-05).
+
+    Same transport hardening as fetch_rss (requests with a socket timeout,
+    feedparser on raw bytes — a stalled feed costs 10s, not forever), but
+    rows go to the SEPARATE gov_news pool: official releases must never
+    shift live ai_news sentiment during the two-week shadow evaluation.
+    """
+    items = []
+    for name, url in feeds:
+        try:
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT},
+                                timeout=10)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
+        except Exception as e:
+            print(f"  [GOV] {name}: failed ({e})")
+            continue
+        for entry in feed.entries[:15]:  # newest 15 per official feed
+            title = entry.get("title", "").strip()
+            if not title:
+                continue
+            sentiment, score = fallback_sentiment(title)
+            items.append({
+                "source": name,
+                "title": title,
+                "url": entry.get("link", ""),
+                "published_at": _normalize_time(
+                    entry.get("published", entry.get("updated", ""))),
+                "sentiment": sentiment,
+                "sentiment_score": score,
+            })
+    return items
+
+
+def gov_live_loop() -> None:
+    """Daemon: refresh gov_news every GOV_FETCH_SECONDS and run the shadow
+    analyst each pass. Never raises — one bad pass must not kill the loop.
+    """
+    import gov_analyst
+    print(f"GOV shadow loop started — refreshing every "
+          f"{config.GOV_FETCH_SECONDS}s (paper-only). Ctrl+C to stop.")
+    while True:
+        try:
+            conn = database.connect()
+            database.init_db(conn)
+            items = fetch_gov_rss(config.GOV_FEEDS)
+            added = database.save_gov_news(conn, items)
+            database.purge_gov_news(conn, config.GOV_SHADOW_TTL_DAYS)
+            proposals = (gov_analyst.run_shadow_cycle(conn)
+                         if config.GOV_SHADOW_ENABLED else [])
+            print(f"  [{datetime.now().strftime('%H:%M:%S')}] [GOV] fetched "
+                  f"{len(items)}, {added} new, shadow proposals: "
+                  f"{len(proposals)}")
+            conn.close()
+        except Exception as e:
+            print(f"  [GOV] error: {e}")
+        time.sleep(config.GOV_FETCH_SECONDS)
 
 
 def live_loop() -> None:

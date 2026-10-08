@@ -110,6 +110,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             title           TEXT,
             url             TEXT,
             published_at    TEXT,
+            published_ts    TEXT,              -- ISO-8601 UTC copy of published_at (sortable)
             sentiment       TEXT,              -- bullish | bearish | neutral | important
             sentiment_score REAL,              -- how strong the signal is (-1..1)
             symbols         TEXT,              -- coins this story is about, comma-separated
@@ -117,6 +118,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_news_published ON news(published_at);
+        CREATE INDEX IF NOT EXISTS idx_news_published_ts ON news(published_ts);
 
         CREATE TABLE IF NOT EXISTS intents (
             intent_hash  TEXT PRIMARY KEY,   -- sha256(symbol|direction|window) — dedup key
@@ -147,13 +149,36 @@ def init_db(conn: sqlite3.Connection) -> None:
             fees        REAL,
             pnl         REAL,
             error       TEXT,
+            trend_regime TEXT,               -- regime at entry (trending_up/down/ranging/volatile)
             reasons     TEXT,                -- why the trade was taken (sources A+B)
             broker_ref  TEXT,                -- broker order id (e.g. Alpaca order UUID)
+            broker_position TEXT,            -- MT5 POSITION ticket (deals key on this; broker_ref
+                                             -- holds the entry DEAL ticket — not the same number)
+            slippage_cost REAL,              -- execution slippage $ (entry + exit): measured
+                                             -- |fill-ref| or venue-tier bps estimate
+            oco_ref TEXT,                    -- Binance OCO orderListId resting on the
+                                             -- exchange for venue-side SL/TP (2026-10-05)
+                                             -- |fill − ref| where a ref price exists, else
+                                             -- venue bps × notional (telemetry, not netted from pnl)
             created_at  TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);
         CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+
+        CREATE TABLE IF NOT EXISTS gov_news (
+            id              TEXT PRIMARY KEY,  -- sha1(source|title), dedupe
+            source          TEXT,              -- feed name (Fed, ECB, SEC, ...)
+            title           TEXT,
+            url             TEXT,
+            published_at    TEXT,
+            published_ts    TEXT,              -- ISO-8601 UTC sortable copy
+            sentiment       TEXT,              -- keyword prior: bullish/bearish/neutral
+            sentiment_score REAL,
+            fetched_at      TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_gov_news_published ON gov_news(published_at);
 
         CREATE TABLE IF NOT EXISTS news_verdicts (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,10 +251,37 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Migrate older orders tables that predate the exit columns.
     try:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
-        for col in ("exit_price", "exit_time", "exit_reason", "reasons", "broker_ref"):
+        for col in ("exit_price", "exit_time", "exit_reason", "reasons", "broker_ref",
+                    "trend_regime", "broker_position", "oco_ref"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
-        conn.commit()
+        # Slippage telemetry is numeric (REAL), not TEXT like the rest.
+        if "slippage_cost" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN slippage_cost REAL")
+        # News table: sortable timestamp copy (see normalize_news_ts) — raw
+        # published_at mixes RFC-2822 and ISO strings whose lexicographic
+        # order is garbage across formats. Backfill existing rows in Python
+        # (normalize_news_ts is a Python helper, not a SQLite UDF).
+        ncols = {r["name"] for r in conn.execute("PRAGMA table_info(news)")}
+        if ncols and "published_ts" not in ncols:
+            conn.execute("ALTER TABLE news ADD COLUMN published_ts TEXT")
+        # gov_news tables created during the 2026-10-05 prototype window
+        # lacked published_ts (rows were silently dropped) — self-heal.
+        gcols = {r["name"] for r in conn.execute("PRAGMA table_info(gov_news)")}
+        if gcols and "published_ts" not in gcols:
+            conn.execute("ALTER TABLE gov_news ADD COLUMN published_ts TEXT")
+            conn.execute("UPDATE gov_news SET published_ts = "
+                         "COALESCE(published_ts, fetched_at)")
+        if ncols:
+            stale = conn.execute(
+                "SELECT id, published_at FROM news WHERE published_ts IS NULL"
+            ).fetchall()
+            for row in stale:
+                iso = normalize_news_ts(row["published_at"])
+                if iso:
+                    conn.execute("UPDATE news SET published_ts = ? WHERE id = ?",
+                                 (iso, row["id"]))
+            conn.commit()
     except Exception:
         pass  # table may not exist yet — CREATE IF NOT EXISTS covers fresh DBs
     conn.commit()
@@ -405,18 +457,20 @@ def save_news(conn, items: list) -> int:
         nid = _news_id(item.get("url", ""), item.get("title", ""))
         if conn.execute("SELECT 1 FROM news WHERE id = ?", (nid,)).fetchone():
             continue  # already have it — skip (de-duplication)
+        iso = normalize_news_ts(item.get("published_at", ""))
         conn.execute(
             """
             INSERT OR IGNORE INTO news
-                (id, source, title, url, published_at, sentiment, sentiment_score, symbols, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, source, title, url, published_at, published_ts, sentiment, sentiment_score, symbols, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 nid,
                 item.get("source", ""),
                 item.get("title", ""),
                 item.get("url", ""),
-                normalize_news_ts(item.get("published_at", "")),
+                iso,
+                iso,  # sortable copy — ORDER BY uses this (see load_news)
                 item.get("sentiment", "neutral"),
                 float(item.get("sentiment_score", 0.0)),
                 item.get("symbols", ""),
@@ -457,7 +511,7 @@ def load_news(conn, limit: int = 50, sentiment=None, symbol=None) -> pd.DataFram
         coin = symbol.split("/")[0]
         query += " AND symbols LIKE ?"
         params.append(f"%{coin}%")
-    query += " ORDER BY published_at DESC LIMIT ?"
+    query += " ORDER BY COALESCE(NULLIF(published_ts, ''), published_at) DESC LIMIT ?"
     params.append(limit)
     return pd.read_sql_query(query, conn, params=params)
 
@@ -503,18 +557,66 @@ def record_order(conn, order: dict) -> int:
         INSERT OR IGNORE INTO orders
             (intent_hash, symbol, side, qty, entry, stop_loss, take_profit,
              source, status, fill_price, fill_time, fees, pnl, error,
-             reasons, broker_ref, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             trend_regime, reasons, broker_ref, broker_position, slippage_cost,
+             oco_ref, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (order["intent_hash"], order["symbol"], order["side"], order["qty"],
          order["entry"], order["stop_loss"], order["take_profit"],
          order["source"], order["status"], order.get("fill_price"),
          order.get("fill_time"), order.get("fees"), order.get("pnl"),
-         order.get("error"), order.get("reasons"), order.get("broker_ref"),
+         order.get("error"), order.get("trend_regime"), order.get("reasons"),
+         order.get("broker_ref"), order.get("broker_position"),
+         order.get("slippage_cost"), order.get("oco_ref"),
          datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     return cur.lastrowid if cur.rowcount > 0 else 0
+
+
+def save_gov_news(conn, items: list[dict]) -> int:
+    """Insert gov_news rows (dedupe on the sha1 id); returns rows added.
+    Separate from save_news BY DESIGN: official releases must never shift
+    live ai_news sentiment during the two-week shadow evaluation."""
+    added = 0
+    for it in items:
+        key = hashlib.sha1(
+            f"{it.get('source', '')}|{it.get('title', '')}".encode(
+                "utf-8", "replace")).hexdigest()
+        try:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO gov_news
+                       (id, source, title, url, published_at, published_ts,
+                        sentiment, sentiment_score, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (key, it.get("source"), it.get("title"), it.get("url"),
+                 it.get("published_at"),
+                 normalize_news_ts(it.get("published_at") or ""),
+                 it.get("sentiment"), it.get("sentiment_score"),
+                 datetime.now(timezone.utc).isoformat()))
+            added += cur.rowcount
+        except sqlite3.Error:
+            continue
+    conn.commit()
+    return added
+
+
+def load_gov_news(conn, limit: int = 40) -> list[dict]:
+    """Latest gov_news rows, newest published first."""
+    rows = conn.execute(
+        "SELECT * FROM gov_news ORDER BY published_ts DESC, fetched_at DESC "
+        "LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def purge_gov_news(conn, days: int = 7) -> int:
+    """Delete gov_news rows older than `days` (shadow TTL)."""
+    cut = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cur = conn.execute(
+        "DELETE FROM gov_news WHERE COALESCE(published_ts, fetched_at) < ?",
+        (cut,))
+    conn.commit()
+    return cur.rowcount
 
 
 def order_for_intent(conn, intent_hash: str) -> dict | None:
@@ -532,6 +634,20 @@ def discard_dry_run(conn, intent_hash: str) -> bool:
         (intent_hash,))
     conn.commit()
     return cur.rowcount > 0
+
+
+def archive_order_hash(conn, order_id: int, intent_hash: str) -> None:
+    """Release a day-bucketed intent hash so a fresh signal can trade the
+    same symbol+direction again (2026-09-30 re-entry cooldown).
+
+    The orders table enforces UNIQUE(intent_hash), so 'freeing' the hash
+    means rewriting the old row's key under a row-unique archived form
+    (#<id>#<old>) — the trade history stays intact and the fresh order can
+    INSERT. Idempotent: no-op when the hash is already archived/absent."""
+    conn.execute(
+        "UPDATE orders SET intent_hash = ? WHERE id = ? AND intent_hash = ?",
+        (f"#{order_id}#{intent_hash}", order_id, intent_hash))
+    conn.commit()
 
 
 def load_orders(conn, symbol: str = None, status: str = None,
@@ -712,16 +828,30 @@ def paper_equity(conn) -> float:
 
 
 def update_order_exit(conn, order_id: int, exit_price: float, exit_time: str,
-                      exit_reason: str, pnl: float, fees: float) -> None:
-    """Mark an open/filled order as closed with its exit + realized PnL."""
+                      exit_reason: str, pnl: float, fees: float,
+                      broker_position: int | str | None = None,
+                      slippage_cost: float | None = None) -> None:
+    """Mark an open/filled order as closed with its exit + realized PnL.
+
+    broker_position: the MT5 POSITION ticket that backed this trade, when
+    known (close paths resolve it from the open position). COALESCE keeps
+    any value already stamped — this must never erase a previously stored
+    ticket.
+
+    slippage_cost: the EXIT slippage $ estimate for this close — ADDED to
+    any entry slippage already on the row (the column is a running
+    round-trip total; see _estimate_slippage_cost)."""
     conn.execute(
         """
         UPDATE orders
         SET status = 'closed', exit_price = ?, exit_time = ?, exit_reason = ?,
-            pnl = ?, fees = ?
+            pnl = ?, fees = ?,
+            broker_position = COALESCE(broker_position, ?),
+            slippage_cost = COALESCE(slippage_cost, 0) + COALESCE(?, 0)
         WHERE id = ? AND status IN ('filled', 'open')
         """,
-        (exit_price, exit_time, exit_reason, pnl, fees, order_id),
+        (exit_price, exit_time, exit_reason, pnl, fees, broker_position,
+         slippage_cost, order_id),
     )
     conn.commit()
 

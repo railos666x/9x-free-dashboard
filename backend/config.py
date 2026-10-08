@@ -208,6 +208,86 @@ RISK_PER_TRADE = 0.01        # 1% of equity per trade
 MAX_RISK_PER_TRADE = 0.02    # hard cap: never risk > 2% of equity
 KELLY_FRACTION = 0.25        # 25% fractional Kelly (variance control)
 
+# Vol-aware sizing (roadmap Phase 2, P1): scale the base risk by
+# target_vol / realized_vol — risk MORE in quiet tape, LESS in wild tape —
+# clamped so a single trade can never be half-vanished or doubled.
+SIZE_VOL_ENABLED = os.environ.get("SIZE_VOL_ENABLED", "true").lower() in (
+    "1", "true", "yes")
+SIZE_VOL_TARGET_ATR_PCT = float(
+    os.environ.get("SIZE_VOL_TARGET_ATR_PCT", "0.01"))   # 1% of price
+SIZE_VOL_MIN_MULT = float(os.environ.get("SIZE_VOL_MIN_MULT", "0.5"))
+SIZE_VOL_MAX_MULT = float(os.environ.get("SIZE_VOL_MAX_MULT", "2.0"))
+
+# Rolling-bucket Kelly sizing (roadmap Phase 2, P2): per
+# (venue, regime, news-tag) bucket, expectancy from the last SIZE_KELLY_LOOKBACK
+# closed trades converts to a fractional-Kelly multiplier in
+# [SIZE_KELLY_MIN_MULT, SIZE_KELLY_MAX_MULT]; 0 when the bucket's 95% CI on
+# expectancy is negative (a data-driven stop for buckets that lose money).
+SIZE_KELLY_ENABLED = os.environ.get("SIZE_KELLY_ENABLED", "true").lower() in (
+    "1", "true", "yes")
+SIZE_KELLY_LOOKBACK = int(os.environ.get("SIZE_KELLY_LOOKBACK", "30"))
+SIZE_KELLY_MIN_MULT = float(os.environ.get("SIZE_KELLY_MIN_MULT", "0.5"))
+SIZE_KELLY_MAX_MULT = float(os.environ.get("SIZE_KELLY_MAX_MULT", "1.5"))
+SIZE_KELLY_ANNUALIZE = float(os.environ.get("SIZE_KELLY_ANNUALIZE", "50"))
+SIZE_KELLY_FRACTION = float(os.environ.get("SIZE_KELLY_FRACTION", "0.25"))
+# Base risk used to translate bucket expectancy into Kelly f* per trade.
+SIZE_KELLY_BASE_RISK_PCT = float(
+    os.environ.get("SIZE_KELLY_BASE_RISK_PCT", "0.01"))
+
+# Cost-clearance veto (2026-10-01): refuse entries whose planned winning
+# trade (TP distance) doesn't clear MULT × the estimated round-trip
+# execution cost (slippage + taker fee, both sides — risk.total_cost_bps).
+# 2× covers cost variance across the round trip (news-tape slippage,
+# requotes). Missing entry/TP degrades open — never a false veto.
+COST_VETO_ENABLED = os.environ.get("COST_VETO_ENABLED", "true").lower() in (
+    "1", "true", "yes")
+COST_VETO_MIN_EDGE_X = float(os.environ.get("COST_VETO_MIN_EDGE_X", "2.0"))
+
+# Venue-side protection for Binance spot legs (2026-10-05): when an entry
+# market order fills, rest an OCO bracket on the exchange — STOP_LOSS_LIMIT
+# + TAKE_PROFIT_LIMIT, one cancels the other — so SL/TP fire even with this
+# bot offline (the same guarantee the MT5 basket gets from deal-attached
+# sl/tp). The software monitor (check_position) stays authoritative: it
+# closes via the journal first and cancels the bracket; a failed/skipped
+# bracket only degrades to today's behavior, never to a worse one.
+BINANCE_OCO_ENABLED = os.environ.get("BINANCE_OCO_ENABLED", "true").lower() in (
+    "1", "true", "yes")
+# OCO legs are market-on-trigger (TAKE_PROFIT / STOP_LOSS on the leg-based
+# orderList/oco schema): they execute as MARKET the moment the trigger
+# touches, so no stop-limit buffer is needed — a fast tape cannot leave the
+# stop resting unfilled. (Legacy flat-schema knob BINANCE_OCO_STOP_LIMIT_PCT
+# removed 2026-10-05 when the venue rejected the old parameter set.)
+
+# ── Government-officials feed (2026-10-05, PROTOTYPE — two-week shadow) ──
+# Official .gov / central-bank RSS releases (Fed, FOMC speeches, BoC, BoE,
+# ECB, SEC, CFTC — every feed HTTP-probed live before inclusion; the dead
+# ones are listed in the CHANGELOG). Rows land in a SEPARATE gov_news table
+# and NEVER touch the live news pool, so live ai_news sentiment is
+# untouched. A shadow cycle runs them through the SAME noise gate and Groq
+# scorer as the live path and journals proposed trades PAPER-ONLY into
+# test_trades (ai_model='groq-gov') for a two-week evaluation.
+GOV_FEEDS_ENABLED = os.environ.get("GOV_FEEDS_ENABLED", "true").lower() in (
+    "1", "true", "yes")
+GOV_FETCH_SECONDS = int(os.environ.get("GOV_FETCH_SECONDS", "180"))
+GOV_SHADOW_ENABLED = os.environ.get("GOV_SHADOW_ENABLED", "true").lower() in (
+    "1", "true", "yes")
+# Open shadow trades older than this many bars close at last price
+# ('shadow_expired') — the shadow book must never accumulate zombie rows.
+GOV_SHADOW_MAX_HOLD_BARS = int(os.environ.get("GOV_SHADOW_MAX_HOLD_BARS", "72"))
+# gov_news rows older than this are purged (news stays tidy; nothing in the
+# shadow book reads headlines older than NEWS_MAX_AGE_HOURS anyway).
+GOV_SHADOW_TTL_DAYS = int(os.environ.get("GOV_SHADOW_TTL_DAYS", "7"))
+GOV_FEEDS = [
+    # Verified live 2026-10-05 (HTTP probe: 200 + parseable items):
+    ("Fed",         "https://www.federalreserve.gov/feeds/press_all.xml"),
+    ("FOMC",        "https://www.federalreserve.gov/feeds/speeches.xml"),
+    ("BoC",         "https://www.bankofcanada.ca/feed/"),
+    ("BoE",         "https://www.bankofengland.co.uk/rss/news"),
+    ("ECB",         "https://www.ecb.europa.eu/rss/press.html"),
+    ("SEC",         "https://www.sec.gov/news/pressreleases.rss"),
+    ("CFTC",        "https://www.cftc.gov/RSS/RSSGP/rssgp.xml"),
+]
+
 # Binance spot taker fee, per side (0.1%). Futures would be lower.
 FEE_BPS = 10.0               # 10 bps per side
 
@@ -612,16 +692,19 @@ NEWS_FEEDS = [
     ("U.Today",         "https://u.today/rss"),
     ("AMBCrypto",       "https://ambcrypto.com/feed/"),
     ("CoinJournal",     "https://coinjournal.net/feed/"),
-    ("Yahoo Crypto",    "https://finance.yahoo.com/news/cryptocurrency/rss"),
     # ── Macro / commodities / forex ──
-    ("Reuters",         "https://feeds.reuters.com/reuters/businessNews"),
+    # 2026-09-28 feed audit (live HTTP probes): removed the dead/stale feeds
+    # that were starving FX sentiment — FXStreet & CryptoSlate 403, Reuters &
+    # MarketWatch connection-refused, both Yahoo feeds 404, Kitco empty,
+    # DailyFX 403. FXStreet's Aug-17 staleness was a direct cause of bad FX
+    # entries. Replaced with working FX/macro feeds (all verified 200):
     ("CNBC Markets",    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
-    ("MarketWatch",     "https://feeds.content.dowjones.com/public/rss/mw_topstories"),
-    ("Yahoo Markets",   "https://finance.yahoo.com/news/markets/rss/"),
-    ("Kitco Gold",      "https://www.kitco.com/news/rss/"),
     ("OilPrice.com",    "https://oilprice.com/rss/main"),
-    ("FXStreet",        "https://www.fxstreet.com/rss/news"),
     ("Zero Hedge",      "https://feeds.feedburner.com/zerohedge/feed"),
+    ("ForexLive",       "https://www.forexlive.com/feed/news"),
+    ("FX Empire",       "https://www.fxempire.com/api/v1/en/articles/rss/news"),
+    ("Investing Forex", "https://www.investing.com/rss/news_1.rss"),
+    ("Investing Econ",  "https://www.investing.com/rss/news_14.rss"),
 ]
 
 # Simple keyword sentiment for RSS stories that have no official score.
@@ -644,7 +727,7 @@ BEARISH_KEYWORDS = [
 # Which broker the execution layer uses: "paper" (default, offline fills
 # from our candles + risk model), "alpaca" (paper or live REST, no SDK
 # needed), or "binance" (signed spot orders).
-EXECUTION_BROKER = os.environ.get("EXECUTION_BROKER", "paper").strip().lower()
+EXECUTION_BROKER = os.environ.get("EXECUTION_BROKER", "hybrid").strip().lower()
 
 # Alpaca keys. ALPACA_PAPER=true (default) talks to the free paper-trading
 # endpoint; set ALPACA_PAPER=false for live (real orders — be careful).
@@ -670,6 +753,13 @@ MAX_POSITION_PCT = float(os.environ.get("MAX_POSITION_PCT", "0.15"))
 # back while this many positions are open, so a signal burst can't stack
 # more exposure than the account can fund. 0 = unlimited.
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "5"))
+
+# Currency-concentration cap: one macro narrative ("dollar strength") can
+# otherwise open a dozen USD-* positions in a single cycle — one reversal
+# then hits them all simultaneously (seen live 2026-09-28: 9 USD-base longs
+# from one news cycle). No single currency/index may appear in more than
+# MAX_PER_CURRENCY open positions. 0 disables the cap.
+MAX_PER_CURRENCY = int(os.environ.get("MAX_PER_CURRENCY", "3"))
 
 # ── Loss guard (circuit breaker — see execution.loss_guard_status) ────
 # Two hard caps on bleeding, checked at the top of every bot cycle BEFORE
@@ -785,6 +875,17 @@ FEAR_GREED_API = "https://api.alternative.me/fng/"
 AI_CONFIRM_ENABLED = os.environ.get("AI_CONFIRM_ENABLED", "true").lower() in ("1", "true", "yes")
 AI_CONFIRM_MIN_SCORE = int(os.environ.get("AI_CONFIRM_MIN_SCORE", "3"))  # 0-6
 AI_REGIME_BLOCK_VOLATILE = os.environ.get("AI_REGIME_BLOCK_VOLATILE", "true").lower() in ("1", "true", "yes")
+
+# HARD counter-trend veto (2026-09-28). Post-mortem of the real closed book
+# (39 trades, excluding the retired-account event): entries WITH the 1h trend
+# (price vs EMA50/200) won 71.4% (14 trades, +639.59); entries AGAINST it won
+# 16.7% (12 trades, -378.90). The old code only *warned* on counter-trend
+# (ADX>30) and traded anyway — every USD/CHF, NZD/USD, ADA/USDT style loss
+# came through that hole. When true, a LONG in trending_down or a SHORT in
+# trending_up (ADX>20) is vetoed outright by ai_confirm.should_trade.
+AI_BLOCK_COUNTER_TREND = os.environ.get("AI_BLOCK_COUNTER_TREND", "true").lower() in ("1", "true", "yes")
+# ADX must exceed this for the veto to fire (below this a 'trend' is chop).
+AI_COUNTER_TREND_MIN_ADX = float(os.environ.get("AI_COUNTER_TREND_MIN_ADX", "20"))
 AI_SENTIMENT_LONG = float(os.environ.get("AI_SENTIMENT_LONG", "0.50"))    # was 0.35 — extreme sentiment only
 AI_SENTIMENT_SHORT = float(os.environ.get("AI_SENTIMENT_SHORT", "-0.50"))  # was -0.35
 AI_CONFIDENCE_FLOOR = float(os.environ.get("AI_CONFIDENCE_FLOOR", "0.70")) # was 0.6 — calibrated floor
@@ -869,6 +970,30 @@ TP_MAX_HOLD_BARS = int(os.environ.get("TP_MAX_HOLD_BARS", "12"))
 # NEWS_MIN_FRESH_HEADLINES available, return HOLD.
 NEWS_MAX_AGE_HOURS = int(os.environ.get("NEWS_MAX_AGE_HOURS", "4"))
 NEWS_MIN_FRESH_HEADLINES = int(os.environ.get("NEWS_MIN_FRESH_HEADLINES", "3"))
+
+# ── News noise filter (2026-09-30) ────────────────────────────────────
+# One story reprinted 2-3x from a single outlet used to push the sentiment
+# window over the trade threshold. Directional trades now need distinct
+# outlets agreeing, or one very strong headline (NEWS_SINGLE_OUTLET_MIN_SCORE).
+NEWS_NOISE_FILTER_ENABLED = os.environ.get(
+    "NEWS_NOISE_FILTER_ENABLED", "true").lower() in ("1", "true", "yes")
+NEWS_MIN_DISTINCT_OUTLETS = int(os.environ.get("NEWS_MIN_DISTINCT_OUTLETS", "2"))
+NEWS_SINGLE_OUTLET_MIN_SCORE = float(os.environ.get(
+    "NEWS_SINGLE_OUTLET_MIN_SCORE", "0.65"))
+
+# ── Risk/reward floor ───────────────────────────────────────────────
+# A trade whose TP is closer than its SL pays the spread and the odds at
+# the same time. Entries now need TP distance >= MIN_RR * SL distance,
+# with a hard cap so "take profit" can't sit a day's range away.
+MIN_RR = float(os.environ.get("MIN_RR", "1.2"))
+MAX_TP_PCT = float(os.environ.get("MAX_TP_PCT", "6.0"))
+
+# A finished trade (closed/error) older than this frees its day-bucketed
+# intent hash, so a fresh signal can re-enter the same symbol+direction.
+# Filled/open positions always block (no stacking the same trade).
+# 60 min: blocks same-hour churn, but lets a genuinely fresh signal (new
+# LLM cycle, new levels) trade again within the day.
+REENTRY_COOLDOWN_MIN = float(os.environ.get("REENTRY_COOLDOWN_MIN", "60"))
 
 # ----------------------------------------------------------------------
 # Dashboard

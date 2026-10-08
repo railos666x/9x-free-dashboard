@@ -309,50 +309,96 @@ def _binance_price(symbol: str) -> float | None:
 # Portfolio assembly
 # ──────────────────────────────────────────────────────────────────────
 
+def _registry_label(key: str, fallback: str) -> str:
+    """Display name for a broker key from the execution registry."""
+    try:
+        import execution
+        for b in execution.BROKER_REGISTRY:
+            if b["key"] == key:
+                return b["name"]
+    except Exception:
+        pass
+    return fallback
+
+
+def _account_slices() -> list[dict]:
+    """Live snapshot of every real account that responds, as
+    {key, label, kind, holdings, unrealized_pl, raw} slices. Registry-
+    driven — a broker that is down contributes nothing; demo fallback
+    only happens when NO real account answers.
+
+    Margin accounts (MT5, Alpaca) contribute their EQUITY as the single
+    USDT pseudo-holding: the account IS the asset (open positions are
+    leveraged exposure already inside that equity — adding coin amounts
+    would double count). Spot accounts (connected Binance exchange)
+    contribute their real coin balances.
+    """
+    slices: list[dict] = []
+
+    # 1. MT5/Exness (probe always — the terminal either answers or not).
+    try:
+        mt = _mt5_account()
+    except Exception:
+        mt = None
+    if mt:
+        equity = float(mt.get("equity") or mt.get("balance") or 0)
+        if equity > 0:
+            slices.append({"key": "mt5", "label": _registry_label("mt5", "Exness · MT5"),
+                           "kind": "margin", "holdings": {"USDT": round(equity, 2)},
+                           "unrealized_pl": mt.get("unrealized_pl") or 0.0, "raw": mt})
+
+    # 2. Alpaca (paper or live).
+    try:
+        alp = _alpaca_account()
+    except Exception:
+        alp = None
+    if alp and float(alp.get("equity") or 0) > 0:
+        slices.append({"key": "alpaca", "label": _registry_label("alpaca", "Alpaca (paper)"),
+                       "kind": "margin", "holdings": {"USDT": round(float(alp["equity"]), 2)},
+                       "unrealized_pl": alp.get("unrealized_pl") or 0.0, "raw": alp})
+
+    # 3. A Binance account explicitly connected via the dashboard modal.
+    keys = load_keys()
+    if keys and keys.get("api_key"):
+        try:
+            ex = _signed_request(keys)
+        except Exception:
+            ex = None
+        if ex:
+            slices.append({"key": "exchange", "label": keys.get("name") or "Binance",
+                           "kind": "spot", "holdings": ex,
+                           "unrealized_pl": 0.0, "raw": {"holdings": ex}})
+
+    return slices
+
+
 def get_portfolio(conn) -> dict:
     """
     Full portfolio snapshot: mode, holdings priced in USD, distribution,
     and a daily value history (from real 1d candles).
 
-    Mode priority: alpaca (the connected trading account) → binance
-    exchange (connect-exchange modal) → demo.
+    AGGREGATE portfolio: every real account that responds contributes a
+    slice (see _account_slices) and Balance/Holdings show the SUM across
+    accounts. One account alone → that account's legacy mode ("mt5",
+    "alpaca", "exchange") so existing UI extras keep working; several →
+    mode "multi"; none → the static demo portfolio.
     """
-    keys = load_keys()
-    mode = "demo"
-    holdings = dict(DEMO_HOLDINGS)
+    slices = _account_slices()
     account_meta = {}
 
-    # 1. MT5/Exness trading account (execution broker).
-    if config.EXECUTION_BROKER == "mt5":
-        try:
-            mt = _mt5_account()
-        except Exception:
-            mt = None
-        if mt:
-            holdings = mt["holdings"]
-            mode = "mt5"
-            account_meta = mt
+    holdings: dict[str, float] = {}
+    for s in slices:
+        for sym, amt in s["holdings"].items():
+            holdings[sym] = holdings.get(sym, 0.0) + float(amt or 0)
 
-    # 2. Alpaca trading account (execution broker).
-    if mode == "demo" and config.EXECUTION_BROKER == "alpaca":
-        try:
-            alp = _alpaca_account()
-        except Exception:
-            alp = None
-        if alp:
-            holdings = alp["holdings"]
-            mode = "alpaca"
-            account_meta = alp
-
-    # 3. Binance exchange (explicitly connected via the modal).
-    if mode == "demo" and keys and keys.get("api_key"):
-        try:
-            ex = _signed_request(keys)
-            if ex:
-                holdings = ex
-                mode = "exchange"
-        except Exception:
-            pass  # fall back to demo silently
+    if not slices:
+        mode = "demo"
+        holdings = dict(DEMO_HOLDINGS)   # nothing real answered → demo fallback
+    elif len(slices) == 1:
+        mode = slices[0]["key"]          # "mt5" | "alpaca" | "exchange"
+        account_meta = slices[0]["raw"]
+    else:
+        mode = "multi"
 
     prices = _latest_prices(conn, [s for s in holdings if s != "USDT"])
     items = []
@@ -381,15 +427,42 @@ def get_portfolio(conn) -> dict:
         for i in items if i["value"] > 0
     ]
 
+    # In multi mode the allocation bar shows ACCOUNT allocation (each
+    # margin account is one asset = its equity) in the broker's registry
+    # color — more truthful than a 100% USDT wedge.
+    if mode == "multi":
+        try:
+            import execution as _exec
+            _colors = {b["key"]: b["color"] for b in _exec.BROKER_REGISTRY}
+        except Exception:
+            _colors = {}
+        distribution = [
+            {"symbol": s["label"], "value": round(float(s["raw"].get("equity") or 0), 2),
+             "pct": round(float(s["raw"].get("equity") or 0) / (total or 1) * 100, 1),
+             "color": _colors.get(s["key"], "#4c9aff")}
+            for s in slices if float(s["raw"].get("equity") or 0) > 0
+        ]
+
     result = {
         "mode": mode,
-        "exchange_name": ("MT5/Exness (demo)" if mode == "mt5"
-                           else keys.get("name") if keys else None),
+        "exchange_name": (slices[0]["label"] if len(slices) == 1 else
+                          (" + ".join(s["label"] for s in slices) if slices else None)),
         "total_usd": round(total, 2),
         "items": items,
         "distribution": distribution,
         "history": _value_history(conn, holdings, days=90),
+        # Per-account breakdown of the aggregate (Balance subtitle + cards).
+        "accounts": [{"key": s["key"], "label": s["label"], "kind": s["kind"],
+                      "unrealized_pl": round(float(s["unrealized_pl"] or 0), 2),
+                      "equity": (round(float(s["raw"].get("equity") or 0), 2)
+                                 if s["kind"] == "margin" else None)}
+                     for s in slices],
     }
+    if mode == "multi":
+        result.update({
+            "equity": round(sum(float(s["raw"].get("equity") or 0) for s in slices), 2),
+            "unrealized_pl": round(sum(float(s["unrealized_pl"] or 0) for s in slices), 2),
+        })
     if mode == "alpaca":
         result.update({
             "exchange_name": f"Alpaca {'paper' if account_meta.get('paper') else 'live'}",

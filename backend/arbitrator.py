@@ -52,6 +52,9 @@ class Proposal:
     # AI-suggested SL/TP percentages (2026-08-18):
     stop_loss_pct: float = 0.0
     take_profit_pct: float = 0.0
+    # Market regime at signal time (from ai_confirm / news analyst) —
+    # journaled on the order so the book can be audited by-trend later.
+    trend_regime: str | None = None
 
 
 @dataclass
@@ -70,6 +73,8 @@ class Intent:
     # AI-suggested SL/TP percentages (2026-08-18):
     stop_loss_pct: float = 0.0
     take_profit_pct: float = 0.0
+    # Regime at signal time — carried to the order journal for post-mortems.
+    trend_regime: str | None = None
 
 
 def proposal_from_signal_dict(d: dict, source: str = "math_engine",
@@ -190,6 +195,7 @@ def arbitrate(a: Proposal, b: Proposal, min_sources: int = 2,
             reasons=list(a_.reasons or []),
             stop_loss_pct=a_.stop_loss_pct or b_.stop_loss_pct,
             take_profit_pct=a_.take_profit_pct or b_.take_profit_pct,
+            trend_regime=a_.trend_regime or b_.trend_regime,
         )
         for r in b_.reasons or []:
             if r not in intent.reasons:
@@ -208,6 +214,7 @@ def arbitrate(a: Proposal, b: Proposal, min_sources: int = 2,
         confidence=p.confidence,
         intent_hash=intent_hash(p.symbol, direction, window),
         reasons=list(p.reasons or []),
+        trend_regime=p.trend_regime,
         stop_loss_pct=p.stop_loss_pct,
         take_profit_pct=p.take_profit_pct,
     )

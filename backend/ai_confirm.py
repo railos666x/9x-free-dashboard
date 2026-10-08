@@ -353,13 +353,25 @@ def should_trade(conn, symbol: str, sentiment_score: float,
                 "session_mult": session_multiplier(),
                 "reasons": [f"BLOCKED: volatile regime (ATR > 90th pct)"]}
 
-    # Block counter-trend trades in strong trends
-    if regime == "trending_up" and direction == "SHORT":
-        if regime_info["adx"] > 30:  # strong uptrend → don't short
-            reasons.append(f"WARNING: shorting against strong uptrend (ADX={regime_info['adx']})")
-    elif regime == "trending_down" and direction == "LONG":
-        if regime_info["adx"] > 30:  # strong downtrend → don't buy
-            reasons.append(f"WARNING: buying against strong downtrend (ADX={regime_info['adx']})")
+    # Counter-trend handling. Post-mortem of the real book (2026-09-28):
+    # with-trend entries won 71.4% (+639.59) while counter-trend entries won
+    # 16.7% (-378.90) — the old code only WARNED here and traded anyway.
+    # AI_BLOCK_COUNTER_TREND turns that warning into a hard veto once the
+    # trend is real (ADX >= AI_COUNTER_TREND_MIN_ADX).
+    counter_trend = (regime == "trending_up" and direction == "SHORT") or (
+        regime == "trending_down" and direction == "LONG")
+    if counter_trend:
+        if config.AI_BLOCK_COUNTER_TREND and regime_info["adx"] >= config.AI_COUNTER_TREND_MIN_ADX:
+            reasons.append(
+                f"BLOCKED: counter-trend {direction} in {regime} "
+                f"(ADX={regime_info['adx']} >= {config.AI_COUNTER_TREND_MIN_ADX}) — "
+                "these entries ran a 16.7% win rate in the live book")
+            return {"pass": False, "score": 0, "regime": regime,
+                    "session": current_session()["session"],
+                    "session_mult": session_multiplier(),
+                    "reasons": reasons}
+        if regime_info["adx"] > 30:  # veto off or weak trend: still flag it
+            reasons.append(f"WARNING: trading against {regime} (ADX={regime_info['adx']})")
 
     reasons.append(f"regime={regime} ADX={regime_info['adx']}")
 

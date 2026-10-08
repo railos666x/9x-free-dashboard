@@ -221,6 +221,13 @@ def fetch_headlines(conn, limit: int = 25) -> list[dict]:
             fresh_rows.append(r)
     rows = fresh_rows
 
+    # ── Wire-copy dedup (2026-09-30): one story reprinted 2-3x from one
+    # outlet used to stack the sentiment window and push directional
+    # trades on single-source noise. Newest copy wins.
+    if config.NEWS_NOISE_FILTER_ENABLED:
+        import news_noise
+        rows, _ndup = news_noise.dedupe_headlines(rows)
+
     # Traded-instrument stories first, then newest first; cap at `limit`.
     rows.sort(key=lambda r: (_is_traded(r), str(r.get("published_at") or "")),
               reverse=True)
@@ -681,6 +688,36 @@ def signal_for(conn, symbol: str) -> dict:
 
     block_reasons = []
 
+    # ── Step 1.5: news noise gate (2026-09-30) ────────────────────────
+    # Distinct outlets must corroborate the story before it risks money —
+    # a lone weak headline (or wire copies of one) is exactly the noise
+    # that produced the low-quality, loss-heavy entries.
+    news_stats = None
+    if config.NEWS_NOISE_FILTER_ENABLED:
+        import news_noise
+        from reviewer import COIN_HINTS as _HINTS
+        hints = _HINTS.get(symbol)
+        if hints:
+            try:
+                _hh = fetch_headlines(conn, limit=15)
+                news_stats = news_noise.corroboration_stats(_hh, hints)
+                _ok, _why = news_noise.corroboration_ok(
+                    news_stats, config.NEWS_MIN_DISTINCT_OUTLETS,
+                    config.NEWS_SINGLE_OUTLET_MIN_SCORE)
+                if not _ok:
+                    block_reasons.append(_why)
+                    return {"action": "HOLD", "confidence": round(conf, 3),
+                            "score": round(sentiment, 3),
+                            "reason": f"news noise gate: {_why}",
+                            "horizon": row.get("impact_horizon"),
+                            "regime": None, "confirm_score": 0,
+                            "dxy_score": 0, "smc_score": 0, "session": None,
+                            "confirm_details": {"news_corroboration": news_stats},
+                            "block_reasons": block_reasons,
+                            "news_corroboration": news_stats}
+            except Exception:
+                pass  # the noise filter must never break the signal path
+
     # ── Step 2: News freshness ────────────────────────────────────────
     headlines = fetch_headlines(conn, limit=10)
     fresh_count = sum(1 for h in headlines if h.get("age_hours") is not None)
@@ -760,6 +797,10 @@ def signal_for(conn, symbol: str) -> dict:
     # ── All gates passed — signal is valid ────────────────────────────
     reason = row.get("summary") or f"news score {sentiment:+.2f} (conf {conf:.2f}) → {direction}"
     reason += f" | regime={confirm['regime']} tc={confirm['score']} dxy={dxy_result['score']} smc={smc_score}"
+    if news_stats:
+        reason += (f" | outlets={news_stats['distinct_outlets']}"
+                   f" stories={news_stats['story_count']}"
+                   f" mean={news_stats['mean_score']:+.2f}")
     
     # Get AI-suggested SL/TP percentages from analytics
     sl_pct = float(row.get("stop_loss_pct") or 0.0)

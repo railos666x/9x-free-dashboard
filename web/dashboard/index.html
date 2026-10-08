@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>cryptoautomation · Dashboard</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="/dash-assets/dashboard.css" />
+<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261008c" />
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
@@ -13,6 +13,10 @@
 <div class="page-bg"></div>
 
 <div class="app">
+  <!-- Real-time alert layer (2026-10-06): persistent banner for critical
+       conditions + transient toasts for everything else. -->
+  <div id="alertBanner" class="alert-banner" style="display:none"></div>
+  <div id="toastHost" class="toast-host"></div>
   <!-- Inline SVG icon set (stroke, currentColor — professional, no emoji, no CDN) -->
   <svg style="display:none" xmlns="http://www.w3.org/2000/svg">
     <symbol id="i-logo" viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></symbol>
@@ -51,6 +55,16 @@
     </div>
   </header>
 
+  <!-- Trader flow strip (2026-10-07): loop state + last cycle + open orders,
+       visible on EVERY view so "orders are going or not" is one glance away. -->
+  <div class="flow-strip" id="flowStrip" style="display:none">
+    <span class="fs-item"><span class="fs-dot" id="fsLoopDot"></span>Loop <b id="fsLoopState">…</b></span>
+    <span class="fs-item">Last cycle <b id="fsCycleAge">—</b></span>
+    <span class="fs-item">Actions <b id="fsCycleActions">—</b></span>
+    <span class="fs-item">Open orders <b id="fsOpenOrders">—</b></span>
+    <button class="fs-jump" onclick="switchView('orders')">Open Orders view →</button>
+  </div>
+
   <!-- ═══════════ Sidebar + main ═══════════ -->
   <div class="body">
     <aside class="sidebar">
@@ -67,6 +81,7 @@
         <a class="nav-item" data-view="orders" href="#"><svg class="ic"><use href="#i-book"/></svg> Orders</a>
         <a class="nav-item" data-view="signals" href="#"><svg class="ic"><use href="#i-zap"/></svg> Signals</a>
         <a class="nav-item" data-view="aitest" href="#"><svg class="ic"><use href="#i-flask"/></svg> AI Test</a>
+        <a class="nav-item" data-view="forex" href="#"><svg class="ic"><use href="#i-coins"/></svg> Forex</a>
       </div>
     </aside>
 
@@ -253,6 +268,20 @@
             <div class="dist-legend" id="distLegend2"></div>
           </section>
         </div>
+        <section class="card">
+          <div class="card-head">
+            <div class="card-title">Broker accounts</div>
+            <div class="muted" id="brokerAccountsMeta"></div>
+          </div>
+          <div id="brokerAccounts" class="ba-grid"><div class="muted">Loading…</div></div>
+        </section>
+        <section class="card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">Connection diagnostics</div>
+            <div class="muted" id="brokerHealthMeta"></div>
+          </div>
+          <div id="brokerHealth" class="bh-list"><div class="muted">Loading…</div></div>
+        </section>
       </section>
 
       <!-- ═══════════ View: Bots ═══════════ -->
@@ -370,16 +399,8 @@
               <div class="card-title">Profit by currency</div>
               <span class="muted" id="pnlDonutMeta"></span>
             </div>
-            <div class="dual-donut-wrap">
-              <div class="donut-pane">
-                <div class="donut-pane-label"><span class="broker-dot dot-mt5"></span> MT5 / Exness</div>
-                <div id="pnlDonutMt5" class="chart pnl-donut"></div>
-              </div>
-              <div class="donut-pane">
-                <div class="donut-pane-label"><span class="broker-dot dot-binance"></span> Binance</div>
-                <div id="pnlDonutBinance" class="chart pnl-donut"></div>
-              </div>
-            </div>
+            <!-- Panes are generated from the broker registry (see renderBrokerDonutPanes) -->
+            <div class="dual-donut-wrap"></div>
             <div id="pnlBreakdown" class="pnl-breakdown"><div class="muted">Loading…</div></div>
             <div class="closed-trades-head">
               <div class="card-title">Every closed trade</div>
@@ -397,6 +418,66 @@
           </section>
         </div>
 
+        <!-- ═══ Manual trading: place / close from the dashboard ═══
+             Posts to /api/manual/order + /api/manual/close/{id}. Both ride
+             the bot's own execution path server-side, so a manual order gets
+             the same routing, risk sizing, R/R floor and venue protection as
+             an AI order — and a manual exit realizes PnL + journals. -->
+        <section class="card manual-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">Manual trading</div>
+            <span class="muted">same execution path as the bot — sizer, R/R floor, OCO / SL-TP, journal</span>
+          </div>
+          <div class="mt-grid">
+            <label class="mt-field mt-field-wide">Asset
+              <div class="ap-wrap" id="manPickerWrap">
+                <div class="asset-picker">
+                  <div class="ap-input-row">
+                    <span class="ap-search-ico"><svg class="ic"><use href="#i-search"/></svg></span>
+                    <input id="manInput" type="text" autocomplete="off" spellcheck="false" placeholder="Search…" />
+                    <span class="ap-caret"><svg class="ic ic-sm"><use href="#i-caret"/></svg></span>
+                  </div>
+                  <div class="ap-list" id="manList" hidden></div>
+                </div>
+                <div class="ap-quick" id="manQuick"></div>
+              </div>
+            </label>
+            <label class="mt-field">Side
+              <div class="mt-side" id="manSide" role="group" aria-label="Order side">
+                <button type="button" class="mt-side-btn active" data-side="LONG">LONG</button>
+                <button type="button" class="mt-side-btn" data-side="SHORT">SHORT</button>
+              </div>
+            </label>
+            <label class="mt-field">Qty <span class="muted">blank = risk size</span>
+              <input id="manQty" type="number" min="0" step="any" placeholder="auto" inputmode="decimal" />
+            </label>
+            <label class="mt-field">Entry <span class="muted">blank = market</span>
+              <input id="manEntry" type="number" step="any" placeholder="market" inputmode="decimal" />
+            </label>
+            <label class="mt-field">Stop loss <span class="muted">blank = ATR</span>
+              <input id="manSL" type="number" step="any" placeholder="auto" inputmode="decimal" />
+            </label>
+            <label class="mt-field">Take profit <span class="muted">optional</span>
+              <input id="manTP" type="number" step="any" placeholder="optional" inputmode="decimal" />
+            </label>
+          </div>
+          <div class="mt-actions">
+            <label class="mt-dry" title="Preview the risk sizing and fees without sending anything to a broker">
+              <input type="checkbox" id="manDry" /> Dry run (no broker order)
+            </label>
+            <button class="btn-warn" id="btnPlaceManual" onclick="placeManualOrder()">
+              <svg class="ic"><use href="#i-play"/></svg> Place order
+            </button>
+            <span class="mt-msg muted" id="manMsg" role="status" aria-live="polite"></span>
+          </div>
+          <div class="mt-note muted">
+            Entry / SL / TP left blank are filled by the bot's ATR defaults; a LONG needs its stop
+            <b>below</b> entry and a SHORT needs it <b>above</b>. A blocked loss guard refuses new
+            entries exactly as it does for the bot. Open positions can be closed from the
+            <b>Close</b> button on each journal row below.
+          </div>
+        </section>
+
         <section class="card crypto-table-card" style="margin-top:16px;">
           <div class="card-head">
             <div class="card-title">Trade journal</div>
@@ -404,19 +485,22 @@
               <span class="signal-badge badge-hold" id="botModeBadge" title="Bot run mode (set by the Auto loop control)">AUTO: ?</span>
               <button class="btn-primary" id="btnRunBotDry" onclick="runBotCycle(true)"><svg class="ic"><use href="#i-flask"/></svg> Dry test</button>
               <button class="btn-warn" id="btnRunBotLive" onclick="runBotCycle(false)"><svg class="ic"><use href="#i-play"/></svg> Live test</button>
+              <button class="icon-btn" id="btnReconcile" onclick="reconcileBroker()" title="Sync journal statuses with the broker">⟳ Reconcile</button>
             </div>
           </div>
           <div id="journalSummary" class="journal-summary muted"></div>
+          <div class="table-scroll">
           <table class="crypto-table orders-table">
             <thead>
               <tr>
                 <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>SL</th><th>TP</th>
                 <th>Exit</th><th>PnL</th><th>Status</th><th>Broker</th>
-                <th>Why</th><th>Time</th>
+                <th>Why</th><th>Time</th><th>Action</th>
               </tr>
             </thead>
-            <tbody id="ordersBody"><tr><td colspan="12" class="muted">No orders yet.</td></tr></tbody>
+            <tbody id="ordersBody"><tr><td colspan="13" class="muted">No orders yet.</td></tr></tbody>
           </table>
+          </div>
         </section>
       </section>
 
@@ -489,6 +573,55 @@
               </tr>
             </thead>
             <tbody id="testTradesBody"><tr><td colspan="14" class="muted">No test trades yet.</td></tr></tbody>
+          </table>
+        </section>
+      </section>
+
+      <!-- ═══════════ View: Forex ═══════════ -->
+      <section class="view" id="view-forex">
+        <!-- Session + USD index strip -->
+        <section class="card bots-card">
+          <div class="card-head">
+            <div class="card-title">FX Session</div>
+            <span class="muted" id="fxSessionMeta">sessions drive FX liquidity &amp; ranges</span>
+          </div>
+          <div id="fxSessionBody" class="fx-session-body"><div class="muted">Loading…</div></div>
+        </section>
+
+        <div class="fx-grid" style="margin-top:16px;">
+          <!-- Currency strength -->
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Currency strength (24h)</div>
+              <span class="muted" id="fxStrengthMeta"></span>
+            </div>
+            <div id="fxStrengthBody" class="fx-strength-body"><div class="muted">Loading…</div></div>
+          </section>
+
+          <!-- Open exposure by currency -->
+          <section class="card">
+            <div class="card-head">
+              <div class="card-title">Open FX exposure</div>
+              <span class="muted">correlated-risk check</span>
+            </div>
+            <div id="fxExposureBody" class="fx-strength-body"><div class="muted">Loading…</div></div>
+          </section>
+        </div>
+
+        <!-- Pairs table -->
+        <section class="card crypto-table-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">Pair analytics (1h)</div>
+            <span class="muted" id="fxPairsMeta"></span>
+          </div>
+          <table class="crypto-table orders-table">
+            <thead>
+              <tr>
+                <th>Pair</th><th>Last</th><th>24h %</th><th>Trend</th><th>Mom</th>
+                <th>RSI</th><th>ATR %</th><th>Best sessions</th><th>Carry favors</th>
+              </tr>
+            </thead>
+            <tbody id="fxPairsBody"><tr><td colspan="9" class="muted">Loading…</td></tr></tbody>
           </table>
         </section>
       </section>
@@ -585,6 +718,6 @@
   </div>
 </div>
 
-<script src="/dash-assets/dashboard.js"></script>
+<script src="/dash-assets/dashboard.js?v=20261008c"></script>
 </body>
 </html>

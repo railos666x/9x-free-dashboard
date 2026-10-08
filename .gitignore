@@ -10,6 +10,11 @@ data/
 *.db-shm
 .env
 
+# Runtime logs (server-run.log / server.err.log and one-off test logs) —
+# redirect targets of a locally started server, never source. .gitignore
+# rather than "just don't add them": they reappear on every restart.
+*.log
+
 # Local editor config (never commit)
 .vscode/
 

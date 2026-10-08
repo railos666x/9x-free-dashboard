@@ -104,6 +104,140 @@ def notional(size: float, entry: float) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Phase-2 sizing multipliers (pure math — DB/IO stays in execution.py)
+# ──────────────────────────────────────────────────────────────────────
+
+def inverse_vol_multiplier(atr_pct: float | None,
+                           target_atr_pct: float | None = None,
+                           lo: float | None = None,
+                           hi: float | None = None) -> float:
+    """Vol-targeting multiplier: risk MORE in quiet tape, LESS in wild tape.
+
+        mult = target_vol / realized_vol      (realized_vol = ATR / price)
+
+    ATR(14) on the entry timeframe already exists in the indicators stack
+    (roadmap Phase 2, P1). Returns 1.0 (neutral) when volatility is unknown
+    — missing data must never invent an opinion. The result is clamped to
+    [lo, hi] (default 0.5×–2.0× of the base risk).
+    """
+    target = config.SIZE_VOL_TARGET_ATR_PCT if target_atr_pct is None else target_atr_pct
+    lo = config.SIZE_VOL_MIN_MULT if lo is None else lo
+    hi = config.SIZE_VOL_MAX_MULT if hi is None else hi
+    try:
+        if (not target or target <= 0 or atr_pct is None
+                or not math.isfinite(float(atr_pct)) or float(atr_pct) <= 0):
+            return 1.0
+        raw = target / float(atr_pct)
+        if not math.isfinite(raw) or raw <= 0:
+            return 1.0
+        return max(lo, min(hi, raw))
+    except Exception:
+        return 1.0
+
+
+def bucket_expectancy_ci(records: list[dict]) -> tuple[float, float] | None:
+    """Mean per-trade risk-multiple (expectancy in R) and its approximate
+    95% CI half-width for a bucket of closed trades.
+
+    Each record = one closed trade: {pnl, entry, stop_loss, qty}. R is
+    pnl / risk_amount with risk_amount = |entry − stop| × qty — how much
+    the trade made vs what it set out to risk, independent of the account
+    size it happened to run on. Trades without usable levels are skipped.
+    With n < 2 the CI is meaningless → returns (mean, None); callers treat
+    a missing CI as 'not significant' (never the negative-CI kill switch).
+    Normal approximation (σ/√n) is deliberately simple: at n=30 the exact
+    Student-t quantile differs by <5%, far inside the clamp band.
+    """
+    rs = []
+    for rec in records or []:
+        try:
+            risk_amt = abs(float(rec["entry"]) - float(rec["stop_loss"])) \
+                * abs(float(rec["qty"]))
+            if risk_amt <= 0:
+                continue
+            rs.append(float(rec["pnl"]) / risk_amt)
+        except (KeyError, TypeError, ValueError):
+            continue
+    n = len(rs)
+    if n == 0:
+        return None
+    mean = sum(rs) / n
+    if n < 2:
+        return mean, None
+    var = sum((x - mean) ** 2 for x in rs) / (n - 1)
+    half = 1.96 * math.sqrt(max(var, 0.0) / n)
+    return mean, half
+
+
+def bucket_kelly_multiplier(records: list[dict],
+                            lo: float | None = None,
+                            hi: float | None = None) -> float:
+    """Fractional-Kelly sizing multiplier for a bucket of closed trades.
+
+    From the last N closed trades in the (venue, regime, news-tag) bucket
+    (roadmap Phase 2, P2):
+      * expectancy E[R] and its 95% CI (bucket_expectancy_ci);
+      * statistically NEGATIVE expectancy (mean + 1.96σ/√n < 0) → 0.0:
+        the bucket stops trading size until the data says otherwise — the
+        ranging-regime gate emerges from data instead of a hard rule;
+      * Kelly f* = E/R − (1 − E)/R with R = avg |winner| / avg |loser| in R
+        units (the payoff ratio), floored at 0 when E ≤ 0;
+      * the fraction-of-Kelly risk pct becomes a multiplier vs the base
+        risk: mult = f* / base_risk_pct, clamped [0.5, 1.5] by default;
+      * f* is additionally capped at MAX_RISK_PER_TRADE so an implausible
+        measured edge can't inflate past the hard risk cap via the clamp;
+      * < 2 usable trades → 1.0 (neutral): no opinion yet.
+    """
+    lo = config.SIZE_KELLY_MIN_MULT if lo is None else lo
+    hi = config.SIZE_KELLY_MAX_MULT if hi is None else hi
+    try:
+        ci = bucket_expectancy_ci(records)
+        if ci is None:
+            return 1.0
+        mean, half = ci
+        if half is None:
+            return 1.0   # n < 2: no usable CI → no evidence, no opinion
+        if (mean + half) < 0:
+            return 0.0   # negative at 95% confidence: starve the bucket
+        if mean <= 0:
+            return 1.0   # negative but not significant → no confidence to shrink
+        wins = [abs(float(r["pnl"])) for r in (records or [])
+                if _num(r.get("pnl")) > 0 and _usable(r)]
+        losses = [abs(float(r["pnl"])) for r in (records or [])
+                  if _num(r.get("pnl")) < 0 and _usable(r)]
+        if not wins or not losses:
+            R = 2.0   # one-sided sample (all wins/all losses): modest prior
+        else:
+            R = (sum(wins) / len(wins)) / (sum(losses) / len(losses))
+        if R <= 0:
+            return 1.0
+        full = mean - (1.0 - mean) / R          # Kelly f* in R units
+        frac_risk = max(0.0, full) * config.SIZE_KELLY_FRACTION
+        frac_risk = min(frac_risk, config.MAX_RISK_PER_TRADE)
+        base = max(config.SIZE_KELLY_BASE_RISK_PCT, 1e-9)
+        return max(lo, min(hi, frac_risk / base))
+    except Exception:
+        return 1.0
+
+
+def _num(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _usable(rec: dict) -> bool:
+    """A trade contributes to the payoff ratio only when its risk amount
+    can be reconstructed (mirrors bucket_expectancy_ci's skip rule)."""
+    try:
+        return abs(float(rec["entry"]) - float(rec["stop_loss"])) \
+            * abs(float(rec["qty"])) > 0
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Sanitizers
 # ──────────────────────────────────────────────────────────────────────
 

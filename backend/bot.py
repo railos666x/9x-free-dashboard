@@ -120,7 +120,10 @@ def _ai_news_proposals(conn, symbols: list[str]) -> dict[str, Proposal]:
             block_reasons=s.get("block_reasons", []),
             # AI-suggested SL/TP percentages:
             stop_loss_pct=float(s.get("stop_loss_pct") or 0.0),
-            take_profit_pct=float(s.get("take_profit_pct") or 0.0))
+            take_profit_pct=float(s.get("take_profit_pct") or 0.0),
+            # Regime the confirmation pipeline saw at signal time — journaled
+            # onto the order row so the book can be audited by-trend later.
+            trend_regime=s.get("regime"))
     return out
 
 
@@ -213,6 +216,27 @@ def run_once(conn, symbols: list[str] | None = None,
             summary["held"].append({"symbol": sym, "reason": "not_on_broker"})
         wanted &= supported
 
+    # ── Live exposure snapshot for the caps below (2026-09-30) ──────
+    # Rows are journaled with their ACTUAL broker (mt5/binance), not
+    # "hybrid" — filtering by EXECUTION_BROKER made both caps count 0 and
+    # they were no-ops (six AUD trades from one narrative slipped through
+    # in a single cycle). Fetched ONCE before the loop and grown in-place
+    # as trades execute, so intra-cycle stacking is capped too.
+    def _currencies(sym: str) -> set:
+        """Currencies/indices a symbol is exposed to. FX pair "USD/CHF" →
+        {USD, CHF}; single-name "BTC/USDT" → {BTC}; index "DXY" → {DXY}."""
+        parts = [p for p in sym.split("/") if p]
+        if len(parts) == 2:
+            return {parts[0], parts[1]}
+        return {parts[0]} if parts else set()
+
+    _live_rows = [o for o in database.load_orders(conn, limit=1000)
+                  if o.get("status") in ("filled", "open")]
+    _cur_counts: dict[str, int] = {}
+    for o in _live_rows:
+        for c in _currencies(o["symbol"]):
+            _cur_counts[c] = _cur_counts.get(c, 0) + 1
+
     for symbol in sorted(wanted):
         proposal = proposals.get(symbol)
         if loss_guard["blocked"]:
@@ -285,14 +309,27 @@ def run_once(conn, symbols: list[str] | None = None,
             # Concurrent-position limit: don't stack more exposure than the
             # account can fund when a burst of signals agrees at once.
             if not dry_run and config.MAX_OPEN_POSITIONS > 0:
-                # Only the CURRENT broker's positions count against the cap —
-                # a retired account's phantom rows must not freeze new entries.
-                open_now = len([o for o in database.load_orders(
-                                    conn, source=config.EXECUTION_BROKER, limit=1000)
-                                if o.get("status") in ("filled", "open")])
-                if open_now >= config.MAX_OPEN_POSITIONS:
+                if len(_live_rows) >= config.MAX_OPEN_POSITIONS:
                     summary["held"].append({"symbol": symbol,
                                             "reason": "max_positions"})
+                    continue
+
+            # Currency-concentration cap: one macro narrative must not become
+            # a dozen same-currency bets (2026-09-28: 9 USD-base longs; seen
+            # again 2026-09-30: 6 AUD trades from one "regulatory news"
+            # story). A pair counts against BOTH legs; grows intra-cycle as
+            # trades execute, so a burst cannot stack past the cap.
+            if not dry_run and config.MAX_PER_CURRENCY > 0:
+                focus = _currencies(symbol)
+                blocked_cur = [c for c in sorted(focus)
+                               if _cur_counts.get(c, 0) >= config.MAX_PER_CURRENCY]
+                if blocked_cur:
+                    summary["held"].append({
+                        "symbol": symbol, "reason": "currency_concentration",
+                        "detail": {"currencies": blocked_cur,
+                                   "open": {c: _cur_counts.get(c, 0)
+                                            for c in blocked_cur},
+                                   "cap": config.MAX_PER_CURRENCY}})
                     continue
 
             # ── Dual-mode execution ───────────────────────────────────
@@ -355,6 +392,21 @@ def run_once(conn, symbols: list[str] | None = None,
                           f"cb={cb_state['level']}x{cb_state['risk_multiplier']}")
         except Exception as e:
             summary["errors"].append({"symbol": symbol, "error": str(e)})
+        finally:
+            # Bookkeeping for the caps: an executed (or errored-then-filled)
+            # trade occupies its exposure immediately, so a same-cycle burst
+            # cannot stack past MAX_PER_CURRENCY / MAX_OPEN_POSITIONS.
+            try:
+                if intent is not None and intent.direction in ("LONG", "SHORT"):
+                    executed_row = database.order_for_intent(
+                        conn, getattr(intent, "intent_hash", "") or "")
+                    if (executed_row and
+                            executed_row.get("status") in ("filled", "open")):
+                        _live_rows.append(executed_row)
+                        for c in _currencies(symbol):
+                            _cur_counts[c] = _cur_counts.get(c, 0) + 1
+            except Exception:
+                pass
 
     # ── SL/TP monitor: close any open position that hit its levels ──────
     if not dry_run:

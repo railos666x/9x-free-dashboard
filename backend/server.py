@@ -29,6 +29,7 @@ import database
 import indicators
 import reviewer
 import signals
+import arbitrator  # manual-trading endpoints build exec-ready Intents
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
@@ -79,15 +80,11 @@ def _series(df, col):
 
 
 def _broker_sources() -> list[str]:
-    """Resolve the active broker(s) to the source tag(s) used in the orders
-    table. In `hybrid` mode orders are journaled under their actual broker
-    (`mt5` / `binance`) — see execution._actual_broker_for — so filtering by
-    the literal `config.EXECUTION_BROKER` ('hybrid') returns nothing. This
-    expands the filter to every concrete broker the current config routes to.
-    """
-    if config.EXECUTION_BROKER == "hybrid":
-        return ["mt5", "binance"]
-    return [config.EXECUTION_BROKER]
+    """Active journal source keys — straight from execution's broker registry
+    (the single place accounts are declared). In `hybrid` mode orders are
+    journaled under their concrete broker (mt5/binance/...), never 'hybrid'."""
+    import execution
+    return execution.broker_keys()
 
 
 # ----------------------------------------------------------------------
@@ -140,9 +137,53 @@ def candles(symbol: str = "BTC/USDT", interval: str = config.DEFAULT_INTERVAL,
     }
 
 
+_binance_ticker_cache: dict = {"at": 0.0, "data": {}}
+
+
+def _ticker_chunk(syms: list[str]) -> dict:
+    """One batched 24hr-ticker call (public, no key, max 100 symbols).
+    Binance wants compact JSON in `symbols` — whitespace makes it 400."""
+    raw = json.dumps(syms, separators=(",", ":"))
+    r = requests.get("https://api.binance.com/api/v3/ticker/24hr",
+                     params={"symbols": raw}, timeout=8)
+    r.raise_for_status()
+    return {d["symbol"]: d for d in r.json()}
+
+
+def _binance_tickers(fiat_pairs: list[str]) -> dict:
+    """24hr tickers for the given Binance pairs (BTCUSDT style), batched,
+    with a 30s shared cache — /api/watchlist is polled repeatedly."""
+    import time as _time
+    now = _time.time()
+    want = set(fiat_pairs)
+    if _binance_ticker_cache["data"] and now - _binance_ticker_cache["at"] < 30.0:
+        return {k: v for k, v in _binance_ticker_cache["data"].items() if k in want}
+    out: dict = {}
+    chunk: list[str] = []
+    try:
+        for s in fiat_pairs:
+            chunk.append(s)
+            if len(chunk) == 100:
+                out.update(_ticker_chunk(chunk))
+                chunk = []
+        if chunk:
+            out.update(_ticker_chunk(chunk))
+    except Exception:
+        pass  # best-effort: cached/partial data is fine, candles still work
+    if out:
+        _binance_ticker_cache.update({"at": now, "data": out})
+    return out
+
+
 @app.get("/api/watchlist")
 def watchlist(interval: str = config.DEFAULT_INTERVAL):
-    """One stat row per symbol: last price, % change, RSI, sparkline."""
+    """One stat row per symbol: last price, % change, RSI, sparkline.
+
+    Covers EVERY known asset (TRADING_UNIVERSE + SYMBOLS), even ones the
+    bot can't trade: collected symbols get full indicators from candles;
+    the rest are priced live from Binance's public 24hr ticker (RSI and
+    sparkline unavailable without candles). Each row carries `tradable`
+    so the UI can distinguish bot-tradeable from watch-only."""
     conn = database.connect()
     out = []
     for s in config.SYMBOLS:
@@ -160,7 +201,82 @@ def watchlist(interval: str = config.DEFAULT_INTERVAL):
             "volume": _clean(df["volume"].iloc[-1]) if "volume" in df else 0.0,
             "spark": _series(df, "close")[-40:],
         })
+
+    # ── Every remaining known asset, even if we never trade it ──
+    # Collected candles are the primary source; anything the system knows
+    # about but doesn't collect gets a live public Binance ticker row.
+    known = list(dict.fromkeys(config.TRADING_UNIVERSE + config.SYMBOLS))
+    emitted = {r["symbol"] for r in out}
+    missing = [s for s in known if s not in emitted and s.endswith("/USDT")]
+    for pair, t in _binance_tickers([s.replace("/", "") for s in missing]).items():
+        ours = f"{pair[:-4]}/USDT"
+        try:
+            out.append({
+                "symbol": ours,
+                "price": float(t["lastPrice"]),
+                "change": round(float(t["priceChangePercent"]), 2),
+                "rsi": None,
+                "volume": float(t["quoteVolume"]),
+                "spark": [],
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    # ── Macro universe: FX / metals / energy / indices (2026-10-07) ──
+    # config.SYMBOLS is crypto-only but the bot's MT5 book is the wider
+    # TRADABLE_UNIVERSE (gold, FX majors/crosses, oil, indices). Until now
+    # NO picker in the dashboard could even list these — the user could not
+    # backtest gold though 1h candles sit in the DB. Priced from the
+    # collected candles (Yahoo 1h backfill): change = last close vs prev
+    # close; RSI skipped (no add_all pass — this endpoint polls often).
+    # Macro feeds are 1h-only: if the requested interval is empty the row
+    # falls back to 1h so "15m poll" doesn't black out the whole sleeve.
+    for s in config.TRADABLE_UNIVERSE:
+        if s in emitted or s.endswith("/USDT"):
+            continue  # crypto priced live above; no duplicates
+        df = database.load_candles(conn, s, interval, limit=40)
+        if df.empty and interval != "1h":
+            df = database.load_candles(conn, s, "1h", limit=40)
+        if df.empty:
+            continue  # never collected — hidden in pickers (same as before)
+        last = df["close"].iloc[-1]
+        prev = df["close"].iloc[-2] if len(df) > 1 else last
+        chg = ((last - prev) / prev * 100) if prev else 0.0
+        out.append({
+            "symbol": s,
+            "price": _clean(last),
+            "change": round(chg, 2),
+            "rsi": _clean(df["rsi"].iloc[-1]) if "rsi" in df else None,
+            "volume": 0.0,
+            "spark": _series(df, "close")[-40:],
+        })
+        emitted.add(s)
+    for r in out:
+        r["tradable"] = r["symbol"] in config.TRADING_UNIVERSE
     return {"interval": interval, "symbols": out}
+
+
+# ── FX mastery (backend/forex.py) ──────────────────────────────────────────
+_forex_cache: dict = {"at": 0.0, "data": {"ok": False, "error": "not loaded yet"}}
+
+
+@app.get("/api/forex/overview")
+def forex_overview():
+    """One payload for the Forex view: session, USD index, currency strength,
+    per-pair trend snapshots, open exposure by currency and carry bias.
+    Cached 60s — 32 pairs x 220 candles is a real query but stable within a minute."""
+    import time as _time
+    import forex as _forex
+    now = _time.time()
+    if _forex_cache["data"].get("ok") and now - _forex_cache["at"] < 60.0:
+        return _forex_cache["data"]
+    conn = database.connect()
+    try:
+        data = _forex.overview(conn)
+    except Exception as e:
+        data = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    _forex_cache.update({"at": now, "data": data})
+    return data
 
 
 @app.get("/api/news")
@@ -424,6 +540,25 @@ def portfolio():
     return pf.get_portfolio(conn)
 
 
+@app.get("/api/broker-health")
+def broker_health():
+    """Live diagnostics per active broker: connection ok, key fingerprint,
+    probe latency and last journal reconciliation. Answers "which account
+    is this thing actually trading?" at a glance."""
+    import execution
+    return {"mode": config.EXECUTION_BROKER, "brokers": execution.broker_health()}
+
+
+@app.get("/api/broker-accounts")
+def broker_accounts():
+    """Live account details from every real broker we trade on, plus the
+    registry itself so the UI can render tags/donuts/filters without any
+    hardcoded broker list. One card per broker, same layout."""
+    import execution
+    return {"accounts": execution.all_account_cards(),
+            "brokers": execution.active_brokers()}
+
+
 @app.post("/api/connect-exchange")
 def connect_exchange(payload: dict):
     """Save Binance API keys locally (data/exchange_keys.json). Keys are
@@ -555,6 +690,10 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
     # unrealized PnL is marked continuously and also covers positions that
     # were opened outside the bot. Falls back to journal marks when the
     # account is unreachable.
+    def _mt5_key(sym: str) -> str:
+        """Journal stores 'EUR/USD', MT5 returns 'EURUSD' — normalize to compare."""
+        return str(sym or "").replace("/", "").upper()
+
     acct_positions: dict[str, dict] = {}
     broker_name = config.EXECUTION_BROKER
     if broker_name == "alpaca":
@@ -576,13 +715,19 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
             else:
                 mt5_broker = broker
             positions = mt5_broker.fetch_positions()
-            # Convert to dict format expected by the blending logic
+            # fetch_positions exposes profit/qty/current — map to the shape
+            # the blending logic expects; notional market_value is derived.
             for pos in positions:
                 sym = pos.get("symbol")
                 if sym:
-                    acct_positions[sym] = {
-                        "unrealized_pl": float(pos.get("unrealized_pl") or pos.get("unrealized_pnl") or 0),
-                        "market_value": float(pos.get("market_value") or 0),
+                    profit = pos.get("profit")
+                    if profit is None:
+                        profit = pos.get("unrealized_pl") or pos.get("unrealized_pnl") or 0
+                    qty = float(pos.get("qty") or 0)
+                    cur = float(pos.get("current") or pos.get("entry") or 0)
+                    acct_positions[_mt5_key(sym)] = {
+                        "unrealized_pl": float(profit or 0),
+                        "market_value": round(qty * cur, 2),
                     }
         except Exception:
             acct_positions = {}
@@ -590,11 +735,15 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
         for r in enriched:
             if r.get("status") not in ("filled", "open"):
                 continue
-            pos = acct_positions.get(r["symbol"])
+            src = (r.get("source") or "").lower()
+            # Only rows this MT5 account could own get broker marks; other
+            # brokers' rows (e.g. Binance) keep their candle-based marks.
+            mt5_routed = src in ("mt5", "hybrid", "")
+            pos = acct_positions.get(_mt5_key(r["symbol"])) if mt5_routed else None
             if pos:
                 r["unrealized_pnl"] = round(pos["unrealized_pl"], 2)
-                r["market_value"] = round(pos["market_value"], 2)
-            else:
+                r["market_value"] = pos["market_value"]
+            elif mt5_routed:
                 # No open position at the broker — the journal row is stale
                 # (closed broker-side); don't show phantom PnL.
                 r["unrealized_pnl"] = 0.0
@@ -617,7 +766,12 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
             e["market_value"] += float(r.get("market_value") or 0)
     # Account-only positions (opened outside the bot) still belong in the
     # donut, otherwise the centre total wouldn't match the slices.
+    covered = {_mt5_key(r["symbol"]) for r in enriched
+               if r.get("status") in ("filled", "open")
+               and (r.get("source") or "").lower() in ("mt5", "hybrid", "")}
     for sym, pos in acct_positions.items():
+        if sym in covered:
+            continue  # already counted via its journal row — no double count
         e = by_sym.setdefault(sym,
                               {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0, "source": "mt5"})
         e["unrealized"] += float(pos.get("unrealized_pl") or 0)
@@ -639,13 +793,21 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
         except Exception:
             acct_deals = []
     
-    # Add closed deals to the aggregation
+    # Add closed deals to the aggregation — but skip deals the journal
+    # already recorded (bot-opened trades get journal closed rows AND MT5
+    # deal history; counting both doubles realized PnL).
+    journal_closed = [( _mt5_key(r["symbol"]), round(float(r.get("pnl") or 0), 2))
+                      for r in enriched if r.get("status") == "closed"]
     for deal in acct_deals:
         sym = deal.get("symbol")
-        if sym:
-            e = by_sym.setdefault(sym,
-                                  {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0, "source": "mt5"})
-            e["realized"] += float(deal.get("pnl") or 0)
+        if not sym:
+            continue
+        d_pnl = round(float(deal.get("pnl") or 0), 2)
+        if (_mt5_key(sym), d_pnl) in journal_closed:
+            continue
+        e = by_sym.setdefault(sym,
+                              {"realized": 0.0, "unrealized": 0.0, "market_value": 0.0, "source": "mt5"})
+        e["realized"] += d_pnl
     gross = sum(abs(e["realized"] + e["unrealized"]) for e in by_sym.values()) or 1.0
     by_symbol = []
     for sym, e in by_sym.items():
@@ -673,6 +835,110 @@ def orders(status: str = None, limit: int = 100, detail: int = 0,
         "by_symbol": by_symbol,
     }
     return {"orders": enriched, "summary": summary_block}
+
+
+# Alert state shared across requests (2026-10-06): the daily-digest
+# thread records its last write result here so /api/alerts can surface a
+# broken digest BETWEEN daily writes (a silent monitoring gap is itself
+# an incident).
+_DIGEST_STATE: dict = {"last_attempt": None, "last_ok": None,
+                       "last_error": None}
+_ALERTS_CACHE: dict = {"at": 0.0, "data": None}
+
+
+def _order_protection(o: dict) -> str:
+    """Venue-side protection class per open leg (2026-10-06) so the
+    dashboard can show NAKED legs at a glance:
+      venue-oco     exchange-side OCO list resting (oco_ref stamped)
+      venue-sltp    SL/TP attached at the broker (MT5 basket rows)
+      software-only journal levels only — NAKED whenever the bot is
+                    offline (the whole reason OCO brackets exist)
+      none          no levels on the row at all
+      unknown       manual/live position whose protection we can't see
+    """
+    if o.get("oco_ref"):
+        return "venue-oco"
+    src = o.get("source") or ""
+    if src == "mt5":
+        return ("venue-sltp"
+                if (o.get("stop_loss") or o.get("take_profit"))
+                else "none")
+    if o.get("stop_loss") or o.get("take_profit"):
+        return "software-only"
+    return "none"
+
+
+def _compute_alerts(conn) -> list:
+    """Real-time alert feed between daily digests (2026-10-06).
+
+    Sources:
+      - NAKED legs: open journal rows with software-only/no protection
+        (critical when there are NO levels at all — nothing would close
+        the trade if this process died).
+      - loss guard BLOCKED (new entries are being refused).
+      - digest thread failure (monitoring log may be silently stale).
+
+    Cached 5s — the dashboard polls this fast, and each check touches
+    the journal + MT5-facing guard math.
+    """
+    import execution as _ex
+
+    alerts = []
+    try:
+        rows = database.load_orders(conn, limit=200)
+        for o in rows:
+            if o.get("status") not in ("filled", "open"):
+                continue
+            prot = _order_protection(o)
+            if prot in ("software-only", "none"):
+                alerts.append({
+                    "id": f"naked:{o.get('id')}", "kind": "naked_leg",
+                    "severity": "critical" if prot == "none" else "warning",
+                    "symbol": o.get("symbol"),
+                    "msg": (f"{o.get('symbol')} {o.get('side')} is NAKED — "
+                            + ("no stop at all"
+                               if prot == "none"
+                               else "software monitoring only; no venue "
+                                    "bracket survives a bot restart")),
+                })
+    except Exception:
+        pass  # journal unavailable → skip naked checks, try the rest
+    try:
+        g = _ex.loss_guard_status(conn)
+        if g.get("blocked"):
+            alerts.append({
+                "id": "loss-guard", "kind": "loss_guard",
+                "severity": "critical", "symbol": None,
+                "msg": f"Loss guard BLOCKED new entries — {g.get('reason') or 'daily loss limit hit'}",
+            })
+    except Exception:
+        pass
+    if _DIGEST_STATE.get("last_error"):
+        alerts.append({
+            "id": "digest-failed", "kind": "digest_failed",
+            "severity": "warning", "symbol": None,
+            "msg": ("Daily digest failed to write ("
+                    + str(_DIGEST_STATE["last_error"])[:120]
+                    + ") — MONITORING-LOG may be stale"),
+        })
+    return alerts
+
+
+@app.get("/api/alerts")
+def api_alerts():
+    """Dashboard alert feed (naked legs / loss guard / digest failures)
+    — polled every 15s; 5s server-side cache keeps it cheap."""
+    now = time.time()
+    if _ALERTS_CACHE["data"] is None or now - _ALERTS_CACHE["at"] > 5.0:
+        conn = database.connect()
+        try:
+            _ALERTS_CACHE["data"] = _compute_alerts(conn)
+        finally:
+            conn.close()
+        _ALERTS_CACHE["at"] = now
+    data = _ALERTS_CACHE["data"] or []
+    return {"alerts": data, "count": len(data),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
 @app.get("/api/positions")
@@ -764,6 +1030,8 @@ def positions():
             "current_price": cur,
             "unrealized_pnl": round(unreal, 2) if unreal is not None else None,
             "created_at": o.get("created_at"),
+            "oco_ref": o.get("oco_ref"),
+            "protection": _order_protection(o),
         })
         seen_symbols.add(o["symbol"])
     
@@ -793,10 +1061,64 @@ def positions():
             "unrealized_pnl": pos.get("unrealized_pl"),
             "created_at": None,
             "source": "live",
+            "oco_ref": None,
+            # Manual venue position — MT5 may carry attached SL/TP but the
+            # fetch doesn't expose them, so report honestly.
+            "protection": "unknown",
         })
     
     return {"positions": out, "count": len(out),
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+@app.post("/api/positions/levels")
+def update_position_levels(payload: dict):
+    """Drag-and-drop levels from the chart: persist new SL/TP to the journal
+    row AND push them to the real broker where the position lives (MT5 via
+    TRADE_ACTION_SLTP; Binance/Alpaca spot market positions carry no server-
+    side SL/TP — journal-only there). Payload: {order_id, symbol, stop_loss,
+    take_profit} (either level may be null to leave it unchanged)."""
+    import execution
+    order_id = payload.get("order_id")
+    symbol = str(payload.get("symbol") or "")
+    new_sl = payload.get("stop_loss")
+    new_tp = payload.get("take_profit")
+    if not symbol or (order_id is None and not payload.get("broker_only")):
+        return {"ok": False, "error": "symbol and order_id required"}
+    conn = database.connect()
+    pushed = None
+    errors = []
+    # 1) Real broker first — if the broker rejects, don't poison the journal.
+    broker = execution.get_broker()
+    target = broker
+    if getattr(broker, "name", "") == "hybrid":
+        from token_registry import Venue, resolve_symbol
+        info = resolve_symbol(symbol)
+        is_crypto = bool(info and (getattr(info, "venue", None) == Venue.BINANCE
+                                   or getattr(info, "asset_class", None) and "CRYPTO" in str(getattr(info, "asset_class"))))
+        if not is_crypto and not symbol.upper().endswith(("USDT",)):
+            target = broker._mt5
+        else:
+            target = None  # Binance spot: no server-side SL/TP amend
+    if target is not None and hasattr(target, "modify_position_sltp"):
+        try:
+            pushed = target.modify_position_sltp(symbol, new_sl, new_tp)
+        except Exception as e:
+            errors.append(f"broker: {e}")
+    # 2) Journal row.
+    if order_id is not None:
+        sets, vals = [], []
+        if new_sl is not None:
+            sets.append("stop_loss = ?"); vals.append(float(new_sl))
+        if new_tp is not None:
+            sets.append("take_profit = ?"); vals.append(float(new_tp))
+        if sets:
+            vals.append(int(order_id))
+            conn.execute(f"UPDATE orders SET {', '.join(sets)} WHERE id = ?", vals)
+            conn.commit()
+    if errors and pushed is None:
+        return {"ok": False, "error": "; ".join(errors), "journal": order_id is not None}
+    return {"ok": True, "broker_push": pushed, "journal": order_id is not None}
 
 
 @app.post("/api/bot/reconcile")
@@ -954,7 +1276,14 @@ def trade_stats():
     biggest_win = 0.0
     best_day_pnl = 0.0
 
-    for o in closed:
+    # Bookkeeping-only rows (a retired account's closes — see A31 analysis)
+    # are NOT strategy performance: one such event on 2026-08-17 booked −677
+    # from four legacy RSI(2) positions and made every headline stat look
+    # negative while the live book was +411. They are counted separately.
+    retired = [o for o in closed if o.get("exit_reason") == "account_retired"]
+    strategy = [o for o in closed if o.get("exit_reason") != "account_retired"]
+
+    for o in strategy:
         pnl = float(o["pnl"])
         total_pnl += pnl
         if pnl > 0:
@@ -982,6 +1311,8 @@ def trade_stats():
     avg_win = round(total_win_amount / wins, 2) if wins else 0.0
     avg_loss = round(total_loss_amount / losses, 2) if losses else 0.0
     profit_factor = round(total_win_amount / total_loss_amount, 2) if total_loss_amount > 0 else 99.99
+    retired_pnl = round(sum(float(o["pnl"]) for o in retired), 2)
+    retired_count = len(retired)
 
     # Streak calculation (most recent trades first)
     sorted_closed = sorted(closed, key=lambda o: o.get("exit_time") or o.get("created_at") or "", reverse=True)
@@ -1045,6 +1376,11 @@ def trade_stats():
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "biggest_win": round(biggest_win, 2),
+        # Bookkeeping separation: `total_pnl` above EXCLUDES retired-account
+        # rows. These fields let the UI show the full picture honestly.
+        "retired_pnl": retired_pnl,
+        "retired_count": retired_count,
+        "all_time_pnl": round(total_pnl + retired_pnl, 2),
         "best_day": round(best_day_pnl, 2),
         "current_streak": current_streak,
         "streak_type": streak_type or "none",
@@ -1082,6 +1418,40 @@ def test_portfolio():
     import test_ai
     conn = database.connect()
     return test_ai.test_portfolio_summary(conn)
+
+
+@app.get("/api/gov-shadow")
+def gov_shadow_status():
+    """Government-officials shadow prototype (2026-10-05): recent official
+    releases (separate gov_news pool) and the paper-only shadow book
+    (test_trades rows tagged ai_model='groq-gov') with running stats.
+    """
+    import gov_analyst
+    conn = database.connect()
+    try:
+        heads = database.load_gov_news(conn, limit=15)
+        shadow = [t for t in database.load_test_trades(conn, limit=100)
+                  if str(t.get("ai_model") or "") == "groq-gov"]
+        closed = [t for t in shadow if t.get("outcome") in ("win", "loss",
+                                                            "breakeven")]
+        wins = sum(1 for t in closed if t.get("outcome") == "win")
+        net = sum(float(t.get("pnl") or 0) for t in closed)
+        return {
+            "enabled": bool(config.GOV_FEEDS_ENABLED),
+            "feeds": [n for n, _ in config.GOV_FEEDS],
+            "recent_official": [
+                {"source": h.get("source"), "title": (h.get("title") or "")[:110],
+                 "published_at": h.get("published_at")} for h in heads],
+            "shadow_trades": shadow,
+            "stats": {"total": len(shadow), "closed": len(closed),
+                      "open": len(shadow) - len(closed),
+                      "wins": wins,
+                      "win_rate": round(100.0 * wins / len(closed), 1)
+                                  if closed else None,
+                      "net_pnl": round(net, 4)},
+        }
+    finally:
+        conn.close()
 
 
 @app.get("/api/circuit-breaker")
@@ -1192,7 +1562,24 @@ def run_backtest(
     import backtester
     conn = database.connect()
     result = backtester.run_backtest(conn, symbol=symbol, interval=interval, limit=limit)
+    # Macro data reality (2026-10-07): FX/metals/energy/indices candles are
+    # collected at 1h ONLY — crypto gets 1m/15m/1h. A sub-hour request for
+    # gold/FX used to return a silent "0 bars / 0 trades" wall, which is
+    # exactly why the user reported "gold is not there in backtest". Fall
+    # back to the 1h data and SAY we did (data_note drives a UI banner).
+    data_note = None
+    if result.total_bars < 60 and interval != "1h":
+        fb = backtester.run_backtest(conn, symbol=symbol, interval="1h", limit=limit)
+        if fb.total_bars >= 60:
+            result = fb
+            data_note = (f"{symbol} is collected at 1h only — showing the 1h "
+                         f"backtest instead of {interval} (no {interval} "
+                         f"candles exist for macro symbols yet).")
+        else:
+            data_note = (f"No candles collected for {symbol} at {interval} "
+                         f"or 1h — run the collector for this symbol first.")
     return {
+        "data_note": data_note,
         "symbol": result.symbol,
         "interval": result.interval,
         "total_bars": result.total_bars,
@@ -1251,8 +1638,142 @@ def _exit_analysis(trades):
 # ----------------------------------------------------------------------
 @app.get("/")
 def index():
-    """Landing page: the dashboard (the old terminal was retired 2026-08-15)."""
-    return FileResponse(DASHBOARD / "index.html")
+    """Landing page: the dashboard (the old terminal was retired 2026-08-15).
+    no-cache: the HTML shell must always revalidate — it carries the
+    dashboard.js?v= cache-bust, so a stale shell means stale code. Static
+    assets under /dash-assets keep heuristic caching (busted via ?v=)."""
+    return FileResponse(DASHBOARD / "index.html", headers={
+        "Cache-Control": "no-cache",
+    })
+
+
+# ----------------------------------------------------------------------
+# Manual trading from the dashboard (2026-10-07)
+# ----------------------------------------------------------------------
+# A trader must be able to ACT from the dashboard, not just watch an AI
+# trade. These endpoints ride the SAME execution path the bot uses
+# (execute_intent / close_position) so every manual order gets: broker
+# routing, risk sizing with the trader's own SL/TP, the R/R floor, the
+# balance precheck, venue-side protection (OCO for Binance / SL-TP for
+# MT5), and the trade journal. Closing goes through close_position so an
+# OCO bracket is cancelled/fired-checked, PnL is realized and the exit is
+# journaled — never a raw broker call.
+
+def _manual_intent(symbol: str, direction: str, entry: float | None,
+                   stop_loss: float | None, take_profit: float | None,
+                   qty: float | None):
+    """Build a bot-shaped Intent for a dashboard-placed order.
+
+    The hash is manual-namespaced and minute-bucketed: re-placing the same
+    manual trade within the day is a NEW order (a trader retrying after a
+    rejection must not be told 'duplicate'), while double-clicking the
+    Place button still collapses to one order via the front-end disable.
+    Side-specific sanity: a LONG needs SL below entry, a SHORT above.
+    """
+    import execution as _ex
+    direction = str(direction).upper().strip()
+    if direction not in ("LONG", "SHORT"):
+        raise ValueError("direction must be LONG or SHORT")
+    entry = float(entry) if entry not in (None, "") else None
+    stop_loss = float(stop_loss) if stop_loss not in (None, "") else None
+    take_profit = float(take_profit) if take_profit not in (None, "") else None
+    qty = float(qty) if qty not in (None, "") else None
+    if qty is not None and qty <= 0:
+        raise ValueError("qty must be positive")
+    if entry and stop_loss:
+        if direction == "LONG" and stop_loss >= entry:
+            raise ValueError("LONG stop_loss must be BELOW the entry price")
+        if direction == "SHORT" and stop_loss <= entry:
+            raise ValueError("SHORT stop_loss must be ABOVE the entry price")
+    window = "manual"
+    minute = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
+    raw = f"manual|{symbol}|{direction}|{minute}"
+    import hashlib as _hashlib
+    h = _hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return arbitrator.Intent(
+        symbol=symbol.upper().strip(), direction=direction,
+        entry=entry, stop_loss=stop_loss, take_profit=take_profit,
+        sources=["manual"], window=window, confidence=100.0,
+        intent_hash=h, reasons=["manual order from dashboard"],
+    )
+
+
+@app.post("/api/manual/order")
+def manual_order(body: dict):
+    """Place a manual order from the dashboard.
+
+    body: {symbol, side|direction, qty?, entry?, stopLoss|stop_loss?,
+    takeProfit|take_profit?}. Optional qty → the bot's risk sizing runs
+    with the given SL (or its ATR fallback). Optional entry/SL/TP → ATR
+    defaults fill any missing level. Loss guard BLOCKED refuses new
+    entries exactly like the bot cycle. dry:true previews sizing + fees
+    without touching a broker.
+    """
+    import execution as _ex
+    symbol = str(body.get("symbol") or "").strip()
+    if not symbol:
+        return JSONResponse(status_code=400, content={"error": "symbol is required"})
+    direction = body.get("side") or body.get("direction") or ""
+    try:
+        intent = _manual_intent(
+            symbol, direction,
+            body.get("entry"), body.get("stopLoss") or body.get("stop_loss"),
+            body.get("takeProfit") or body.get("take_profit"),
+            body.get("qty"))
+        guard = _ex.loss_guard_status(conn=database.connect())
+        if guard.get("blocked"):
+            return JSONResponse(status_code=423, content={
+                "error": "loss guard BLOCKED — new entries refused "
+                         f"({guard.get('reason')})",
+                "guard": guard})
+        conn = database.connect()
+        res = _ex.execute_intent(conn, intent,
+                                 qty=intent_qty(body),
+                                 interval="1h",
+                                 dry_run=bool(body.get("dry")))
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:  # broker outages etc — surfaced, not swallowed
+        return JSONResponse(status_code=502, content={"error": f"execution failed: {e}"})
+    if not res.get("order"):
+        return JSONResponse(status_code=422, content={
+            "error": res.get("error") or "sizer refused the trade"})
+    o = res["order"]
+    return {
+        "ok": True, "order": o, "duplicate": res.get("duplicate", False),
+        "dry_run": res.get("dry_run", False),
+    }
+
+
+def intent_qty(body: dict):
+    """Manual qty override: explicit qty means the trader sizes it (the
+    executor still clamps to broker rules); None → risk sizing."""
+    q = body.get("qty")
+    try:
+        return float(q) if q not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+@app.post("/api/manual/close/{order_id}")
+def manual_close(order_id: int):
+    """Close one open position from the dashboard via the real close path
+    (OCO lifecycle handled: cancel-or-fired-check, true exit reason)."""
+    import execution as _ex
+    conn = database.connect()
+    rows = database.load_orders(conn, limit=2000)
+    order = next((o for o in rows if o.get("id") == order_id), None)
+    if not order:
+        return JSONResponse(status_code=404, content={"error": f"order #{order_id} not found"})
+    if order.get("status") not in ("filled", "open"):
+        return JSONResponse(status_code=409, content={
+            "error": f"order #{order_id} is {order.get('status')}, not open"})
+    try:
+        res = _ex.close_position(conn, order, reason="manual")
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": f"close failed: {e}"})
+    return {"ok": True, "order": res["order"], "pnl": res.get("pnl"),
+            "reason": res.get("reason")}
 
 
 # ----------------------------------------------------------------------
@@ -1261,6 +1782,20 @@ def index():
 _bot_thread = None
 _bot_stop = threading.Event()
 _bot_loop_state = {"running": False, "live": False, "since": None}
+
+# ── Freeze watchdog (2026-10-01) ─────────────────────────────────────
+# The bot loop froze for ~2h mid-cycle: a MetaTrader5 IPC call never
+# returned (same no-timeout C-call class as the RSS hang) and Python
+# cannot kill a wedged C call from another thread. The ONLY recovery is
+# replacing the loop. The watchdog tracks cycle completions; when none
+# arrive within the window it abandons the stuck thread and starts a
+# fresh loop. The zombie thread (if it ever un-wedges) exits via the
+# stop event and — thanks to the generation guard — cannot clobber the
+# replacement's state.
+_BOT_CYCLE_TIMEOUT = 1800.0   # 30 min: normal cycles finish in ~45s (news
+                              # re-score) to a few minutes; 30 min = wedged.
+_bot_cycle_ts = {"at": time.time()}
+_bot_gen = {"n": 0}
 
 
 def _auto_loop_live() -> bool:
@@ -1281,16 +1816,48 @@ def _start_bot_loop() -> bool:
     global _bot_thread
     if _bot_thread is not None and _bot_thread.is_alive():
         return False
+    _bot_gen["n"] += 1
     live = _auto_loop_live()
     _bot_stop.clear()
+    _bot_cycle_ts["at"] = time.time()   # fresh grace window for cycle #1
     _bot_loop_state.update({
         "running": True, "live": live,
         "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     })
-    _bot_thread = threading.Thread(target=_bot_loop_worker, args=(live,),
+    _bot_thread = threading.Thread(target=_bot_loop_worker,
+                                   args=(live, _bot_gen["n"]),
                                    daemon=True, name="bot-loop")
     _bot_thread.start()
     return True
+
+
+def _watch_bot_loop() -> None:
+    """Daemon: restart the bot loop when it stops completing cycles.
+
+    A completed cycle touches _bot_cycle_ts (via on_cycle). If nothing
+    touches it for _BOT_CYCLE_TIMEOUT while the loop is supposed to run,
+    the worker is wedged inside a no-timeout MT5/C call — abandon that
+    thread (it stays stuck; Python can't kill it) and start a fresh loop
+    that shares the DB and the stop event."""
+    global _bot_thread
+    while True:
+        time.sleep(60)
+        if not _bot_loop_state.get("running"):
+            continue
+        if _bot_stop.is_set():
+            continue   # deliberate stop in progress — not a freeze
+        stale_for = time.time() - _bot_cycle_ts["at"]
+        if stale_for <= _BOT_CYCLE_TIMEOUT:
+            continue
+        t = _bot_thread
+        print(f"  [watchdog] bot loop stale {int(stale_for)}s (thread "
+              f"{'alive' if t is not None and t.is_alive() else 'dead'}) "
+              "— wedged? restarting bot loop")
+        _bot_stop.set()          # old worker exits cleanly if it un-wedges
+        _bot_thread = None       # abandon the zombie thread
+        _bot_cycle_ts["at"] = time.time()
+        if _start_bot_loop():
+            print("  [watchdog] bot loop restarted")
 
 
 def _stop_bot_loop() -> bool:
@@ -1301,22 +1868,27 @@ def _stop_bot_loop() -> bool:
     return True
 
 
-def _bot_loop_worker(live: bool) -> None:
+def _bot_loop_worker(live: bool, gen: int = 0) -> None:
     import bot as _bot
     conn = database.connect()
     database.init_db(conn)
 
     def _record_cycle(summary: dict) -> None:
         """Surface auto-loop cycles to the dashboard (same slot as manual
-        /api/bot/run cycles)."""
+        /api/bot/run cycles) and feed the freeze watchdog."""
         _bot_last_cycle.update({"summary": summary, "at": time.time()})
+        _bot_cycle_ts["at"] = time.time()
 
     try:
         _bot.bot_loop(conn, dry_run=not live,
                       interval_seconds=config.BOT_LOOP_SECONDS,
                       stop_event=_bot_stop, on_cycle=_record_cycle)
     finally:
-        _bot_loop_state.update({"running": False, "live": False, "since": None})
+        # Generation guard: a watchdog-replaced (possibly un-wedged later)
+        # old thread must not flip the flag off while its replacement runs.
+        if gen == _bot_gen["n"]:
+            _bot_loop_state.update({"running": False, "live": False,
+                                    "since": None})
 
 
 def _write_env_key(key: str, value: str) -> None:
@@ -1360,6 +1932,57 @@ def _start_live_threads() -> None:
             pass
         macro_data.macro_loop(conn)
 
+    def _gov_shadow_loop():
+        # Government-officials feed + shadow analyst (PROTOTYPE 2026-10-05):
+        # official releases land in the SEPARATE gov_news pool and proposed
+        # trades are journaled PAPER-ONLY (test_trades, ai_model='groq-gov')
+        # for a two-week evaluation. Live sentiment and live orders are
+        # untouched. Soft-disabled by env (GOV_FEEDS_ENABLED=0) with zero
+        # code risk: the whole loop is wrapped below.
+        import news as _newsmod
+        _newsmod.gov_live_loop()
+
+    def _daily_digest_loop():
+        # Daily digest → docs/MONITORING-LOG.md once per UTC day (2026-10-06):
+        # the run-window report (win-rate trajectory, per-symbol table) lands
+        # every day without a manual scripts/run_report.py / daily_digest.py
+        # run. Catches up at startup when today's section is missing (host
+        # restarts are frequent), then sleeps to just past the next 00:00
+        # UTC boundary. An exception must never kill the thread — the next
+        # iteration retries.
+        import datetime as _dt
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import daily_digest as dd
+
+        def _today_present() -> bool:
+            try:
+                today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+                text = (ROOT / "docs" / "MONITORING-LOG.md").read_text(
+                    encoding="utf-8", errors="replace")
+                return f"## Digest {today}" in text
+            except Exception:
+                return False
+
+        while True:
+            try:
+                if not _today_present():
+                    _DIGEST_STATE["last_attempt"] = time.time()
+                    problems = dd.main()
+                    _DIGEST_STATE["last_ok"] = time.time()
+                    _DIGEST_STATE["last_error"] = None
+                    print("  [DIGEST] daily digest appended to "
+                          "docs/MONITORING-LOG.md"
+                          + (f" ({len(problems)} anomalies)" if problems
+                             else ""))
+            except Exception as e:
+                _DIGEST_STATE["last_error"] = f"{type(e).__name__}: {e}"
+                print(f"  [DIGEST] daily digest failed: "
+                      f"{type(e).__name__}: {e}")
+            now = _dt.datetime.now(_dt.timezone.utc)
+            nxt = (now + _dt.timedelta(days=1)).replace(
+                hour=0, minute=5, second=0, microsecond=0)
+            time.sleep(max(60.0, (nxt - now).total_seconds()))
+
     def _exness_candle_loop():
         # Keep the bot's Exness 1h candle feed fresh (the macro loop only
         # refreshes the `macro` table — the bot's SMC/data gates read the
@@ -1378,7 +2001,17 @@ def _start_live_threads() -> None:
     t2.start()
     t3.start()
     t4.start()
-    print("  Live data threads started (prices + news + macro + exness candles)")
+    if config.GOV_FEEDS_ENABLED:
+        threading.Thread(target=_gov_shadow_loop, daemon=True,
+                         name="gov-shadow").start()
+        print("  GOV shadow thread started (official feeds, paper-only)")
+    threading.Thread(target=_daily_digest_loop, daemon=True,
+                     name="daily-digest").start()
+    print("  Daily digest thread started (MONITORING-LOG, once per UTC day)")
+    threading.Thread(target=_watch_bot_loop, daemon=True,
+                     name="bot-watchdog").start()
+    print("  Live data threads started (prices + news + macro + exness candles)"
+          " + bot-loop watchdog")
     if config.BOT_AUTO_LOOP:
         if _start_bot_loop():
             print("  Bot loop thread started"

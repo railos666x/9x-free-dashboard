@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 
 import config
 import database
@@ -163,7 +164,11 @@ def adaptive_thresholds(conn) -> dict:
     try:
         report = calibration_report(conn, days=30)
         if report.get("total_trades", 0) < 10:
-            # Not enough data to adapt — return current config values
+            # Paper book too thin — fall back to the REAL orders journal so the
+            # live book (the one that actually pays) drives calibration too.
+            report = _live_book_report(conn)
+        if report.get("total_trades", 0) < 10:
+            # Not enough data anywhere — return current config values
             return {
                 "sentiment_long": config.AI_SENTIMENT_LONG,
                 "sentiment_short": config.AI_SENTIMENT_SHORT,
@@ -267,3 +272,76 @@ def adaptive_thresholds(conn) -> dict:
             "reasoning": f"error: {e}",
             "adapted": False,
         }
+
+
+def _live_book_report(conn, days: int = 45) -> dict:
+    """Same shape as calibration_report(), but built from the REAL orders
+    journal instead of the paper test_trades. Excludes bookkeeping rows
+    (account_retired) and breaks win rate down by trend_regime — the field
+    that matters most (the 2026-09-28 post-mortem: with-trend 71% WR,
+    counter-trend 17% WR)."""
+    import json as _json
+    import sqlite3
+    try:
+        cutoff = time.time() - days * 86400
+        rows = conn.execute(
+            """SELECT symbol, side, pnl, exit_reason, trend_regime, exit_time
+               FROM orders
+               WHERE pnl IS NOT NULL AND exit_reason != 'account_retired'
+                 AND COALESCE(exit_time, created_at) >= ?""",
+            (datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat(),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Pre-migration DB without trend_regime — degrade to pnl-only stats
+        try:
+            rows = conn.execute(
+                """SELECT symbol, side, pnl, exit_reason, NULL AS trend_regime,
+                          exit_time FROM orders
+                   WHERE pnl IS NOT NULL AND exit_reason != 'account_retired'
+                     AND COALESCE(exit_time, created_at) >= ?""",
+                (datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat(),),
+            ).fetchall()
+        except Exception as e:
+            log.warning("_live_book_report fallback failed: %s", e)
+            return {"total_trades": 0, "period_days": days}
+    except Exception as e:
+        log.warning("_live_book_report failed: %s", e)
+        return {"total_trades": 0, "period_days": days}
+
+    trades = []
+    for r in rows:
+        try:
+            pnl = float(r["pnl"] or 0)
+        except (TypeError, ValueError):
+            continue
+        trades.append({
+            "pnl": pnl,
+            "outcome": "win" if pnl > 0 else ("loss" if pnl < 0 else "breakeven"),
+            "regime": r["trend_regime"] or "unknown",
+        })
+    if not trades:
+        return {"total_trades": 0, "period_days": days}
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t["outcome"] == "win")
+    by_regime = {}
+    for t in trades:
+        b = by_regime.setdefault(t["regime"], {"total": 0, "wins": 0, "pnl": 0.0})
+        b["total"] += 1
+        if t["outcome"] == "win":
+            b["wins"] += 1
+        b["pnl"] += t["pnl"]
+    for v in by_regime.values():
+        v["win_rate"] = round(v["wins"] / v["total"], 3) if v["total"] else 0.0
+        v["pnl"] = round(v["pnl"], 2)
+    return {
+        "period_days": days,
+        "total_trades": total,
+        "wins": wins,
+        "losses": total - wins,
+        "breakevens": 0,
+        "win_rate": round(wins / total, 3) if total else 0.0,
+        "total_pnl": round(sum(t["pnl"] for t in trades), 2),
+        "avg_pnl_per_trade": round(sum(t["pnl"] for t in trades) / total, 2),
+        "by_factor": {"regime": by_regime},
+    }

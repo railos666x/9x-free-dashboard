@@ -109,7 +109,10 @@ EXNESS_YAHOO: dict[str, str] = {
     "DAX": "^GDAXI", "NIKKEI": "^N225", "FTSE": "^FTSE",
     "EUROSTOXX": "^STOXX50E", "HANG_SENG": "^HSI", "FR40": "^FCHI",
     "ES35": "^IBEX", "ITA40": "FTSEMIB.MI", "AU200": "^AXJO",
-    "BTC/USDT": "BTC-USD", "ETH/USDT": "ETH-USD",
+    # BTC/USDT & ETH/USDT deliberately NOT here: the Binance klines collector
+    # already feeds them real bars, and Yahoo BTC-USD snapshots (irregular
+    # timestamps, O=H=L=C, volume 0) used to interleave into the same rows —
+    # flat ghost bars on the chart and a corrupted time axis.
 }
 
 # Flat lookup for backward compatibility.

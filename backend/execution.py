@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import math
 import time
 from datetime import datetime, timezone
-from decimal import ROUND_FLOOR
+from decimal import ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal as _Dec
 
 import requests
 
@@ -48,6 +50,30 @@ BINANCE_BASE = "https://testnet.binance.vision"
 BINANCE_ORDER = f"{BINANCE_BASE}/api/v3/order"
 BINANCE_ACCOUNT = f"{BINANCE_BASE}/api/v3/account"
 BINANCE_OPEN_ORDERS = f"{BINANCE_BASE}/api/v3/openOrders"
+BINANCE_OCO_PLACE = f"{BINANCE_BASE}/api/v3/orderList/oco"   # POST (place)
+BINANCE_OCO_LIST = f"{BINANCE_BASE}/api/v3/orderList"        # GET/DELETE (query/cancel)
+
+# Local clock skew correction. Binance rejects any signed request whose
+# timestamp falls outside recvWindow with -1021 ('Timestamp for this request
+# is outside of the recvWindow') — this machine tripped it three times on
+# 2026-09-28. We measure the offset from the public /api/v3/time endpoint
+# once every 10 minutes and apply it to every signed timestamp.
+_BINANCE_CLOCK = {"offset_ms": 0, "at": 0.0}
+
+
+def _binance_ts() -> int:
+    """Current time in ms, corrected for local clock skew vs Binance."""
+    now = time.time()
+    clock = _BINANCE_CLOCK
+    if now - clock["at"] > 600.0:
+        try:
+            resp = requests.get(f"{BINANCE_BASE}/api/v3/time", timeout=5)
+            resp.raise_for_status()
+            clock["offset_ms"] = int(resp.json()["serverTime"]) - int(now * 1000)
+        except Exception:
+            pass  # keep the last known offset (0 on the first failure)
+        clock["at"] = now
+    return int(now * 1000) + clock["offset_ms"]
 
 # Alpaca's crypto universe is small (~30 assets) vs our 87 Binance symbols;
 # orders for anything else 422 at the broker. The tradable set is fetched
@@ -206,6 +232,9 @@ class PaperBroker(Broker):
             "fill_time": datetime.now(timezone.utc).isoformat(),
             "fees": round(fees, 8),
             "broker_ref": f"paper-{int(time.time() * 1000)}",
+            # Pre-order mid — lets execute_intent journal MEASURED slippage
+            # (|fill − ref|) instead of the bps estimate.
+            "ref_price": price,
         }
 
     def place_market(self, conn, order: dict) -> dict:
@@ -377,7 +406,9 @@ class BinanceBroker(Broker):
                 resp.raise_for_status()
                 BinanceBroker._exchange_info_cache = {"at": now, "data": resp.json()}
             except Exception:
-                return 0.0
+                # Keep serving the stale cache — resetting it to 0.0 made every
+                # order skip step-rounding while the network hiccupped.
+                pass
         
         data = BinanceBroker._exchange_info_cache["data"]
         if not data:
@@ -402,7 +433,8 @@ class BinanceBroker(Broker):
                 resp.raise_for_status()
                 BinanceBroker._exchange_info_cache = {"at": now, "data": resp.json()}
             except Exception:
-                return {"stepSize": 0.0, "minQty": 0.0, "minNotional": 5.0}
+                # Stale cache beats zeros (zeros → LOT_SIZE rejections).
+                pass
         
         data = BinanceBroker._exchange_info_cache["data"]
         if not data:
@@ -414,15 +446,20 @@ class BinanceBroker(Broker):
                 for f in s.get("filters", []):
                     ftype = f.get("filterType")
                     if ftype == "MARKET_LOT_SIZE":
-                        result["stepSize"] = float(f.get("stepSize", 0))
-                        result["minQty"] = float(f.get("minQty", 0))
+                        # The testnet sends stepSize/minQty as literal 0 here —
+                        # never let zeros overwrite the LOT_SIZE values: orders
+                        # then go out unrounded → 'Filter failure: LOT_SIZE'.
+                        if float(f.get("stepSize", 0) or 0) > 0:
+                            result["stepSize"] = float(f.get("stepSize"))
+                        if float(f.get("minQty", 0) or 0) > 0:
+                            result["minQty"] = float(f.get("minQty"))
                     elif ftype == "LOT_SIZE":
-                        # Use LOT_SIZE minQty as fallback if MARKET_LOT_SIZE minQty is 0
+                        # LOT_SIZE is the binding grid for market orders too;
+                        # fill gaps only (order-independent of the loop above).
                         if result["minQty"] == 0:
-                            result["minQty"] = float(f.get("minQty", 0))
-                        # Use LOT_SIZE stepSize if MARKET_LOT_SIZE stepSize is 0
+                            result["minQty"] = float(f.get("minQty", 0) or 0)
                         if result["stepSize"] == 0:
-                            result["stepSize"] = float(f.get("stepSize", 0))
+                            result["stepSize"] = float(f.get("stepSize", 0) or 0)
                     elif ftype == "NOTIONAL":
                         result["minNotional"] = float(f.get("minNotional", 5.0))
                 break
@@ -430,11 +467,270 @@ class BinanceBroker(Broker):
 
     def place_market(self, conn, order: dict) -> dict:
         side = "BUY" if order["side"].upper() == "LONG" else "SELL"
-        return self._submit(conn, order, side)
+        fill = self._submit(conn, order, side)
+        # Venue-side protection (2026-10-05): rest the SL/TP bracket on the
+        # exchange the moment the entry fills. A failure here only degrades
+        # to software monitoring — it must NEVER turn a filled entry into
+        # an error (the position exists at the venue regardless).
+        self._attach_oco(conn, order, fill, side)
+        return fill
 
     def close_market(self, conn, order: dict) -> dict:
         side = "SELL" if order["side"].upper() == "LONG" else "BUY"
         return self._submit(conn, order, side)
+
+    # ── Venue-side OCO bracket (2026-10-05) ───────────────────────────
+    # Spot legs used to rely solely on check_position() in-process: bot
+    # offline (or the thread wedged on an MT5 IPC call) = naked position.
+    # The MT5 basket gets deal-attached sl/tp from the venue; this gives
+    # Binance spot the same guarantee via a resting OCO list.
+
+    def _signed(self, method: str, path: str,
+                params: dict | None = None) -> requests.Response:
+        """Signed Spot-API request with the shared clock-skew-corrected
+        timestamp (same offset _submit uses for market orders)."""
+        p = {"timestamp": _binance_ts(), "recvWindow": 10000, **(params or {})}
+        query = "&".join(f"{k}={v}" for k, v in p.items())
+        sig = hmac.new(config.BINANCE_EXEC_API_SECRET.encode(), query.encode(),
+                       hashlib.sha256).hexdigest()
+        return requests.request(method, path, params={**p, "signature": sig},
+                                headers={"X-MBX-APIKEY": config.BINANCE_EXEC_API_KEY},
+                                timeout=20)
+
+    def _tick_size(self, symbol: str) -> float:
+        """PRICE_FILTER tickSize for `symbol` (0.0 when unavailable)."""
+        import time as _time
+        now = _time.time()
+        if (BinanceBroker._exchange_info_cache["data"] is None
+                or now - BinanceBroker._exchange_info_cache["at"] > self._EXCHANGE_INFO_TTL):
+            try:
+                resp = requests.get(f"{BINANCE_BASE}/api/v3/exchangeInfo", timeout=10)
+                resp.raise_for_status()
+                BinanceBroker._exchange_info_cache = {"at": now, "data": resp.json()}
+            except Exception:
+                pass  # stale cache beats a metadata outage
+        data = BinanceBroker._exchange_info_cache["data"] or {}
+        for s in data.get("symbols", []):
+            if s.get("symbol") == symbol:
+                for f in s.get("filters", []):
+                    if f.get("filterType") == "PRICE_FILTER":
+                        return float(f.get("tickSize", 0) or 0)
+        return 0.0
+
+    @staticmethod
+    def _round_price(price: float, tick: float) -> str:
+        """Format a price ON the tick grid (nearest tick). An off-grid stop
+        gets -1111 'Precision is over the maximum' from the venue."""
+        if tick and tick > 0:
+            dec = BinanceBroker._step_decimals(tick)
+            q = ((_Dec(str(price)) / _Dec(str(tick)))
+                 .to_integral_value(rounding=ROUND_HALF_UP) * _Dec(str(tick)))
+            return f"{q:.{dec}f}"
+        return f"{price:.8f}"
+
+    def place_oco(self, symbol: str, side: str, qty: str, stop: float,
+                  tp: float, stop_limit: float | None = None) -> dict:
+        """Rest an OCO list on the Spot /api/v3/orderList/oco LEG-BASED schema
+        (the venue rejects the legacy flat price/stopPrice form with
+        "-1102 Mandatory parameter 'aboveType'" — live 2026-10-05).
+
+        Legs (relative to the exit side):
+          SELL exit (long position):  aboveType=TAKE_PROFIT @ tp,
+                                      belowType=STOP_LOSS @ stop
+          BUY exit  (short covered):  belowType=TAKE_PROFIT @ tp,
+                                      aboveType=STOP_LOSS @ stop
+        Market-on-trigger legs (TAKE_PROFIT / STOP_LOSS) execute as MARKET
+        the moment the trigger touches — a fast tape cannot leave the stop
+        resting unfilled, which is why they beat STOP_LOSS_LIMIT here
+        (stop_limit is accepted for call compatibility but no longer sent).
+        `side` is the EXIT side (SELL after a LONG entry, BUY after a
+        covered SHORT). Prices are pre-rounded to the tick grid; `qty` must
+        already be on the LOT_SIZE step grid. Returns {orderListId,
+        orderIds, listStatus}; raises BrokerError on refusal.
+        """
+        tick = self._tick_size(symbol)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": qty,
+            "listClientOrderId": f"cb-{int(time.time() * 1000)}",
+        }
+        if side == "SELL":
+            params["aboveType"] = "TAKE_PROFIT"
+            params["aboveStopPrice"] = self._round_price(tp, tick)
+            params["belowType"] = "STOP_LOSS"
+            params["belowStopPrice"] = self._round_price(stop, tick)
+        else:
+            params["belowType"] = "TAKE_PROFIT"
+            params["belowStopPrice"] = self._round_price(tp, tick)
+            params["aboveType"] = "STOP_LOSS"
+            params["aboveStopPrice"] = self._round_price(stop, tick)
+        resp = None
+        for attempt in range(3):  # same transient-network tolerance as _submit
+            try:
+                resp = self._signed("POST", BINANCE_OCO_PLACE, params)
+                break
+            except requests.RequestException as e:
+                if attempt >= 2:
+                    raise BrokerError(f"binance oco connection failed after 3 tries: {e}")
+                time.sleep(1.5 * (attempt + 1))
+        if resp is not None and resp.status_code == 400 and '"code":-1021' in resp.text:
+            _BINANCE_CLOCK["at"] = 0.0  # clock drift → re-sign once
+            resp = self._signed("POST", BINANCE_OCO_PLACE, params)
+        if resp.status_code >= 400:
+            raise BrokerError(f"binance oco rejected ({resp.status_code}): "
+                              f"{resp.text[:300]}")
+        d = resp.json()
+        return {"orderListId": str(d.get("orderListId")),
+                "orderIds": [str(o.get("orderId")) for o in d.get("orders", [])],
+                "listStatus": str(d.get("listStatusType")
+                                  or d.get("listStatus") or "EXECUTING")}
+
+    def cancel_oco(self, symbol: str, order_list_id: str) -> bool:
+        """Cancel a resting OCO list. True when gone; -2011 'Unknown order
+        list' counts as gone (already fired/cancelled). A REAL cancel
+        failure raises — the caller must know the bracket survived."""
+        try:
+            resp = self._signed("DELETE", BINANCE_OCO_LIST,
+                                {"symbol": symbol,
+                                 "orderListId": int(order_list_id)})
+        except (ValueError, TypeError):
+            return False  # malformed ref — nothing to cancel on the venue
+        if resp.status_code >= 400 and '"code":-2011' not in resp.text:
+            raise BrokerError(f"binance oco cancel failed ({resp.status_code}): "
+                              f"{resp.text[:200]}")
+        return True
+
+    def order_fill_price(self, symbol: str, order_id) -> float | None:
+        """Executed price of a (filled) order id from /api/v3/myTrades.
+        None when unknown — callers fall back to the last candle close."""
+        if not order_id:
+            return None
+        try:
+            resp = self._signed("GET", f"{BINANCE_BASE}/api/v3/myTrades",
+                                {"symbol": symbol, "limit": 50})
+            if resp.status_code >= 400:
+                return None
+            want = str(order_id)
+            for t in resp.json():
+                if str(t.get("orderId")) == want:
+                    return float(t.get("price") or 0) or None
+        except Exception:
+            return None
+        return None
+
+    def oco_status(self, symbol: str, order_list_id: str) -> dict | None:
+        """State of an OCO list: None when unknown/unreachable, else
+        {status, fired_leg, orders[]} where fired_leg is 'sl' | 'tp' when
+        the list EXECUTED, so reconcile can journal the REAL exit."""
+        try:
+            # GET /api/v3/orderList takes orderListId ONLY — sending the
+            # symbol alongside it 400s with -1104 'Not all sent parameters
+            # were read' (live 2026-10-05).
+            resp = self._signed("GET", BINANCE_OCO_LIST,
+                                {"orderListId": int(order_list_id)})
+        except (ValueError, TypeError):
+            return None
+        if resp.status_code >= 400:
+            return None
+        try:
+            d = resp.json()
+        except Exception:
+            return None
+        status = str(d.get("listStatusType") or "").upper()
+        # The list response's orders[] is SLIM ({symbol, orderId,
+        # clientOrderId}) — leg type/status/price live on the per-order
+        # Query endpoint, so enrich each leg (2 extra signed calls, only
+        # for rows that actually carry a bracket).
+        fired = None
+        legs = []
+        for o in d.get("orders", []):
+            leg = {"orderId": str(o.get("orderId")), "type": None,
+                   "status": None, "price": None, "stopPrice": None}
+            try:
+                r2 = self._signed("GET", BINANCE_ORDER,
+                                  {"symbol": symbol,
+                                   "orderId": int(o.get("orderId"))})
+                if r2.status_code < 400:
+                    od = r2.json()
+                    ot = str(od.get("type") or "").upper()
+                    ost = str(od.get("status") or "").upper()
+                    leg.update(type=ot, status=ost,
+                               price=od.get("price"),
+                               stopPrice=od.get("stopPrice"))
+                    if ost == "FILLED":
+                        # A FILLED leg IS the execution proof — the list
+                        # status spelling varies (EXECUTED on some paths,
+                        # ALL_DONE as the live terminal state, live
+                        # 2026-10-06: OCO #457561 came back ALL_DONE with
+                        # the SL FILLED and fired_leg was MISSED), so the
+                        # mapping must never gate on it. STOP_LOSS
+                        # (market-on-trigger, what we place) or legacy
+                        # STOP_LOSS_LIMIT → 'sl'; TAKE_PROFIT(_LIMIT) → 'tp'.
+                        if ot in ("STOP_LOSS", "STOP_LOSS_LIMIT"):
+                            fired = "sl"
+                        elif ot in ("TAKE_PROFIT", "TAKE_PROFIT_LIMIT"):
+                            fired = "tp"
+            except Exception:
+                pass  # leg detail is best-effort; the list status still stands
+            legs.append(leg)
+        return {"status": status or "UNKNOWN", "fired_leg": fired,
+                "orders": legs}
+
+    def _attach_oco(self, conn, order: dict, fill: dict, entry_side: str) -> None:
+        """Rest the OCO bracket for a filled entry. Best-effort BY DESIGN:
+        any skip/failure prints and leaves software monitoring in charge —
+        the journal fill result gains `oco_ref` only when the list actually
+        rested (so `oco_ref == NULL` always means 'no venue bracket').
+        """
+        if not config.BINANCE_OCO_ENABLED:
+            return
+        symbol = order["symbol"].replace("/", "")
+        px = float(fill.get("fill_price") or order.get("entry") or 0)
+        sl = float(order.get("stop_loss") or 0)
+        tp = float(order.get("take_profit") or 0)
+        if not (px > 0 and sl > 0 and tp > 0):
+            return  # no complete levels → nothing to protect venue-side
+        is_long = entry_side == "BUY"
+        # Levels must strictly bracket the fill or the venue rejects the
+        # whole list — skip loudly instead (software monitor still covers).
+        if (is_long and not (sl < px < tp)) or (not is_long and not (tp < px < sl)):
+            print(f"[Binance] OCO skipped for {symbol}: levels don't bracket "
+                  f"fill {px} (sl={sl}, tp={tp})")
+            return
+        qty = abs(float(order["qty"]))
+        lot = self._get_market_lot_info(symbol)
+        if lot["stepSize"] > 0:
+            dec = self._step_decimals(lot["stepSize"])
+            q = self._floor_to_step(qty, lot["stepSize"])
+            if q < _Dec(str(lot["minQty"] or 0)):
+                print(f"[Binance] OCO skipped for {symbol}: qty {q} below "
+                      f"minQty {lot['minQty']} after step-floor")
+                return
+            qty_str = f"{q:.{dec}f}"
+        else:
+            qty_str = f"{qty:.8f}"
+        # Legs are market-on-trigger (TAKE_PROFIT / STOP_LOSS): they execute
+        # as MARKET the moment the trigger touches, so no limit buffer is
+        # needed — a fast tape cannot leave the stop resting unfilled.
+        stop_side = "SELL" if is_long else "BUY"
+        try:
+            res = self.place_oco(symbol, stop_side, qty_str, sl, tp)
+            fill["oco_ref"] = res["orderListId"]
+            print(f"[Binance] OCO #{res['orderListId']} resting for {symbol} "
+                  f"qty={qty_str} sl={sl} tp={tp} — venue-side protection on")
+        except BrokerError as e:
+            print(f"[Binance] OCO placement failed for {symbol}: {e} — "
+                  "software SL/TP monitor stays authoritative")
+
+    def symbol_of(self, symbol: str) -> str:
+        """Display symbol → Binance pair, SAME normalization fetch_positions
+        reports. 2026-09-30 win-rate post-mortem: this override was missing,
+        so the reconcile position pass compared 'BTC/USDT' against
+        'BTCUSDT' and judged every Binance holding 'gone' — ghost-closing
+        journal rows at the last candle price (pnl ≈ 0) while the actual
+        BTC/ETH/SOL accumulated on the exchange, unmanaged."""
+        return symbol.replace("/", "").upper()
 
     @staticmethod
     def _step_decimals(step: float) -> int:
@@ -459,18 +755,70 @@ class BinanceBroker(Broker):
     def _free_balance(self, asset: str):
         """Free balance of one asset; None when it couldn't be determined
         (network/API failure) so callers fail-open instead of holding all
-        orders on a flaky metadata call."""
+        orders on a flaky metadata call.
+
+        Reads the SIGNED /account cache — this used to call the endpoint
+        unsigned, which 400s every time, so the fundability pre-check in
+        _submit silently never worked."""
         try:
-            resp = requests.get(BINANCE_ACCOUNT,
-                                headers={"X-MBX-APIKEY": config.BINANCE_EXEC_API_KEY},
-                                timeout=15)
-            resp.raise_for_status()
-            for b in resp.json().get("balances", []):
+            d = self._account_snapshot()
+            for b in d.get("balances", []):
                 if b.get("asset") == asset:
                     return float(b.get("free") or 0)
             return 0.0
         except Exception:
             return None
+
+    def fundability(self, symbol: str, side: str, qty: float,
+                    price) -> str | None:
+        """None when the venue can fund this order; a reason string when it
+        provably cannot (the same message _submit would raise). 'hold'
+        when the balance endpoint is unavailable — never block all trading
+        on a flaky metadata call.
+
+        A market BUY needs free quote (USDT) ≥ notional; a SELL needs free
+        base ≥ qty. Used by execute_intent as a pre-submit check so
+        unfundable intents fail fast with a clear reason instead of an
+        'error' journal row (live: #403 XRP/USDT SHORT).
+        """
+        try:
+            parts = symbol.split("/")
+            base, quote = (parts[0], parts[1]) if len(parts) == 2 \
+                else (parts[0], "USDT")
+            need_asset = quote if side.upper() == "BUY" else base
+            have = self._free_balance(need_asset)
+            if have is None:
+                return "hold"
+            lacking = float(qty) * float(price or 0) if side.upper() == "BUY" \
+                else float(qty)
+            if have < lacking:
+                return (f"binance: insufficient free {need_asset} "
+                        f"(have {have:.2f}, need {lacking:.2f}) — "
+                        "fund the account or lower risk size")
+            return None
+        except Exception:
+            return "hold"
+
+    def _account_snapshot(self) -> dict:
+        """Signed /account JSON with a 30s shared cache (UI polls + the
+        fundability pre-check hit it; Binance rate-limits signed calls)."""
+        now = time.time()
+        c = _binance_account_cache
+        if c["data"] is None or now - c["at"] > 30.0:
+            # /account is a signed endpoint — an unsigned GET 400s. Sign
+            # exactly like _submit does.
+            params = {"timestamp": _binance_ts(), "recvWindow": 10000}
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            sig = hmac.new(config.BINANCE_EXEC_API_SECRET.encode(), query.encode(),
+                           hashlib.sha256).hexdigest()
+            resp = requests.get(BINANCE_ACCOUNT,
+                                params={**params, "signature": sig},
+                                headers={"X-MBX-APIKEY": config.BINANCE_EXEC_API_KEY},
+                            timeout=15)
+            resp.raise_for_status()
+            c["data"] = resp.json()
+            c["at"] = now
+        return c["data"]
 
     def _submit(self, conn, order: dict, side: str) -> dict:
         from decimal import Decimal
@@ -525,7 +873,7 @@ class BinanceBroker(Broker):
               f"min_qty={min_qty}, rounded_qty={qty_str}, "
               f"notional=${notional:.2f} (min ${min_notional})")
 
-        ts = int(time.time() * 1000)
+        ts = _binance_ts()
         params = {
             "symbol": symbol,
             "side": side,
@@ -551,6 +899,24 @@ class BinanceBroker(Broker):
                 if attempt >= 2:
                     raise BrokerError(f"binance connection failed after 3 tries: {e}")
                 time.sleep(1.5 * (attempt + 1))
+        if resp is not None and resp.status_code == 400 and '"code":-1021' in resp.text:
+            # Clock drift between this box and Binance: force-refresh the
+            # measured offset, re-sign with a corrected timestamp and retry
+            # once instead of burning the order (-1021).
+            _BINANCE_CLOCK["at"] = 0.0
+            params["timestamp"] = _binance_ts()
+            query = "&".join(f"{k}={v}" for k, v in params.items())
+            sig = hmac.new(config.BINANCE_EXEC_API_SECRET.encode(), query.encode(),
+                           hashlib.sha256).hexdigest()
+            try:
+                resp = requests.post(
+                    BINANCE_ORDER,
+                    params={**params, "signature": sig},
+                    headers={"X-MBX-APIKEY": config.BINANCE_EXEC_API_KEY},
+                    timeout=20,
+                )
+            except requests.ConnectionError as e:
+                raise BrokerError(f"binance connection failed on -1021 retry: {e}")
         if resp.status_code >= 400:
             raise BrokerError(f"binance {resp.status_code}: {resp.text[:300]}")
         data = resp.json()
@@ -567,8 +933,15 @@ class BinanceBroker(Broker):
     def fetch_orders(self, limit: int = 100) -> list[dict]:
         """Open spot orders (one call, no symbol = all). Filled orders are
         only picked up on the next open-cycle; full history would need a
-        per-symbol allOrders query."""
+        per-symbol allOrders query. /openOrders is a SIGNED endpoint — an
+        unsigned GET (the old behavior) 400s every time, so reconcile
+        always failed."""
+        params = {"timestamp": _binance_ts(), "recvWindow": 10000}
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        sig = hmac.new(config.BINANCE_EXEC_API_SECRET.encode(), query.encode(),
+                       hashlib.sha256).hexdigest()
         resp = requests.get(BINANCE_OPEN_ORDERS,
+                            params={**params, "signature": sig},
                             headers={"X-MBX-APIKEY": config.BINANCE_EXEC_API_KEY},
                             timeout=20)
         resp.raise_for_status()
@@ -582,6 +955,94 @@ class BinanceBroker(Broker):
                 "fill_time": None,
                 "fees": None,
             })
+        return out
+
+    def fetch_positions(self, strict: bool = False) -> list[dict]:
+        """Spot holdings as pseudo-positions: a spot account has no
+        leveraged positions — a base-asset balance IS the exposure.
+        Lets journal reconciliation detect broker-side sells/resets
+        (e.g. a testnet that was wiped). Quote currencies and assets
+        without a USDT price are skipped.
+
+        strict=True (used by reconcile): raise instead of returning []
+        when the signed snapshot or the price batch fails — a transient
+        API blip must NOT look like 'no holdings' or the position pass
+        ghost-closes every open journal row (live 2026-09-30: BTC/ETH/SOL
+        buys marked broker_closed pnl≈0 while the coins sat on the
+        exchange, unmanaged)."""
+        try:
+            d = self._account_snapshot()
+        except Exception:
+            if strict:
+                raise
+            return []
+        quotes = {"USDT", "BUSD", "USDC", "FDUSD", "TUSD", "USD"}
+        holdings = []
+        for b in d.get("balances", []):
+            asset = b.get("asset")
+            qty = float(b.get("free") or 0) + float(b.get("locked") or 0)
+            if not asset or asset in quotes or qty <= 1e-9:
+                continue
+            holdings.append((asset, qty))
+        if not holdings:
+            return []
+        # One batched price call per 100 symbols. 2026-09-30: a single
+        # holding without a USDT pair (airdrop token) made the whole batch
+        # 400 — ALL prices dropped, positions looked empty, reconcile
+        # ghost-closed every Binance journal row. Fix: pre-filter against
+        # the exchangeInfo symbol list (public, cached) so only REAL
+        # USDT pairs are batched; junk tokens are skipped upfront instead
+        # of poisoning the request.
+        valid = set()
+        try:
+            ex = self._get_market_lot_info.__self__._exchange_info_cache  # noqa: F841
+        except Exception:
+            ex = None
+        try:
+            data = BinanceBroker._exchange_info_cache["data"]
+            if not data:
+                resp = requests.get(f"{BINANCE_BASE}/api/v3/exchangeInfo", timeout=10)
+                resp.raise_for_status()
+                BinanceBroker._exchange_info_cache = {"at": time.time(),
+                                                      "data": resp.json()}
+                data = BinanceBroker._exchange_info_cache["data"]
+            valid = {s.get("symbol") for s in data.get("symbols", [])}
+        except Exception:
+            valid = set()  # unknown list → try the batch anyway
+        priceable = [(a, q) for a, q in holdings
+                     if not valid or f"{a}USDT" in valid]
+        if not priceable:
+            return []
+        prices: dict[str, float] = {}
+        for i in range(0, len(priceable), 100):
+            chunk = priceable[i:i + 100]
+            syms = [f"{a}USDT" for a, _ in chunk]
+            try:
+                r = requests.get("https://api.binance.com/api/v3/ticker/price",
+                                 params={"symbols": json.dumps(syms, separators=(",", ":"))},
+                                 timeout=10)
+                if r.ok:
+                    for d2 in r.json():
+                        prices[d2["symbol"]] = float(d2.get("price") or 0)
+                elif strict and not prices:
+                    raise BrokerError(f"price batch failed: HTTP {r.status_code}")
+            except BrokerError:
+                raise
+            except Exception:
+                if strict and not prices:
+                    raise
+                continue
+        if strict and priceable and not prices:
+            # Every price lookup failed → the network is down, not just one
+            # symbol. The caller must treat this as 'unknown', not 'empty'.
+            raise BrokerError("all Binance price lookups failed")
+        out = []
+        for asset, qty in holdings:
+            cur = prices.get(f"{asset}USDT")
+            if not cur:
+                continue  # no USDT market → not a trackable exposure here
+            out.append({"symbol": f"{asset}/USDT", "qty": qty, "side": "long",
+                        "entry": None, "current": cur, "profit": None})
         return out
 
 
@@ -659,6 +1120,32 @@ class MT5Broker(Broker):
         finally:
             self._close()
 
+    def detailed_account_info(self) -> dict:
+        """Full account card for the UI — login, holder name, server,
+        currency, company, leverage, balances. Read-only."""
+        mt5 = self._ensure()
+        try:
+            i = mt5.account_info()
+            if i is None:
+                raise BrokerError(f"MT5 account_info failed: {mt5.last_error()}")
+            return {
+                "login": str(getattr(i, "login", "") or ""),
+                "name": getattr(i, "name", "") or "",
+                "server": getattr(i, "server", "") or "",
+                "currency": getattr(i, "currency", "") or "",
+                "company": getattr(i, "company", "") or "",
+                "leverage": float(getattr(i, "leverage", 0) or 0),
+                "trade_mode": int(getattr(i, "trade_mode", 0) or 0),  # 0=demo 1=contest 2=real
+                "balance": float(getattr(i, "balance", 0) or 0),
+                "equity": float(getattr(i, "equity", 0) or 0),
+                "margin": float(getattr(i, "margin", 0) or 0),
+                "margin_free": float(getattr(i, "margin_free", 0) or 0),
+                "margin_level": float(getattr(i, "margin_level", 0) or 0),
+                "floating_pnl": float(getattr(i, "profit", 0) or 0),
+            }
+        finally:
+            self._close()
+
     def _symbol_info(self, symbol: str):
         mt5 = self._ensure()
         sym = self.symbol_of(symbol)
@@ -682,13 +1169,153 @@ class MT5Broker(Broker):
 
     def place_market(self, conn, order: dict) -> dict:
         side = "buy" if order["side"].upper() == "LONG" else "sell"
-        return self._submit(conn, order, side)
+        return self._submit(conn, order, side, attach_levels=True)
 
     def close_market(self, conn, order: dict) -> dict:
-        side = "sell" if order["side"].upper() == "LONG" else "buy"
-        return self._submit(conn, order, side)
+        """Close the journal position by closing the OPEN MT5 POSITIONS
+        (ticket-scoped opposite DEALs), never by sending a naked opposite
+        order. 2026-09-29: ticket-less closes on this hedging account
+        OPENED a mirror position instead of closing — 18 phantom positions
+        in one night, every SL exit doubling the exposure while the
+        original trade kept running."""
+        mt5 = self._ensure()
+        sym = self.symbol_of(order["symbol"])
+        # Exact target when the journal row carries the MT5 POSITION ticket
+        # (2026-10-01): closes then hit THAT position and never touch a
+        # newer same-symbol position that isn't ours to close. Rows from
+        # before the broker_position column (or non-MT5 rows) fall back to
+        # the newest-first same-symbol sweep below.
+        want_pos = str(order.get("broker_position") or "").strip()
+        want_pos = want_pos if want_pos.isdigit() else ""
+        try:
+            mt5.symbol_select(sym, True)
+            positions = mt5.positions_get(symbol=sym) or []
+            if want_pos:
+                exact = [p for p in positions
+                         if str(getattr(p, "ticket", "")) == want_pos]
+                if not exact:
+                    raise BrokerError(
+                        f"MT5 position #{want_pos} for {sym} not open at "
+                        "the broker (already closed or ticket mismatch)")
+                positions = exact
+            if not positions:
+                # Nothing open at the broker — the position was closed
+                # outside the bot (manual, or the server-side SL/TP we now
+                # attach fired first). Journal the close at the live price
+                # and place NOTHING (a naked opposite deal would open a
+                # hedge on this account).
+                tick = mt5.symbol_info_tick(sym)
+                px = 0.0
+                if tick is not None:
+                    px = float(getattr(tick, "bid", 0) or 0)\
+                        or float(getattr(tick, "ask", 0) or 0)
+                if px <= 0:
+                    df = database.load_candles(conn, order["symbol"], "1h", limit=1)
+                    px = float(df["close"].iloc[-1]) if not df.empty else 0.0
+                if px <= 0:
+                    raise BrokerError(
+                        f"no open MT5 position for {sym} and no price to "
+                        "journal the close")
+                return {"status": "already_closed", "fill_price": px,
+                        "fill_time": datetime.now(timezone.utc).isoformat(),
+                        "fees": 0.0, "broker_ref": ""}
+            info = mt5.symbol_info(sym)
+            if info is None:
+                raise BrokerError(f"MT5 symbol {sym} not found for close")
+            volume = self._lots(info, abs(float(order["qty"])))
+            if volume <= 0:
+                raise BrokerError(f"zero volume for {sym} close "
+                                  f"(qty {order['qty']})")
+            filling_mode = getattr(info, "filling_mode", 0)
+            # 2026-09-30 10013 root cause: `journal.side` is the POSITION's
+            # direction (SHORT = we sold). Closing it needs the OPPOSITE
+            # deal: LONG → sell, SHORT → buy. The old `!= "LONG"` inverted
+            # this and sent a SELL to close the AUD/JPY SHORT — MT5 rejects
+            # a same-type deal on a ticket with 10013 (and in the pre-
+            # ticket era the same inversion OPENED mirror positions).
+            is_long_close = order["side"].upper() == "LONG"
+            otype = mt5.ORDER_TYPE_SELL if is_long_close else mt5.ORDER_TYPE_BUY
+            # 2026-09-30 close hardening: AUD/JPY died with retcode 10013
+            # (Invalid request) cycle after cycle on the exact request that
+            # succeeded from a live probe seconds later — a stale tick /
+            # filling-mode quirk, not a structurally bad request. Now every
+            # attempt re-quotes a FRESH tick, tries FOK then IOC when the
+            # symbol allows both, and gets one extra fresh-tick retry.
+            fillings = ([mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC]
+                        if filling_mode & 1 else [mt5.ORDER_FILLING_IOC])
+            attempts = fillings + [fillings[-1]]
 
-    def _submit(self, conn, order: dict, side: str) -> dict:
+            def _send_close(pos, vol, filling):
+                tk = mt5.symbol_info_tick(sym)   # fresh per attempt
+                if tk is None:
+                    raise BrokerError(f"no tick for {sym}")
+                req = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": sym,
+                    "volume": vol,
+                    "type": otype,
+                    "position": pos.ticket,   # ← close THIS position, no hedge
+                    "price": tk.bid if is_long_close else tk.ask,
+                    "deviation": 30,
+                    "magic": 20260817,
+                    "comment": "cryptoautomation-close",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": filling,
+                }
+                result = mt5.order_send(req)
+                rc = getattr(result, "retcode", None)
+                if result is None or rc != mt5.TRADE_RETCODE_DONE:
+                    comment = (getattr(result, "comment", "") or "").strip()
+                    err = BrokerError(
+                        f"mt5 close rejected for {sym} #{pos.ticket}: "
+                        f"retcode {rc}" + (f" — {comment}" if comment else ""))
+                    err.retcode = rc
+                    raise err
+                return result
+
+            # Newest positions first: the position opened most recently (with
+            # our attached SL/TP) is consumed first.
+            remaining = volume
+            last_price, last_deal, last_pos = 0.0, 0, 0
+            for pos in sorted(positions, key=lambda p: p.time, reverse=True):
+                if remaining <= 1e-9:
+                    break
+                vol = min(float(pos.volume), remaining)
+                result, last_err = None, None
+                for attempt, filling in enumerate(attempts):
+                    try:
+                        result = _send_close(pos, vol, filling)
+                        break
+                    except BrokerError as e:
+                        last_err = e
+                        # Transient rejects worth a fresh-tick retry:
+                        # 10013 invalid request (stale tick), 10004 requote,
+                        # 10020 prices changed, 10021 no quotes, or a None
+                        # result (IPC hiccup). Terminal rejects like 10018
+                        # market-closed are NOT retried.
+                        rc = getattr(e, "retcode", None)
+                        retryable = rc in (None, 10004, 10013, 10020, 10021)
+                        if attempt + 1 < len(attempts) and retryable:
+                            time.sleep(0.3)
+                            continue
+                        raise
+                if result is None:
+                    raise last_err or BrokerError(
+                        f"mt5 close failed for {sym} #{pos.ticket}")
+                last_price = (float(getattr(result, "price", 0) or 0)
+                              or last_price)
+                last_deal = int(getattr(result, "deal", 0) or 0) or last_deal
+                last_pos = int(getattr(pos, "ticket", 0) or 0) or last_pos
+                remaining = round(remaining - vol, 8)
+            return {"status": "filled", "fill_price": last_price or None,
+                    "fill_time": datetime.now(timezone.utc).isoformat(),
+                    "fees": 0.0, "broker_ref": str(last_deal),
+                    "broker_position": str(last_pos) if last_pos else None}
+        finally:
+            self._close()
+
+    def _submit(self, conn, order: dict, side: str,
+                attach_levels: bool = False) -> dict:
         mt5 = self._ensure()
         sym = self.symbol_of(order["symbol"])
         try:
@@ -732,10 +1359,54 @@ class MT5Broker(Broker):
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": type_filling,
             }
+            if attach_levels:
+                # Server-side protection: attach the bot's SL/TP to the DEAL
+                # itself. Without this the position is only monitored by
+                # check_position() while this process runs — offline bot =
+                # naked position (found live 2026-09-28: 40 open positions
+                # with sl=0 on the venue). Levels are validated against the
+                # entry side first; a wrong-side level would get the WHOLE
+                # order rejected with 'Invalid stops', so a bad level is
+                # dropped instead (software monitoring still covers it).
+                ref = float(order.get("entry") or order.get("fill_price") or 0)
+                sl = float(order.get("stop_loss") or 0)
+                tp = float(order.get("take_profit") or 0)
+                is_long = side == "buy"
+                if ref > 0 and sl > 0 and ((is_long and sl < ref) or (not is_long and sl > ref)):
+                    request["sl"] = sl
+                if ref > 0 and tp > 0 and ((is_long and tp > ref) or (not is_long and tp < ref)):
+                    request["tp"] = tp
             result = mt5.order_send(request)
             if result is None or getattr(result, "retcode", None) != mt5.TRADE_RETCODE_DONE:
-                raise BrokerError(f"mt5 order rejected for {sym}: "
-                                  f"{getattr(result, 'retcode', '?')} {mt5.last_error()}")
+                # Report the broker's own comment, not mt5.last_error() — after a
+                # rejected order last_error() returns (1, 'Success'), which read
+                # as a success in the journal ("10027 (1, 'Success')").
+                retcode = getattr(result, "retcode", "?")
+                comment = (getattr(result, "comment", "") or "").strip()
+                raise BrokerError(
+                    f"mt5 order rejected for {sym}: retcode {retcode}"
+                    + (f" — {comment}" if comment else ""))
+            # Resolve the POSITION ticket this deal opened/affected. Deals are
+            # grouped by position id in the terminal — the journal must store
+            # THAT ticket (not the entry deal id) so reconciliation and
+            # cleanup match the exact position on this hedging account
+            # (2026-10-01: broker_ref held the entry DEAL ticket, e.g.
+            # AUD/JPY #394 deal 1859451756 vs position 1975186562). Some
+            # builds return no `position` field on MqlTradeResult, so fall
+            # back to the executed deal's position_id from deal history.
+            pos_ticket = int(getattr(result, "position", 0) or 0)
+            if not pos_ticket:
+                deal_id = int(getattr(result, "deal", 0) or 0)
+                if deal_id:
+                    try:
+                        seed = mt5.history_deals_get(ticket=deal_id) or []
+                        pos_ids = {int(getattr(d, "position_id", 0) or 0)
+                                   for d in seed}
+                        pos_ids.discard(0)
+                        if pos_ids:
+                            pos_ticket = pos_ids.pop()
+                    except Exception:
+                        pos_ticket = 0  # best-effort; reconcile self-heals
         finally:
             self._close()
         return {
@@ -745,7 +1416,38 @@ class MT5Broker(Broker):
             "fees": 0.0,  # CFD costs are inside the spread
             "broker_ref": str(getattr(result, "deal", 0)
                               or getattr(result, "order", 0)),
+            # MT5 POSITION ticket (≠ entry deal id) — see resolution above.
+            "broker_position": str(pos_ticket) if pos_ticket else None,
         }
+
+    def modify_position_sltp(self, symbol: str, new_sl: float | None, new_tp: float | None) -> dict:
+        """Amend SL/TP on the open MT5 position for `symbol` (TRADE_ACTION_SLTP).
+        Pass None to leave a level unchanged. The position is found by symbol;
+        if the terminal holds several, the oldest is modified."""
+        mt5 = self._ensure()
+        sym = self.symbol_of(symbol)
+        try:
+            mt5.symbol_select(sym, True)
+            positions = mt5.positions_get(symbol=sym) or []
+            if not positions:
+                raise BrokerError(f"no open MT5 position for {sym} to modify")
+            pos = sorted(positions, key=lambda p: p.time)[0]
+            request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": pos.ticket,
+                "symbol": sym,
+                "sl": float(new_sl) if new_sl else float(pos.sl or 0),
+                "tp": float(new_tp) if new_tp else float(pos.tp or 0),
+            }
+            result = mt5.order_send(request)
+            rc = getattr(result, "retcode", None)
+            if result is None or rc != mt5.TRADE_RETCODE_DONE:
+                raise BrokerError(f"mt5 SLTP modify rejected for {sym}: "
+                                  f"{rc} {mt5.last_error()}")
+            return {"status": "ok", "sl": request["sl"] or None,
+                    "tp": request["tp"] or None, "ticket": pos.ticket}
+        finally:
+            self._close()
 
     def fetch_positions(self) -> list[dict]:
         """Open MT5 positions: [{symbol (MT5 name), qty (units), side, entry, current}]."""
@@ -825,6 +1527,82 @@ class MT5Broker(Broker):
         finally:
             self._close()
         return out
+
+    def closing_deal_for_position(self, position_ticket: int) -> dict | None:
+        """Ground-truth close for an MT5 position: the OUT (exit) deal from
+        the terminal's deal history, keyed by position id.
+
+        2026-09-30 win-rate audit: broker-side closes used to be journaled at
+        the last 1h candle close because market IOC DEALs leave no ORDER
+        history — which fabricated exits (EUR/USD #392 got pnl=0.0 with
+        exit==entry; XAU/USD #391 showed +21.40 while the real deal paid
+        +4.62). The history HAS the exact answer.
+
+        NOTE: the journal's broker_ref stores the ENTRY deal ticket, but
+        deals are grouped by position id — resolve the entry ticket to its
+        position id first (2026-09-30: AUD/JPY #394 fell through to the
+        candle fallback, journaling pnl 420.99 for a 0.01-lot trade whose
+        real deal paid +3.24, because its ref 1859451756 was the entry deal
+        while the position id is 1975186562)."""
+        mt5 = self._ensure()
+        try:
+            deals = mt5.history_deals_get(position=int(position_ticket)) or []
+            if not deals:
+                # broker_ref may be the ENTRY deal ticket → resolve to the
+                # position id and retry.
+                seed = (mt5.history_deals_get(
+                            ticket=int(position_ticket)) or [])
+                pos_ids = {int(getattr(d, "position_id", 0) or 0)
+                           for d in seed}
+                pos_ids.discard(0)
+                for pid in pos_ids:
+                    deals = mt5.history_deals_get(position=pid) or []
+                    if deals:
+                        break
+            if not deals:
+                return None
+            out_deals = [d for d in deals
+                         if int(getattr(d, "entry", -1))
+                         == int(getattr(mt5, "DEAL_ENTRY_OUT", 1))]
+            if not out_deals:
+                return None
+            d = max(out_deals, key=lambda x: int(getattr(x, "time", 0)))
+            profit = float(getattr(d, "profit", 0.0) or 0.0)
+            swap = float(getattr(d, "swap", 0.0) or 0.0)
+            # Commission may sit on the entry deal — sum the whole position.
+            commission = sum(float(getattr(x, "commission", 0.0) or 0.0)
+                             for x in deals)
+            # The POSITION id the deals belong to — reconcile self-heal
+            # stamps this onto journal rows that predate broker_position.
+            pos_id = int(getattr(d, "position_id", 0) or 0)
+            return {
+                "ticket": int(getattr(d, "ticket", 0) or 0),
+                "position_id": pos_id or None,
+                "price": float(getattr(d, "price", 0.0) or 0.0),
+                "time": int(getattr(d, "time", 0) or 0),
+                "profit": profit,
+                "swap": swap,
+                "commission": round(commission, 8),
+                "pnl": profit + swap + commission,
+            }
+        finally:
+            self._close()
+
+    def position_id_for_entry_deal(self, deal_ticket: int) -> int | None:
+        """Resolve an ENTRY deal ticket to its POSITION id (the terminal
+        groups deals by position id). None when it can't be resolved.
+        Used by reconcile to self-heal journal rows that predate the
+        broker_position column."""
+        mt5 = self._ensure()
+        try:
+            seed = mt5.history_deals_get(ticket=int(deal_ticket)) or []
+            pos_ids = {int(getattr(d, "position_id", 0) or 0) for d in seed}
+            pos_ids.discard(0)
+            return pos_ids.pop() if pos_ids else None
+        except Exception:
+            return None
+        finally:
+            self._close()
 
 
 class HybridBroker(Broker):
@@ -911,7 +1689,10 @@ class HybridBroker(Broker):
 
 
 def get_broker() -> Broker:
-    """The configured broker — the only gateway the executor talks to."""
+    """The configured broker — the only gateway the executor talks to.
+    Every trade MUST land on a real broker we have access to (hybrid /
+    mt5 / binance / alpaca). An unknown EXECUTION_BROKER value now fails
+    loudly instead of silently falling back to the fake PaperBroker."""
     mode = config.EXECUTION_BROKER
     if mode == "alpaca":
         return AlpacaBroker()
@@ -921,7 +1702,13 @@ def get_broker() -> Broker:
         return MT5Broker()
     if mode == "hybrid":
         return HybridBroker()
-    return PaperBroker()
+    if mode == "paper":
+        # Explicit only. Nothing may reach the simulated book by accident.
+        return PaperBroker()
+    raise BrokerError(
+        f"EXECUTION_BROKER={mode!r} is not a real broker. "
+        "Valid: hybrid, mt5, binance, alpaca (or explicit 'paper' for dry tests). "
+        "Set it in .env — refusing to fall back to a simulated broker.")
 
 
 # ----------------------------------------------------------------------
@@ -955,6 +1742,65 @@ def _actual_broker_for(symbol: str) -> str:
     return "mt5"
 
 
+# ── Execution-cost model (journaling + entry veto) ──────────────────
+# Estimated slippage in $ for a fill at `fill_price` on `notional`.
+# Measured slippage needs the PRE-ORDER mid/quote — none of the fill
+# paths carries one today, so every number in this feature is an
+# estimate: venue tier bps × notional (risk.slippage_bps). When future
+# paths do carry a reference price, |fill − ref| slots in here with no
+# schema change.
+def _estimate_slippage_cost(symbol: str, qty: float,
+                            fill_price: float | None) -> float | None:
+    try:
+        fp = float(fill_price or 0)
+        if fp <= 0:
+            return None
+        return round(abs(float(qty)) * fp * risk.slippage_bps(symbol) / 10_000.0, 8)
+    except Exception:
+        return None
+
+
+def _venue_of(symbol: str) -> str:
+    """The broker that actually fills `symbol` (hybrid-aware) — the cost
+    table and veto must price the REAL venue, not 'hybrid'."""
+    return _actual_broker_for(symbol)
+
+
+def _rrtp_cost_pct(symbol: str) -> float:
+    """Estimated round-trip execution cost for `symbol` as a fraction of
+    notional: (slippage + taker fee) × 2 sides, in decimal (1 bp = 1e-4)."""
+    return risk.total_cost_bps(symbol) / 10_000.0
+
+
+def _cost_clearance(intent, entry: float | None) -> str | None:
+    """Entry veto: refuse trades whose planned WINNER can't pay 2× the
+    estimated round-trip execution cost (2026-10-01).
+
+    Edge = |TP − entry| — the take-profit hit is the plan being sized; the
+    stop is the loss case, not the edge. Threshold = COST_VETO_MIN_EDGE_X
+    (default 2.0) × round-trip cost fraction × entry. Returns the veto
+    reason, or None when the trade clears (or the check can't run —
+    missing entry/TP or broker refusal must never false-veto)."""
+    if not config.COST_VETO_ENABLED:
+        return None
+    try:
+        tp_lvl = float(getattr(intent, "take_profit", None) or 0)
+        entry_lvl = float(entry or getattr(intent, "entry", None) or 0)
+        if entry_lvl <= 0 or tp_lvl <= 0:
+            return None
+        edge = abs(tp_lvl - entry_lvl)
+        min_edge = (config.COST_VETO_MIN_EDGE_X
+                    * _rrtp_cost_pct(intent.symbol) * entry_lvl)
+        if edge < min_edge:
+            return (f"cost-veto: TP edge {edge:.6g} < "
+                    f"{config.COST_VETO_MIN_EDGE_X:g}× round-trip cost "
+                    f"{min_edge:.6g} ({_venue_of(intent.symbol)} "
+                    f"{_rrtp_cost_pct(intent.symbol) * 1e4:.1f}bps RT)")
+    except Exception:
+        return None  # never break sizing on veto-math hiccups
+    return None
+
+
 def _default_levels(conn, symbol: str, entry: float, direction: str) -> tuple[float, float]:
     """
     ATR-based SL/TP for intents that carry none (e.g. source-B-only).
@@ -983,9 +1829,12 @@ def _default_levels(conn, symbol: str, entry: float, direction: str) -> tuple[fl
         tp_mult = 2.0
     else:
         sl_dist = max(atr * 1.5, entry * 0.005)
-        # Dynamic TP: scale with volatility
+        # Dynamic TP: scale with volatility. 2026-09-30: the old low-vol
+        # "quick win" (TP = 1.0x SL distance, R/R 1.0) is the exact
+        # small-profit/big-loss profile that bleeds an account — every
+        # default now clears the MIN_RR floor.
         if vol_pct < 0.25:
-            tp_mult = 1.0   # low vol → quick wins
+            tp_mult = 1.5   # low vol → symmetric target (R/R 1.5)
         elif vol_pct > 0.75:
             tp_mult = 2.0   # high vol → let winners run
         else:
@@ -997,12 +1846,120 @@ def _default_levels(conn, symbol: str, entry: float, direction: str) -> tuple[fl
     return round(stop, 8), round(tp, 8)
 
 
+# ── Phase-2 sizing buckets (roadmap 2026-09-30) ──────────────────────────
+
+def _news_tag(reasons: str | None) -> str:
+    """Classify a trade's news reason into ONE stable tag for bucket keys.
+
+    Bucket identity must be reproducible at sizing time and at post-mortem
+    time, so this reads only the journal's own `reasons` text ("ai/news
+    LONG: <headline> | regime=… tc=…") — never live state. Journal evidence:
+    AUD-regulation shorts, BTC-ETF/inflow longs, risk-off shorts, central-
+    bank rate-cut chatter. Unrecognized text → "other"."""
+    if not reasons:
+        return "none"
+    s = str(reasons).lower()
+    if any(k in s for k in ("central bank", "central-bank", "rate cut",
+                            "rate hike", "fomc", "fed ", "ecb ", "boj",
+                            "boe ", "policy")):
+        return "central_bank"
+    if any(k in s for k in ("inflation", "cpi", "pce", "bond yields",
+                            "yields")):
+        return "inflation"
+    if "etf" in s:
+        return "etf"
+    if "regulat" in s:
+        return "regulation"
+    if any(k in s for k in ("risk-off", "risk off", "weakness", "strength",
+                            "momentum", "inflows", "outflows")):
+        return "macro"
+    return "other"
+
+
+def _row_bucket_keys(venue: str, symbol: str, regime: str | None,
+                     reasons: str | None) -> list[str]:
+    """Bucket identities for one trade, most specific first:
+    venue|symbol|regime|tag → venue|regime|tag → venue|regime (real news
+    tags only — the generic "other" bucket must not blur into venue-wide)."""
+    tag = _news_tag(reasons)
+    reg = str(regime or "unknown")
+    keys = [f"{venue}|{symbol}|{reg}|{tag}", f"{venue}|{reg}|{tag}"]
+    if tag not in ("none", "other"):
+        keys.append(f"{venue}|{reg}")
+    return keys
+
+
+def _risk_bucket_keys(conn, symbol: str, regime: str | None,
+                      reasons: str | None) -> list[str]:
+    """Bucket keys for a NEW trade — the venue that will actually fill it."""
+    return _row_bucket_keys(_actual_broker_for(symbol), symbol, regime, reasons)
+
+
+def _bucket_records(conn, key: str, lookback: int) -> list[dict]:
+    """The last `lookback` closed trades belonging to bucket `key`
+    (venue|…), newest first, as risk.py-shaped records. Legacy rows
+    without entry/SL are skipped by risk.py's usability checks."""
+    venue = key.split("|", 1)[0]
+    out: list[dict] = []
+    try:
+        rows = conn.execute(
+            "SELECT symbol, trend_regime, reasons, pnl, entry, stop_loss, qty "
+            "FROM orders WHERE status = 'closed' AND pnl IS NOT NULL "
+            "AND source = ? ORDER BY id DESC LIMIT 800", (venue,)).fetchall()
+    except Exception:
+        return []
+    for r in rows:
+        d = dict(r)
+        if key in _row_bucket_keys(venue, str(d.get("symbol") or ""),
+                                   d.get("trend_regime"), d.get("reasons")):
+            out.append({"pnl": d.get("pnl"), "entry": d.get("entry"),
+                        "stop_loss": d.get("stop_loss"),
+                        "qty": d.get("qty")})
+            if len(out) >= lookback:
+                break
+    return out
+
+
+def _kelly_multiplier_for(conn, symbol: str, regime: str | None,
+                          reasons: str | None) -> float:
+    """Rolling-bucket fractional-Kelly multiplier for a NEW trade.
+    The most specific bucket holding >= 2 usable closed trades decides
+    (1.0 neutral, 0.5–1.5 scaled, 0 when its 95% CI on expectancy is
+    negative). Any failure → 1.0: sizing additions must never break the
+    order path."""
+    if not config.SIZE_KELLY_ENABLED:
+        return 1.0
+    try:
+        for key in _risk_bucket_keys(conn, symbol, regime, reasons):
+            recs = _bucket_records(conn, key, config.SIZE_KELLY_LOOKBACK)
+            if len(recs) < 2:
+                continue
+            return risk.bucket_kelly_multiplier(recs)
+    except Exception:
+        return 1.0
+    return 1.0
+
+
 def _sized_qty(conn, intent, qty: float | None, entry: float | None = None,
-               stop: float | None = None) -> float:
+               stop: float | None = None,
+               telemetry: dict | None = None) -> float:
     """Risk-based size: (risk% × equity) / |entry − SL|, capped by Kelly.
-    Equity = the Alpaca account when that's the broker, else journal equity."""
+    Equity = the Alpaca account when that's the broker, else journal equity.
+    Returns 0.0 when the cost-clearance veto refuses the entry (telemetry
+    then carries the veto reason)."""
     if qty is not None and qty > 0:
         return float(qty)
+    # ── Cost-clearance veto (2026-10-01): entries whose PLANNED winning
+    # trade can't pay 2× the estimated round-trip cost never reach the
+    # broker. Edge = |TP − entry| (a TP hit is the plan; SL is the loss
+    # case, not the edge). 2× covers cost variance across the round trip
+    # (news-tape slippage spikes, requotes). Everything degrades open:
+    # unknown entry/TP or broker refusal → 1.0, never a false veto.
+    veto = _cost_clearance(intent, entry)
+    if veto:
+        if telemetry is not None:
+            telemetry.update({"veto": veto})
+        return 0.0
     equity = _broker_equity(conn)
     entry = entry or intent.entry
     stop = stop or intent.stop_loss
@@ -1023,7 +1980,36 @@ def _sized_qty(conn, intent, qty: float | None, entry: float | None = None,
         mult = 2.0
     elif conf >= 60:
         mult = 1.5
-    risk_pct = min(risk_pct * mult, config.MAX_RISK_PER_TRADE)
+    # ── Phase-2 sizing (roadmap 2026-09-30) ──────────────────────────
+    # P1 inverse-vol: risk_pct × (target_vol / realized_vol) with
+    # realized_vol = ATR(14)/price on the 1h entry timeframe, clamped
+    # [0.5×, 2×]. Neutral 1.0 when ATR/price is unknown — missing data
+    # must not invent an opinion.
+    vol_mult = 1.0
+    if config.SIZE_VOL_ENABLED:
+        try:
+            atr = _get_atr(conn, intent.symbol, "1h")
+            if atr > 0 and entry:
+                vol_mult = risk.inverse_vol_multiplier(atr / float(entry))
+        except Exception:
+            vol_mult = 1.0
+    # P2 rolling-bucket Kelly: fractional-Kelly multiplier from the last
+    # SIZE_KELLY_LOOKBACK closed trades in the (venue, regime, news-tag)
+    # bucket, clamped [0.5×, 1.5×]; 0 when that bucket's 95% CI on
+    # expectancy is negative — the roadmap's data-driven gate: a bucket
+    # that measurably loses money stops getting size.
+    kelly_mult = _kelly_multiplier_for(
+        conn, intent.symbol, getattr(intent, "trend_regime", None),
+        "; ".join(getattr(intent, "reasons", None) or []))
+    if telemetry is not None:
+        telemetry.update({"vol_mult": round(vol_mult, 4),
+                          "kelly_mult": kelly_mult,
+                          "conf_mult": mult})
+    # Combined multiplier = product of the two (each individually clamped);
+    # kelly 0 (starved bucket) wins over everything → zero risk → the trade
+    # is skipped by the caller with an explanatory error.
+    combined = min(3.0, max(0.0, vol_mult * kelly_mult))
+    risk_pct = min(risk_pct * mult * combined, config.MAX_RISK_PER_TRADE)
     size = risk.position_size(equity, entry or 0, stop or 0, risk_pct)
     if size <= 0:
         return 0.0
@@ -1032,7 +2018,15 @@ def _sized_qty(conn, intent, qty: float | None, entry: float | None = None,
         broker = get_broker()
     except Exception:
         broker = None
-    if broker is not None and broker.name == "mt5" and entry:
+    # Lot-aware sizing must also run in hybrid mode for FX/metals/indices —
+    # they route to MT5 ("zero volume for USDJPY…" came from skipping this).
+    mt5b = None
+    if broker is not None:
+        if broker.name == "mt5":
+            mt5b = broker
+        elif broker.name == "hybrid" and not broker._is_crypto(intent.symbol):
+            mt5b = getattr(broker, "_mt5", None)
+    if mt5b is not None and entry:
         # MT5/Exness (lot-based CFDs): the standard 15% notional cap is
         # BELOW the broker's minimum lot for metals/indices (a 0.01 XAUUSD
         # lot is ~$4.4k), which would zero-size every gold trade. Use
@@ -1040,12 +2034,12 @@ def _sized_qty(conn, intent, qty: float | None, entry: float | None = None,
         # the exchange margin rules be the hard backstop. Terminal down /
         # symbol unknown → fall back to the standard cap below.
         try:
-            info = broker._symbol_info(intent.symbol)
+            info = mt5b._symbol_info(intent.symbol)
             contract = float(getattr(info, "trade_contract_size", 0) or 100_000.0)
             step = float(getattr(info, "volume_step", 0) or 0.01)
             vmin = float(getattr(info, "volume_min", 0) or 0.01)
             vmax = float(getattr(info, "volume_max", 0) or 100.0)
-            vol = broker._lots(info, size)
+            vol = mt5b._lots(info, size)
             if vol < vmin:
                 vol = vmin  # min-lot floor — the risk stop keeps risk ~1-2%
             cap_vol = math.floor(
@@ -1068,6 +2062,23 @@ def _sized_qty(conn, intent, qty: float | None, entry: float | None = None,
     return size
 
 
+def _hash_freed(existing: dict | None) -> bool:
+    """True when a finished (closed/error) journal row is past the
+    re-entry cooldown, so its day-bucketed intent hash can be released.
+    Filled/open rows always hold their hash (no stacking the same trade)."""
+    if not existing or existing.get("status") not in ("closed", "error"):
+        return False
+    done_at = str(existing.get("fill_time")
+                  or existing.get("created_at") or "")
+    try:
+        age_min = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(
+                       done_at.replace("Z", "+00:00"))).total_seconds() / 60.0
+    except Exception:
+        return True  # unparseable timestamp → ancient, treat as stale
+    return age_min >= config.REENTRY_COOLDOWN_MIN
+
+
 def execute_intent(conn, intent, qty: float | None = None,
                    interval: str = "1h", dry_run: bool = False) -> dict:
     """
@@ -1080,7 +2091,20 @@ def execute_intent(conn, intent, qty: float | None = None,
     # A dry_run row is only a preview — it must NOT consume the trade, so a
     # later real order of the same intent is allowed (it replaces the row).
     if existing and existing.get("status") != "dry_run":
-        return {"order": existing, "duplicate": True, "dry_run": False}
+        # ── Re-entry cooldown (2026-09-30) ───────────────────────────
+        # The hash is day-bucketed, so one CLOSED trade used to squat on
+        # its symbol+direction for the rest of the UTC day — blocking
+        # every re-entry even after the position was long gone (seen
+        # live: BTC/USDT LONG held 'duplicate' all evening behind a
+        # 0-PnL row closed hours earlier). A finished row past
+        # REENTRY_COOLDOWN_MIN releases its hash (archived under a
+        # row-unique key) so a fresh signal can trade again.
+        if _hash_freed(existing):
+            database.archive_order_hash(conn, existing["id"],
+                                        intent.intent_hash)
+            existing = None
+        else:
+            return {"order": existing, "duplicate": True, "dry_run": False}
 
     order = {
         "intent_hash": intent.intent_hash,
@@ -1095,8 +2119,12 @@ def execute_intent(conn, intent, qty: float | None = None,
         "fill_price": None, "fill_time": None, "fees": 0.0, "pnl": None,
         "error": None,
         "interval": interval,
+        "trend_regime": getattr(intent, "trend_regime", None),
         "reasons": "; ".join(getattr(intent, "reasons", None) or []),
     }
+    # The pre-order mid/backfilled close — the reference for MEASURED entry
+    # slippage once fill_price exists (|fill − ref|); None when no price.
+    order["slippage_ref"] = order.get("entry")
 
     # Source-B-only intents carry no entry level — backfill from the last
     # close so the journal can price market value / unrealized PnL.
@@ -1133,21 +2161,93 @@ def execute_intent(conn, intent, qty: float | None = None,
             order["stop_loss"] = order.get("stop_loss") or sl
             order["take_profit"] = order.get("take_profit") or tp
 
-    size = _sized_qty(conn, intent, qty, order.get("entry"), order.get("stop_loss"))
+        # ── Risk/reward floor (2026-09-30) ────────────────────────────
+        # A trade whose TP is closer than its SL pays the spread AND the
+        # odds at the same time — the "always small profit, always big
+        # loss" profile. Enforce TP distance >= MIN_RR * SL distance, and
+        # cap an unrealistic TP (MAX_TP_PCT) by widening nothing: if the
+        # AI/ATR TP is too far, it is pulled back to the cap only when
+        # that still clears the RR floor; otherwise the trade is refused.
+        is_long = intent.direction == "LONG"
+        sl_p = float(order.get("stop_loss") or 0)
+        tp_p = float(order.get("take_profit") or 0)
+        if sl_p > 0 and tp_p > 0:
+            risk_d = abs(entry - sl_p)
+            rew_d = abs(tp_p - entry)
+            if risk_d > 0:
+                rr = rew_d / risk_d
+                cap_d = entry * (config.MAX_TP_PCT / 100.0)
+                if rew_d > cap_d:
+                    rew_d = cap_d
+                    order["take_profit"] = round(
+                        entry + cap_d if is_long else entry - cap_d, 8)
+                if rew_d / risk_d < config.MIN_RR:
+                    raise ValueError(
+                        f"rr_floor: TP {abs((order.get('take_profit') or 0) - entry):.5f} "
+                        f"vs SL {risk_d:.5f} (R/R {rr:.2f} < {config.MIN_RR}) "
+                        f"for {intent.symbol} — low-reward risk refused")
+
+    size_meta: dict = {}
+    size = _sized_qty(conn, intent, qty, order.get("entry"),
+                      order.get("stop_loss"), telemetry=size_meta)
     if size <= 0:
+        # Distinguish WHY the sizer refused — a cost veto or a starved
+        # Kelly bucket is a deliberate data-driven refusal, not a data
+        # problem. The veto reason IS the message when present.
+        why = (size_meta.get("veto")
+               or ("zero size (kelly bucket starved: negative expectancy "
+                   "CI for its venue/regime/news-tag bucket)"
+                   if size_meta.get("kelly_mult") == 0
+                   else "zero size (no equity or no stop distance)"))
         return {"order": None, "duplicate": False, "dry_run": dry_run,
-                "error": "zero size (no equity or no stop distance)"}
+                "error": why}
     order["qty"] = size
+    # Entry slippage estimate (venue bps × entry notional). When the fill
+    # path later provides a pre-order reference price, |fill − ref| replaces
+    # this as the measured number — same column, better data.
+    order["slippage_cost"] = _estimate_slippage_cost(
+        intent.symbol, size, order.get("entry"))
+    # Size forensics on the row itself (keyword-safe: _news_tag only reads
+    # its own keyword substrings, which this never introduces).
+    if size_meta:
+        order["reasons"] = (order["reasons"] + " | " if order["reasons"]
+                            else "") + \
+            "size=vol{vol},kelly{kelly},conf{conf}".format(
+                vol=size_meta.get("vol_mult"), kelly=size_meta.get("kelly_mult"),
+                conf=size_meta.get("conf_mult"))
 
     if dry_run:
         order["status"] = "dry_run"
+        # Surface the cost veto in previews too — a vetoed dry-run row
+        # explains WHY the trade wouldn't be taken live.
+        if size_meta.get("veto"):
+            order["error"] = size_meta["veto"]
         database.record_order(conn, order)
         return {"order": order, "duplicate": False, "dry_run": True}
 
     # Drop any preview row for this intent so the real order takes its place.
     database.discard_dry_run(conn, intent.intent_hash)
 
+    # ── Balance precheck (2026-10-05) ────────────────────────────
+    # Intents the venue cannot fund used to die at SUBMIT as an 'error'
+    # journal row (live: #403 XRP/USDT SHORT — binance held 349 free XRP,
+    # the position needed 2177). Check BEFORE submitting: return the same
+    # reason the broker would raise so the intent is held (no journal row,
+    # no half-state), and HOLD instead of blocking when the balance
+    # endpoint is unavailable. Runs after the dry-run return: previews must
+    # never depend on venue reachability. Sizing already happened, so the
+    # check uses the honest final `size`.
     broker = get_broker()
+    rb = broker._get_broker_for(intent.symbol) \
+        if broker.name == "hybrid" else broker
+    if hasattr(rb, "fundability"):
+        fund = rb.fundability(
+            intent.symbol, "BUY" if intent.direction == "LONG" else "SELL",
+            size, order.get("entry"))
+        if fund:
+            return {"order": None, "duplicate": False, "dry_run": dry_run,
+                    "error": fund}
+
     try:
         fill = broker.place_market(conn, order)
     except BrokerError as e:
@@ -1159,6 +2259,15 @@ def execute_intent(conn, intent, qty: float | None = None,
         database.record_order(conn, order)
         raise BrokerError(order["error"]) from e
 
+    # Entry slippage: MEASURED |fill − ref| when the fill path carried a
+    # pre-order reference price (paper broker today; others when they do),
+    # else the venue-tier bps estimate recorded during sizing.
+    ref_price = fill.get("ref_price")
+    fill_price = fill.get("fill_price")
+    if ref_price and fill_price:
+        order["slippage_cost"] = round(
+            abs(float(order["qty"]))
+            * abs(float(fill_price) - float(ref_price)), 8)
     order.update({
         "status": fill.get("status", "error"),
         "fill_price": fill.get("fill_price"),
@@ -1168,12 +2277,29 @@ def execute_intent(conn, intent, qty: float | None = None,
         # lets the position pass journal broker-side closes). Dropping it
         # here silently orphaned every real order from the broker.
         "broker_ref": fill.get("broker_ref"),
+        # MT5 POSITION ticket (2026-10-01): the exact broker position this
+        # row owns — closes and reconcile hit THIS ticket, not a symbol
+        # guess. None for brokers without position ids (crypto spot).
+        "broker_position": fill.get("broker_position"),
+        # Binance OCO orderListId when the venue-side bracket rested
+        # (2026-10-05). NULL = no bracket → software monitor is the only
+        # SL/TP for that row.
+        "oco_ref": fill.get("oco_ref"),
     })
     rowid = database.record_order(conn, order)
     if rowid == 0:
-        # Lost a race: another call placed this intent first. Return it.
+        # Hash still occupied (a row inserted between our check and write).
         existing = database.order_for_intent(conn, intent.intent_hash)
-        return {"order": existing, "duplicate": True, "dry_run": False}
+        if _hash_freed(existing):
+            database.archive_order_hash(conn, existing["id"],
+                                        intent.intent_hash)
+            rowid = database.record_order(conn, order)
+            if rowid == 0:
+                return {"order": database.order_for_intent(
+                            conn, intent.intent_hash),
+                        "duplicate": True, "dry_run": False}
+        elif existing is not None:
+            return {"order": existing, "duplicate": True, "dry_run": False}
     return {"order": database.order_for_intent(conn, intent.intent_hash),
             "duplicate": False, "dry_run": False}
 
@@ -1217,6 +2343,60 @@ def close_position(conn, order: dict, price: float | None = None,
     if order.get("status") not in ("filled", "open"):
         return {"order": order, "pnl": 0.0, "reason": "not_open"}
 
+    # ── Venue-side bracket lifecycle (2026-10-05) ────────────────────
+    # The journal is the trade's brain: when IT closes the position, the
+    # resting OCO must not outlive it (a live bracket would sell the next
+    # refill). And if the venue ALREADY fired a leg (we were offline), the
+    # coins are gone — a market close would sell air. In that case journal
+    # the exit with the TRUE leg ('sl'/'tp') and the OCO's real fill price
+    # instead of issuing an impossible close.
+    oco_ref = str(order.get("oco_ref") or "").strip()
+    fired = None
+    leg_orders: list = []
+    if oco_ref:
+        broker = get_broker()
+        if broker.name == "hybrid":
+            broker = broker._get_broker_for(order["symbol"])
+        venue_sym = (broker.symbol_of(order["symbol"])
+                     if hasattr(broker, "symbol_of") else order["symbol"])
+        if hasattr(broker, "oco_status"):
+            try:
+                st = broker.oco_status(venue_sym, oco_ref)
+                if st and st.get("fired_leg"):
+                    fired = st["fired_leg"]
+                    leg_orders = [o for o in st.get("orders", [])
+                                  if str(o.get("status") or "").upper() == "FILLED"]
+            except Exception:
+                pass  # status check is advisory — never blocks the close
+        if hasattr(broker, "cancel_oco"):
+            try:
+                if broker.cancel_oco(venue_sym, oco_ref):
+                    print(f"  [OCO] #{oco_ref} cancelled — journal closed "
+                          "the position first")
+            except Exception as e:
+                print(f"  [OCO] cancel failed for #{oco_ref}: {e} — bracket "
+                      "may rest at the venue; reconcile will clean it up")
+    if fired:
+        px = None
+        for lo in leg_orders:
+            try:
+                px = broker.order_fill_price(venue_sym, lo.get("orderId"))
+            except Exception:
+                px = None
+            if px:
+                break
+        if not px:
+            df = database.load_candles(conn, order["symbol"], "1h", limit=3)
+            px = float(df["close"].iloc[-1]) if not df.empty else None
+        if px:
+            # Recurse WITHOUT the bracket ref: the second pass must not
+            # re-query the fired list (infinite loop) — it just journals
+            # the exit at the real fill price with the true leg reason.
+            return close_position(conn, {**order, "oco_ref": None},
+                                  price=float(px), reason=fired)
+        return {"order": order, "pnl": 0.0,
+                "reason": f"oco_fired_{fired}_no_price"}
+
     if price is not None:
         fees = abs(order["qty"]) * float(price) * risk.fee_bps() / 10_000.0
         fill = {"fill_price": float(price), "fees": fees,
@@ -1229,6 +2409,9 @@ def close_position(conn, order: dict, price: float | None = None,
     entry = float(order.get("entry") or 0.0)
     entry_fees = float(order.get("fees") or 0.0)
     exit_fees = float(fill.get("fees") or 0.0)
+    # Journal the EXIT slippage estimate — update_order_exit adds it to the
+    # entry estimate recorded at fill time (round-trip total on the row).
+    exit_slip = _estimate_slippage_cost(order["symbol"], qty, exit_price)
     if order["side"].upper() == "LONG":
         gross = (exit_price - entry) * qty
     else:
@@ -1237,7 +2420,8 @@ def close_position(conn, order: dict, price: float | None = None,
 
     database.update_order_exit(conn, order["id"], round(exit_price, 8),
                                fill.get("fill_time") or datetime.now(timezone.utc).isoformat(),
-                               reason, round(pnl, 8), round(entry_fees + exit_fees, 8))
+                               reason, round(pnl, 8), round(entry_fees + exit_fees, 8),
+                               slippage_cost=exit_slip)
     closed = database.order_for_intent(conn, order["intent_hash"])
     return {"order": closed, "pnl": round(pnl, 8), "reason": reason}
 
@@ -1458,6 +2642,84 @@ def _update_trailing_stop(conn, order: dict, interval: str = "1h") -> None:
             conn.commit()
         except Exception:
             pass  # best effort — next cycle will retry
+        else:
+            # 2026-10-06: the venue bracket still protects the ORIGINAL
+            # stop — a trailed journal stop that never reaches the
+            # exchange is protection theater. Sync it (best-effort).
+            try:
+                _sync_oco_with_stop(conn, order, new_sl)
+            except Exception as e:
+                print(f"[Binance] OCO trail sync error for "
+                      f"{order.get('symbol')}: {e}")
+
+
+def _sync_oco_with_stop(conn, order: dict, new_sl: float) -> None:
+    """Re-place the venue OCO bracket at a trailed stop (2026-10-06).
+
+    _update_trailing_stop moves the JOURNAL stop; this moves the EXCHANGE
+    bracket to match: cancel the old list, re-place at (new stop, same
+    TP, same qty), and stamp the NEW orderListId on the row. Best-effort
+    by design:
+      - cancel reports already-gone (fired/cancelled) → return; the
+        reconcile fired-OCO pass owns that case.
+      - cancel ok but re-place fails → journal oco_ref=NULL (truthful:
+        no venue bracket any more) and print LOUD — software monitoring
+        is then the only protection until the next trail update.
+    Rows without an oco_ref or on a broker without OCO calls: untouched.
+    """
+    oco_ref = order.get("oco_ref")
+    if not oco_ref or not order.get("id"):
+        return
+    broker = get_broker()
+    rb = broker._get_broker_for(order["symbol"]) \
+        if broker.name == "hybrid" else broker
+    if not (hasattr(rb, "cancel_oco") and hasattr(rb, "place_oco")):
+        return  # no venue-bracket concept on this broker
+    venue_symbol = rb.symbol_of(order["symbol"])
+    is_long = str(order.get("side") or "").upper() == "LONG"
+    exit_side = "SELL" if is_long else "BUY"   # a long exits by selling
+    tp = float(order.get("take_profit") or 0)
+    if tp <= 0:
+        return  # no TP → nothing to re-place around
+    qty = abs(float(order.get("qty") or 0))
+    try:  # re-floor to the venue LOT_SIZE grid like _attach_oco does
+        lot = rb._get_market_lot_info(venue_symbol)
+        if lot and float(lot.get("stepSize") or 0) > 0:
+            qty = rb._floor_to_step(qty, float(lot["stepSize"]))
+    except Exception:
+        pass  # fake brokers / missing info — send the journal qty as-is
+    try:
+        if not rb.cancel_oco(venue_symbol, str(oco_ref)):
+            return  # list already gone — reconcile handles a fired leg
+    except Exception as e:
+        print(f"[Binance] OCO cancel FAILED during trail sync for "
+              f"{order['symbol']} (#{order['id']}): {e} — old bracket "
+              "left resting at the original stop")
+        return
+    try:
+        res = rb.place_oco(venue_symbol, exit_side, qty, new_sl, tp)
+    except Exception as e:
+        try:  # truthful journal: the bracket is GONE, not re-placed
+            conn.execute("UPDATE orders SET oco_ref = NULL WHERE id = ?",
+                         (order["id"],))
+            conn.commit()
+        except Exception:
+            pass
+        print(f"[Binance] OCO re-place FAILED for {order['symbol']} "
+              f"(#{order['id']}) at trailed stop {new_sl}: {e} — "
+              "software monitoring is the only protection now")
+        return
+    new_ref = str((res or {}).get("orderListId") or "")
+    if new_ref:
+        try:
+            conn.execute("UPDATE orders SET oco_ref = ? WHERE id = ?",
+                         (new_ref, order["id"]))
+            conn.commit()
+        except Exception:
+            pass
+    print(f"[Binance] OCO re-placed at trailed stop for "
+          f"{order['symbol']} (#{order['id']}): sl={new_sl} tp={tp} "
+          f"list={new_ref or '?'}")
 
 
 def _check_time_decay(conn, order: dict, interval: str = "1h") -> str | None:
@@ -1524,7 +2786,26 @@ def _check_time_decay(conn, order: dict, interval: str = "1h") -> str | None:
 # ----------------------------------------------------------------------
 # Broker reconciliation (journal ↔ Alpaca/Binance order status)
 # ----------------------------------------------------------------------
+_reconcile_state: dict = {"at": None, "ok": None, "updated": 0, "error": ""}
+
+
 def reconcile_orders(conn, limit: int = 100) -> list[dict]:
+    """Journal ↔ broker sync (see _reconcile_orders_impl) with health
+    tracking: /api/broker-health reports the last run's time, outcome and
+    error so the UI can show sync freshness at a glance."""
+    started = time.time()
+    try:
+        updated = _reconcile_orders_impl(conn, limit)
+    except Exception as e:
+        _reconcile_state.update({"at": started, "ok": False, "updated": 0,
+                                 "error": str(e)[:200]})
+        raise
+    _reconcile_state.update({"at": started, "ok": True,
+                             "updated": len(updated), "error": ""})
+    return updated
+
+
+def _reconcile_orders_impl(conn, limit: int = 100) -> list[dict]:
     """
     Pull the broker's order list and sync every journal order that has a
     broker_ref: status (pending_new → filled, canceled → cancelled), fill
@@ -1532,14 +2813,63 @@ def reconcile_orders(conn, limit: int = 100) -> list[dict]:
 
     No-op for the offline paper broker (nothing to reconcile). Network is
     wrapped defensively — a broker hiccup never breaks the bot cycle.
+
+    Hybrid mode IS supported: rows are grouped by their journal source and
+    each group is checked against that actual sub-broker (crypto → Binance
+    spot holdings, FX/metals → MT5 positions). Without this, broker-side
+    closes (manual exits in Exness, a wiped Binance testnet) never reached
+    the journal while AUTO was off.
     """
     updated = []
+    # ── Ghost scrub: an OPEN row must never carry exit fields (2026-09-30:
+    # rows 386/387/400 sat at status 'filled' with an exit_time stamped by an
+    # aborted close path — reports then read a row that was simultaneously
+    # open and half-closed). Clear dangling exit fields on non-closed rows.
+    try:
+        conn.execute(
+            "UPDATE orders SET exit_price = NULL, exit_time = NULL, "
+            "exit_reason = NULL, pnl = NULL "
+            "WHERE status NOT IN ('closed', 'cancelled', 'canceled', 'error') "
+            "AND (exit_price IS NOT NULL OR exit_time IS NOT NULL "
+            "OR exit_reason IS NOT NULL OR pnl IS NOT NULL)")
+        conn.commit()
+    except Exception:
+        pass  # journal-only hygiene — never blocks reconciliation
     try:
         broker = get_broker()
     except BrokerError:
         return updated
-    if broker.name not in ("alpaca", "binance", "mt5"):
+    if broker.name == "paper":
         return updated
+
+    # Resolve the per-symbol broker: hybrid fans out to its sub-brokers,
+    # everything else is a single broker for all rows.
+    def _broker_for(sym: str) -> Broker:
+        if broker.name == "hybrid":
+            return broker._get_broker_for(sym)
+        return broker
+
+    class _BrokerUnreachable(Exception):
+        """The broker's position snapshot FAILED — not 'empty'."""
+
+    def _positions_of(b: Broker) -> set[str]:
+        """Symbols with live exposure at broker b, normalized for compare.
+        2026-09-30 win-rate post-mortem: a FAILED snapshot (network, auth,
+        rate limit) used to return an empty set — indistinguishable from
+        'no positions' — so every open journal row was closed at the last
+        candle price while the assets sat unmanaged at the broker (live:
+        BTC/ETH/SOL buys marked broker_closed pnl=0.0). Now it RAISES and
+        the caller skips the pass. BinanceBroker.fetch_positions runs in
+        strict mode so its internal fail-opens can't hide either."""
+        try:
+            if getattr(b, "name", "") == "binance":
+                rows = b.fetch_positions(strict=True)
+            else:
+                rows = b.fetch_positions()
+            return {str(p["symbol"]).replace("/", "").upper() for p in rows
+                    if abs(float(p.get("qty") or 0)) > 1e-9}
+        except Exception as e:
+            raise _BrokerUnreachable(str(e)[:160]) from e
 
     try:
         remote = broker.fetch_orders(limit=limit)
@@ -1547,41 +2877,35 @@ def reconcile_orders(conn, limit: int = 100) -> list[dict]:
         raise BrokerError(f"reconcile fetch failed: {e}") from e
     by_id = {o["id"]: o for o in remote}
 
-    # MT5 reports no order list (market IOC DEALs) — only the position pass
-    # below applies; the foreign/status passes need a real order feed.
-    if not remote:
-        remote = None
-
     # ── Foreign-fill pass: FILLED broker orders that our journal knows
     # nothing about (no matching broker_ref) were placed OUTSIDE this bot
     # (manual, another tool, an earlier config). Flag them so the dashboard
     # can warn instead of silently ignoring broker-side activity.
-    if remote is not None:
-        try:
-            journal_refs = {j.get("broker_ref") for j in database.load_orders(conn, limit=2000)
-                            if j.get("broker_ref")}
-            foreign = []
-            for o in remote:
-                oid = str(o.get("id") or "")
-                if not oid or oid in journal_refs:
-                    continue
-                if str(o.get("status", "")).lower() != "filled":
-                    continue
-                s = str(o.get("symbol") or "").replace("/", "")
-                ours = next((c for c in config.TRADABLE_UNIVERSE
-                             if broker.name == "alpaca" and AlpacaBroker._symbol(c) == s), None)
-                if not ours:
-                    continue
-                foreign.append({"foreign": True, "symbol": ours,
-                                "broker_symbol": str(o.get("symbol")),
-                                "side": o.get("side"), "qty": o.get("qty"),
-                                "fill_price": o.get("fill_price"),
-                                "fill_time": o.get("fill_time"),
-                                "created_at": o.get("created_at")})
-            if foreign:
-                updated.extend(foreign[:50])  # cap: don't flood the journal view
-        except Exception:
-            pass  # foreign-fill detection is best-effort, never fatal
+    try:
+        journal_refs = {j.get("broker_ref") for j in database.load_orders(conn, limit=2000)
+                        if j.get("broker_ref")}
+        foreign = []
+        for o in remote:
+            oid = str(o.get("id") or "")
+            if not oid or oid in journal_refs:
+                continue
+            if str(o.get("status", "")).lower() != "filled":
+                continue
+            s = str(o.get("symbol") or "").replace("/", "")
+            ours = next((c for c in config.TRADABLE_UNIVERSE
+                         if broker.name == "alpaca" and AlpacaBroker._symbol(c) == s), None)
+            if not ours:
+                continue
+            foreign.append({"foreign": True, "symbol": ours,
+                            "broker_symbol": str(o.get("symbol")),
+                            "side": o.get("side"), "qty": o.get("qty"),
+                            "fill_price": o.get("fill_price"),
+                            "fill_time": o.get("fill_time"),
+                            "created_at": o.get("created_at")})
+        if foreign:
+            updated.extend(foreign[:50])  # cap: don't flood the journal view
+    except Exception:
+        pass  # foreign-fill detection is best-effort, never fatal
 
     if remote is not None:
         for journal in database.load_orders(conn, limit=2000):
@@ -1610,26 +2934,143 @@ def reconcile_orders(conn, limit: int = 100) -> list[dict]:
                 updated.append({"id": journal["id"], "symbol": journal["symbol"],
                                 "broker_ref": ref, **updates})
 
-    # ── Position pass (Alpaca + MT5): a journal order whose broker position
-    # is GONE was closed broker-side (manually in the broker dashboard, or a
-    # stop/TP placed outside the bot). Alpaca finds the closing order; MT5
-    # has no order history in v1, so the exit is journaled at the last close.
-    if broker.name in ("alpaca", "mt5"):
-        try:
-            positions = broker.fetch_positions()
-        except Exception:
-            positions = []
-        open_syms = {p["symbol"] for p in positions if abs(p.get("qty") or 0) > 1e-9}
+    # ── Position pass: a journal order whose broker position is GONE was
+    # closed broker-side (manually in the broker dashboard, a stop/TP hit,
+    # or a wiped testnet). Hybrid resolves each row to its real sub-broker,
+    # so crypto rows are checked against Binance spot holdings and FX rows
+    # against MT5 positions — with per-broker position caches.
+    broker_down = False  # set True only when a snapshot FAILS (skip notice)
+    if broker.name in ("alpaca", "mt5", "hybrid"):
+        pos_cache: dict[str, set[str]] = {}
         for journal in database.load_orders(conn, limit=2000):
             if journal.get("status") not in ("filled", "open"):
                 continue
             if not journal.get("broker_ref"):
                 continue
-            sym = broker.symbol_of(journal["symbol"])
+            rb = _broker_for(journal["symbol"])
+            if rb.name not in ("alpaca", "mt5", "binance"):
+                continue
+            if rb.name not in pos_cache:
+                try:
+                    pos_cache[rb.name] = _positions_of(rb)
+                except _BrokerUnreachable:
+                    # Broker snapshot FAILED: skip the whole pass. Closing
+                    # journal rows without broker evidence fabricates
+                    # outcomes (pnl=0.0 ghosts) and abandons real assets.
+                    print(f"  reconcile: {rb.name} snapshot failed — "
+                          "position pass skipped this run")
+                    broker_down = True
+                    break
+            open_syms = pos_cache[rb.name]
+            sym = rb.symbol_of(journal["symbol"]).replace("/", "").upper()
+            # Self-heal stamping: OPEN MT5 rows that predate the
+            # broker_position column get their exact POSITION ticket
+            # resolved from the entry deal — so the NEXT close/reconcile
+            # targets the precise position instead of a symbol sweep
+            # (2026-10-01: #402 was placed by the pre-column build). Runs
+            # only for rows missing the stamp, so it costs nothing once
+            # every row is stamped.
+            if (rb.name == "mt5"
+                    and not str(journal.get("broker_position") or "").strip()
+                    and str(journal.get("broker_ref") or "").isdigit()
+                    and hasattr(rb, "position_id_for_entry_deal")):
+                try:
+                    pid = rb.position_id_for_entry_deal(
+                        int(journal["broker_ref"]))
+                except Exception:
+                    pid = None
+                if pid:
+                    conn.execute(
+                        "UPDATE orders SET broker_position = ? WHERE id = ?",
+                        (str(pid), journal["id"]))
+                    conn.commit()
+                    journal["broker_position"] = str(pid)
+                    updated.append({
+                        "id": journal["id"], "symbol": journal["symbol"],
+                        "stamped_position": str(pid),
+                        "source": "mt5_deal_history"})
             if sym in open_syms:
                 continue
+            # Grace window: a row filled seconds ago must never be declared
+            # dead on snapshot evidence (2026-09-29: BTC/ETH/SOL buys were
+            # closed as broker_closed at the same candle price minutes after
+            # filling, because the holdings snapshot raced the fills).
+            filled_at = str(journal.get("fill_time")
+                            or journal.get("created_at") or "")
+            try:
+                age = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(
+                           filled_at.replace("Z", "+00:00"))).total_seconds()
+                if 0 <= age < 900:
+                    continue
+            except Exception:
+                pass
+            # Second look with a fresh position query before killing the row.
+            try:
+                fresh = _positions_of(rb)
+            except _BrokerUnreachable:
+                print(f"  reconcile: {rb.name} re-query failed — row "
+                      f"#{journal['id']} left open this run")
+                broker_down = True
+                break
+            pos_cache[rb.name] = fresh
+            if sym in fresh:
+                continue
             close = None
-            if broker.name == "alpaca":
+            # NOTE: use THIS row's broker_ref — `ref` is a leftover from the
+            # order-history pass above and may point at another row's deal
+            # (caught by test_close_hardening: the ghost BTC row would have
+            # been journaled with the EUR/USD closing deal).
+            row_ref = str(journal.get("broker_ref") or "")
+            if rb.name == "mt5" and row_ref.isdigit():
+                # MT5 market IOC DEALs leave no order history, but the
+                # terminal's DEAL HISTORY holds the real closing deal —
+                # journal the broker's own numbers instead of a candle-close
+                # guess (2026-09-30: candle-close journaling fabricated
+                # exits — EUR/USD #392 pnl=0.0 with exit==entry, XAU/USD
+                # #391 +21.40 vs the real +4.62).
+                # 2026-10-01: try the row's exact POSITION ticket first
+                # (broker_position), then the legacy entry-deal ref — a
+                # stale/foreign stamp must never lose the deal-history
+                # numbers the entry-deal path can still resolve.
+                row_pos = str(journal.get("broker_position") or "").strip()
+                candidates = ([int(row_pos)] if row_pos.isdigit() else []) \
+                    + [int(row_ref)]
+                deal = None
+                for cand in candidates:
+                    try:
+                        deal = rb.closing_deal_for_position(cand)
+                    except Exception as e:
+                        print(f"  reconcile: mt5 deal history unavailable "
+                              f"for #{journal['id']} ({e}) — trying next ref")
+                        deal = None
+                    if deal and deal.get("price", 0) > 0:
+                        break
+                if deal and deal.get("price", 0) > 0:
+                    exit_iso = (datetime.fromtimestamp(
+                                    deal["time"], tz=timezone.utc).isoformat()
+                                if deal.get("time")
+                                else datetime.now(timezone.utc).isoformat())
+                    database.update_order_exit(
+                        conn, journal["id"], round(deal["price"], 8),
+                        exit_iso, "broker_closed", round(deal["pnl"], 8),
+                        float(journal.get("fees") or 0.0),
+                        broker_position=deal.get("position_id"),
+                        slippage_cost=_estimate_slippage_cost(
+                            journal["symbol"],
+                            abs(float(journal["qty"])),
+                            deal["price"]))
+                    updated.append({
+                        "id": journal["id"], "symbol": journal["symbol"],
+                        "closed": True, "exit_reason": "broker_closed",
+                        "exit_price": round(deal["price"], 8),
+                        "pnl": round(deal["pnl"], 8),
+                        "side": journal["side"], "qty": abs(float(journal["qty"])),
+                        "source": "mt5_deal_history",
+                        "deal_ticket": deal.get("ticket"),
+                    })
+                    continue
+            if rb.name == "alpaca":
                 close = _find_closing_order(remote or [], journal, sym)
             entry = float(journal.get("entry") or journal.get("fill_price") or 0)
             if close:
@@ -1637,7 +3078,7 @@ def reconcile_orders(conn, limit: int = 100) -> list[dict]:
                 exit_time = close.get("fill_time") or close.get("created_at") or ""
                 exit_fees = float(close.get("fees") or 0)
             else:
-                # MT5 fallback (or no matching close found): mark the exit at
+                # No order history (MT5/Binance spot): mark the exit at
                 # the last candle close — the journal stays truthful even
                 # without an order history.
                 df = database.load_candles(conn, journal["symbol"], "1h", limit=3)
@@ -1661,6 +3102,140 @@ def reconcile_orders(conn, limit: int = 100) -> list[dict]:
                             "closed": True, "exit_reason": "broker_closed",
                             "exit_price": round(exit_price, 8), "pnl": pnl,
                             "side": journal["side"], "qty": qty})
+
+    # ── Fired-OCO pass (2026-10-05): a Binance row with a resting OCO whose
+    # list EXECUTED at the venue (SL or TP leg fired while this bot was
+    # offline/wedged — the very scenario the bracket exists for). The coins
+    # are already gone; without this pass the position pass would see no
+    # holding and ghost-close the row at a candle price with the wrong
+    # reason. Journal the REAL leg ('sl'/'tp') at the OCO fill price.
+    if broker.name in ("binance", "hybrid"):
+        for journal in database.load_orders(conn, limit=2000):
+            if journal.get("status") not in ("filled", "open"):
+                continue
+            oref = str(journal.get("oco_ref") or "").strip()
+            if not oref:
+                continue
+            rb = _broker_for(journal["symbol"])
+            if rb.name != "binance" or not hasattr(rb, "oco_status"):
+                continue
+            try:
+                st = rb.oco_status(rb.symbol_of(journal["symbol"]), oref)
+            except Exception:
+                st = None
+            if not st or not st.get("fired_leg"):
+                continue
+            fired = st["fired_leg"]
+            px = None
+            for lo in st.get("orders", []):
+                if str(lo.get("status") or "").upper() != "FILLED":
+                    continue
+                try:
+                    px = rb.order_fill_price(
+                        rb.symbol_of(journal["symbol"]), lo.get("orderId"))
+                except Exception:
+                    px = None
+                if px:
+                    break
+            if not px:
+                df = database.load_candles(conn, journal["symbol"], "1h", limit=3)
+                px = float(df["close"].iloc[-1]) if not df.empty else None
+            if not px:
+                continue  # no price evidence → leave the row for next run
+            qty = abs(float(journal["qty"]))
+            entry = float(journal.get("entry") or journal.get("fill_price") or 0)
+            exit_fees = qty * float(px) * risk.fee_bps() / 10_000.0
+            entry_fees = float(journal.get("fees") or 0)
+            if str(journal["side"]).upper() == "LONG":
+                gross = (px - entry) * qty
+            else:
+                gross = (entry - px) * qty
+            pnl = round(gross - entry_fees - exit_fees, 8)
+            database.update_order_exit(
+                conn, journal["id"], round(px, 8),
+                datetime.now(timezone.utc).isoformat(), fired, pnl,
+                round(entry_fees + exit_fees, 8),
+                slippage_cost=_estimate_slippage_cost(
+                    journal["symbol"], qty, px))
+            updated.append({"id": journal["id"], "symbol": journal["symbol"],
+                            "closed": True, "exit_reason": fired,
+                            "exit_price": round(px, 8), "pnl": pnl,
+                            "side": journal["side"], "qty": qty,
+                            "source": "binance_oco"})
+
+    # ── Deal-history correction pass: rows already marked broker_closed whose
+    # numbers were journaled from candle-close guesses (pre-2026-09-30). The
+    # MT5 closing deal is ground truth — correct price/pnl/exit_time where
+    # they disagree. Only the broker_closed bucket is audited; manual/sl/tp
+    # exits were journaled from real fills and are left alone.
+    if broker.name in ("mt5", "hybrid"):
+        for journal in database.load_orders(conn, limit=2000):
+            if journal.get("status") != "closed":
+                continue
+            if str(journal.get("exit_reason") or "") != "broker_closed":
+                continue
+            ref = str(journal.get("broker_ref") or "")
+            if not ref.isdigit():
+                continue
+            rb = _broker_for(journal["symbol"])
+            if rb.name != "mt5":
+                continue
+            try:
+                row_pos = str(journal.get("broker_position") or "").strip()
+                deal = None
+                for cand in ([int(row_pos)] if row_pos.isdigit() else []) \
+                        + [int(ref)]:
+                    deal = rb.closing_deal_for_position(cand)
+                    if deal and deal.get("price", 0) > 0:
+                        break
+            except Exception:
+                continue  # history unavailable — never break reconciliation
+            if not deal or deal.get("price", 0) <= 0:
+                continue
+            cur_pnl = float(journal.get("pnl") or 0.0)
+            cur_px = float(journal.get("exit_price") or 0.0)
+            if (abs(deal["pnl"] - cur_pnl) < 0.005
+                    and abs(deal["price"] - cur_px) < 1e-8):
+                # Numbers already truthful — but rows that predate the
+                # broker_position column still lack the exact POSITION
+                # ticket. The deal history knows it (all deals of the
+                # position share position_id): stamp it once so future
+                # reconciliation/cleanup matches the position EXACTLY and
+                # never needs the entry-deal fallback again.
+                if (not str(journal.get("broker_position") or "").strip()
+                        and deal.get("position_id")):
+                    conn.execute(
+                        "UPDATE orders SET broker_position = ? WHERE id = ?",
+                        (str(deal["position_id"]), journal["id"]))
+                    conn.commit()
+                    updated.append({
+                        "id": journal["id"], "symbol": journal["symbol"],
+                        "stamped_position": str(deal["position_id"]),
+                        "source": "mt5_deal_history"})
+                continue  # already truthful
+            sets = ["exit_price = ?", "pnl = ?",
+                    "broker_position = COALESCE(broker_position, ?)"]
+            vals = [round(deal["price"], 8), round(deal["pnl"], 8),
+                    str(deal["position_id"]) if deal.get("position_id") else None]
+            if deal.get("time"):
+                sets.append("exit_time = ?")
+                vals.append(datetime.fromtimestamp(
+                    deal["time"], tz=timezone.utc).isoformat())
+            vals.append(journal["id"])
+            conn.execute(f"UPDATE orders SET {', '.join(sets)} WHERE id = ?",
+                         vals)
+            conn.commit()
+            updated.append({"id": journal["id"], "symbol": journal["symbol"],
+                            "corrected": True, "old_pnl": round(cur_pnl, 8),
+                            "pnl": round(deal["pnl"], 8),
+                            "exit_price": round(deal["price"], 8),
+                            "source": "mt5_deal_history"})
+
+    if broker_down:
+        # Surface the skip so the dashboard/analytics know rows were left
+        # open deliberately (no broker evidence), not by omission.
+        updated.append({"skipped": "position pass aborted: broker snapshot "
+                                    "failed — open rows left untouched"})
     return updated
 
 
@@ -1678,6 +3253,215 @@ def _find_closing_order(remote: list[dict], journal: dict, sym: str) -> dict | N
         return None
     cands.sort(key=lambda o: str(o.get("created_at") or ""))
     return cands[0]
+
+
+_binance_account_cache = {"at": 0.0, "data": None}
+
+
+def _mt5_account_card() -> dict:
+    """Live MT5/Exness account details for the dashboard card — read-only."""
+    i = MT5Broker().detailed_account_info()
+    mode = {0: "Demo", 1: "Contest"}.get(i.get("trade_mode"), "Real")
+    return {
+        "broker": "mt5",
+        "name": f"Exness · MT5",
+        "account_type": f"{mode} · 1:{i.get('leverage') or '—'}",
+        "currency": i.get("currency") or "USD",
+        "balance": i.get("balance"),
+        "equity": i.get("equity"),
+        "floating_pnl": i.get("floating_pnl"),
+        "leverage": i.get("leverage") or 0,
+        "details": [
+            ["Login", i.get("login") or "—"],
+            ["Holder", i.get("name") or "—"],
+            ["Server", i.get("server") or "—"],
+            ["Company", i.get("company") or "—"],
+            ["Account", mode],
+            ["Margin", str(i.get("margin") or 0)],
+            ["Free margin", str(i.get("margin_free") or 0)],
+            ["Margin level", f"{i.get('margin_level') or 0:.1f}%"],
+        ],
+    }
+
+
+def _binance_account_card() -> dict:
+    """Signed GET /api/v3/account on the EXEC spot account. Cached 30s —
+    the UI polls and Binance rate-limits signed account calls."""
+    d = BinanceBroker()._account_snapshot()
+    balances = [b for b in d.get("balances", [])
+                if float(b.get("free") or 0) + float(b.get("locked") or 0) > 0]
+    usdt = next((b for b in balances if b.get("asset") == "USDT"), {})
+    free, locked = float(usdt.get("free") or 0), float(usdt.get("locked") or 0)
+    key = config.BINANCE_EXEC_API_KEY or ""
+    return {
+        "broker": "binance",
+        "name": "Binance Spot (testnet)",
+        "account_type": "Spot · exec API",
+        "currency": "USDT",
+        "balance": free + locked,
+        "equity": free + locked,
+        "floating_pnl": 0.0,
+        "details": [
+            ["API key", f"…{key[-6:]}" if len(key) > 6 else "—"],
+            ["Server", "testnet.binance.vision"],
+            ["Free USDT", f"{free:.2f}"],
+            ["Locked USDT", f"{locked:.2f}"],
+            ["Assets held", str(len(balances))],
+        ],
+    }
+
+
+def _alpaca_account_card() -> dict:
+    """GET /v2/account on the Alpaca paper (or live) account."""
+    b = AlpacaBroker()
+    d = requests.get(f"{b.base}/v2/account", headers=b.headers, timeout=15).json()
+    num = str(d.get("account_number") or "—")
+    return {
+        "broker": "alpaca",
+        "name": "Alpaca (paper)",
+        "account_type": str(d.get("status") or "—"),
+        "currency": d.get("currency") or "USD",
+        "balance": float(d.get("equity") or 0),
+        "equity": float(d.get("equity") or 0),
+        "floating_pnl": float(d.get("equity") or 0) - float(d.get("last_equity") or 0),
+        "details": [
+            ["Account #", num],
+            ["Status", str(d.get("status") or "—")],
+            ["Market", "paper" if "paper" in b.base else "live"],
+            ["Cash", f"{float(d.get('cash') or 0):.2f}"],
+            ["Buying power", f"{float(d.get('buying_power') or 0):.2f}"],
+            ["Portfolio value", f"{float(d.get('portfolio_value') or 0):.2f}"],
+        ],
+    }
+
+
+# ── Broker registry: THE single place to add a new account ──────────
+# One entry per ACCOUNT. The dashboard (donuts, tags, account cards, journal
+# filters, routing metadata) is generated from this — adding an account means
+# adding ONE entry here (+ an account-card builder + its .env keys) and every
+# surface picks it up. No frontend edits.
+#   key     — journal `source` value (orders rows carry this; NEVER rename
+#             once trades exist)
+#   name    — display name everywhere in the UI
+#   letter  — one-letter tag badge
+#   color   — accent color (tags, donut dots)
+#   modes   — EXECUTION_BROKER values under which this account is active
+BROKER_REGISTRY: list[dict] = [
+    {"key": "mt5", "name": "Exness · MT5", "letter": "M", "color": "#0ecb81",
+     "modes": ("hybrid", "mt5")},
+    {"key": "binance", "name": "Binance", "letter": "B", "color": "#f5b50a",
+     "modes": ("hybrid", "binance")},
+    {"key": "alpaca", "name": "Alpaca (paper)", "letter": "A", "color": "#ffd03e",
+     "modes": ("hybrid", "alpaca")},
+]
+
+
+def _fingerprint(key: str) -> str:
+    """Stable short key fingerprint — enough to confirm WHICH account a
+    broker talks to (the "my testnet looks empty" class of confusion)
+    without leaking the key."""
+    if not key:
+        return ""
+    return f"..{key[-6:]}" if len(key) > 6 else ".."
+
+
+def _probe(fn):
+    """Time a probe call; return (ok, latency_ms, error, payload)."""
+    t0 = time.time()
+    try:
+        return True, round((time.time() - t0) * 1000), "", fn() or {}
+    except Exception as e:
+        return False, round((time.time() - t0) * 1000), str(e)[:160], {}
+
+
+def broker_health() -> list[dict]:
+    """Live diagnostics for every active registry broker: reachable or not,
+    which key/account it talks to, and probe latency. A broker that is down
+    degrades to ok:false with the error — never silently absent."""
+    out = []
+    mode = config.EXECUTION_BROKER
+    for entry in active_brokers():
+        key = entry["key"]
+        base = {"key": key, "name": entry["name"], "letter": entry["letter"],
+                "color": entry["color"], "routed": mode in entry["modes"],
+                "mode": mode if mode in entry["modes"] else "",
+                "last_reconcile": dict(_reconcile_state)}
+        if key == "mt5":
+            def _p():
+                i = MT5Broker().detailed_account_info()
+                return {"account": str(i.get("login") or ""), "detail": i.get("server") or "",
+                        "extra": {"balance": i.get("balance"), "currency": i.get("currency") or "USD"}}
+            ok, ms, err, payload = _probe(_p)
+            out.append({**base, "ok": ok, "latency_ms": ms, "error": err,
+                        "fingerprint": payload.get("account", ""), "detail": payload.get("detail", ""),
+                        "extra": payload.get("extra", {})})
+        elif key == "binance":
+            has_keys = bool(config.BINANCE_EXEC_API_KEY and config.BINANCE_EXEC_API_SECRET)
+            if not has_keys:
+                out.append({**base, "ok": False, "latency_ms": 0,
+                            "error": "no API key configured", "fingerprint": "", "detail": "", "extra": {}})
+            else:
+                def _p():
+                    snap = BinanceBroker()._account_snapshot()
+                    bal = next((b for b in snap.get("balances", []) if b.get("asset") == "USDT"), {})
+                    return {"fingerprint": _fingerprint(config.BINANCE_EXEC_API_KEY),
+                            "detail": BINANCE_BASE.replace("https://", ""),
+                            "extra": {"free_usdt": bal.get("free")}}
+                ok, ms, err, payload = _probe(_p)
+                out.append({**base, "ok": ok, "latency_ms": ms, "error": err,
+                            "fingerprint": payload.get("fingerprint", ""), "detail": payload.get("detail", ""),
+                            "extra": payload.get("extra", {})})
+        elif key == "alpaca":
+            has_keys = bool(config.ALPACA_API_KEY and config.ALPACA_SECRET_KEY)
+            if not has_keys:
+                out.append({**base, "ok": False, "latency_ms": 0,
+                            "error": "no API key configured", "fingerprint": "", "detail": "", "extra": {}})
+            else:
+                def _p():
+                    import portfolio as pf
+                    acct = pf._alpaca_account() or {}
+                    return {"fingerprint": _fingerprint(config.ALPACA_API_KEY),
+                            # detail/extra filled below from the live account
+                            "detail": acct.get("account_number") or acct.get("acct") or "",
+                            "extra": {"status": acct.get("status"), "equity": acct.get("equity")}}
+                ok, ms, err, payload = _probe(_p)
+                out.append({**base, "ok": ok, "latency_ms": ms, "error": err,
+                            "fingerprint": payload.get("fingerprint", ""), "detail": payload.get("detail", ""),
+                            "extra": payload.get("extra", {})})
+    return out
+
+_ACCOUNT_CARD_BUILDERS = {
+    "mt5": lambda: _mt5_account_card(),
+    "binance": lambda: _binance_account_card(),
+    "alpaca": lambda: _alpaca_account_card(),
+}
+
+
+def active_brokers() -> list[dict]:
+    """Registry entries active under the current EXECUTION_BROKER mode."""
+    mode = config.EXECUTION_BROKER
+    return [b for b in BROKER_REGISTRY if mode in b["modes"]]
+
+
+def broker_keys() -> list[str]:
+    """Active journal source keys (what the orders table filters on)."""
+    return [b["key"] for b in active_brokers()]
+
+
+def all_account_cards() -> list[dict]:
+    """One card per active registry account, same layout for all.
+    A broker that fails (terminal down, network) degrades to an error card —
+    never a fake number."""
+    cards: list[dict] = []
+    for b in active_brokers():
+        builder = _ACCOUNT_CARD_BUILDERS.get(b["key"])
+        if builder is None:
+            continue
+        try:
+            cards.append(builder())
+        except Exception as e:
+            cards.append({"broker": b["key"], "name": b["name"], "error": str(e)[:200]})
+    return cards
 
 
 def _map_broker_status(status: str) -> str:

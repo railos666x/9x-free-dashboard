@@ -104,6 +104,47 @@ def backfill(conn, symbol: str, interval: str, days: int) -> int:
     return total
 
 
+def fill_interior_gaps(conn, symbol: str, interval: str) -> int:
+    """
+    Backfill INTERIOR holes (missing bars between two stored bars) from real
+    Binance klines. repair_gaps() only heals the newest edge — an interior
+    hole (e.g. the machine off Aug 19 -> Sep 7) stayed forever, and SMA-50
+    computed across it dragged pre-gap prices into post-gap means, drawing a
+    false diagonal across the chart. Skips symbols Binance doesn't list.
+
+    Returns the number of candles added.
+    """
+    iv_ms = _interval_to_ms(interval)
+    ots = [r[0] for r in conn.execute(
+        "SELECT open_time FROM candles WHERE symbol=? AND interval=? ORDER BY open_time",
+        (symbol, interval)).fetchall()]
+    if len(ots) < 2:
+        return 0
+    total = 0
+    for i in range(len(ots) - 1):
+        d = ots[i + 1] - ots[i]
+        if d <= iv_ms * 3:
+            continue
+        cursor = ots[i] + iv_ms
+        end = ots[i + 1]
+        while cursor < end:
+            try:
+                resp = requests.get(KLINES_URL, params={
+                    "symbol": _api_symbol(symbol), "interval": interval,
+                    "startTime": cursor, "endTime": min(end - 1, cursor + 999 * iv_ms),
+                    "limit": 1000}, timeout=15)
+                resp.raise_for_status()
+                rows = _to_rows(resp.json())
+            except Exception:
+                break  # dead symbol / network — leave the hole, don't spin
+            if not rows:
+                break
+            total += database.upsert_candles(conn, symbol, interval, rows)
+            cursor = rows[-1]["open_time"] + iv_ms
+            time.sleep(0.15)
+    return total
+
+
 def repair_gaps(conn, symbol: str, interval: str, days: int = 7) -> int:
     """
     Check the newest stored candle against wall-clock time and backfill any
@@ -207,6 +248,17 @@ def live_loop(conn, refresh_seconds: int = None) -> None:
                     # Repair any gap left by collector downtime (cheap: only
                     # fires when the newest candle is stale).
                     repair_gaps(conn, symbol, interval, days=3)
+                    # Heal interior holes too, but rarely: only when a hole
+                    # actually exists (single indexed query per symbol),
+                    # since a real fill costs API round-trips.
+                    _hole_check = conn.execute(
+                        "SELECT COUNT(*) FROM ("
+                        "  SELECT open_time - LAG(open_time) OVER (ORDER BY open_time) AS d"
+                        "  FROM candles WHERE symbol=? AND interval=?)"
+                        "WHERE d > ?",
+                        (symbol, interval, _interval_to_ms(interval) * 3)).fetchone()
+                    if _hole_check and _hole_check[0] > 0:
+                        fill_interior_gaps(conn, symbol, interval)
                     rows = fetch_klines(symbol, interval, limit=5)
                     n = database.upsert_candles(conn, symbol, interval, rows)
                     if n and interval in ("1m", "5m", "15m"):

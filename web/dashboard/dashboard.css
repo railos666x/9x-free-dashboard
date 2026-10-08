@@ -417,6 +417,37 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
 
 /* ── My portfolio view ──────────────────────────── */
 .pf-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
+
+/* ── Broker account cards (Portfolio) ─────────────────────────── */
+/* ── Draggable level lines ────────────────────────────────────── */
+.lvl-drag-zone { position: absolute; inset: 0; z-index: 5; }
+.lvl-toast {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(12px);
+  background: #0d1420; color: #e6edf7; border: 1px solid rgba(46,204,113,.45);
+  border-radius: 10px; padding: 9px 16px; font-size: 13px; font-weight: 600;
+  opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; z-index: 999;
+  box-shadow: 0 8px 24px rgba(0,0,0,.5);
+}
+.lvl-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.lvl-toast.err { border-color: rgba(255,99,99,.5); color: #ffb4b4; }
+
+.ba-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+.ba-card { border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 14px 16px; background: rgba(255,255,255,.02); display: flex; flex-direction: column; gap: 10px; }
+.ba-card.ba-error { border-color: rgba(255,99,99,.35); }
+.ba-head { display: flex; align-items: center; gap: 8px; }
+.ba-head .broker-tag { margin-right: 2px; }
+.ba-name { font-weight: 700; font-size: 14px; }
+.ba-type { margin-left: auto; font-size: 11px; color: var(--muted, #8b93a7); }
+.ba-main { display: flex; align-items: baseline; gap: 14px; }
+.ba-balance { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ba-currency { font-size: 12px; color: var(--muted, #8b93a7); }
+.ba-pnl { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ba-pnl.up { color: #2ecc71; }
+.ba-pnl.down { color: #ff6363; }
+.ba-details { display: grid; grid-template-columns: auto 1fr; column-gap: 12px; row-gap: 4px; margin: 0; }
+.ba-details dt { font-size: 11.5px; color: var(--muted, #8b93a7); }
+.ba-details dd { margin: 0; font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
+.ba-error-msg { font-size: 12px; color: #ff9c9c; line-height: 1.45; }
 .pf-grid .balance { min-width: 0; }
 
 /* ── Bots view ──────────────────────────────────── */
@@ -607,6 +638,54 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
 .badge-short { background: rgba(246,70,93,.14); color: var(--red); }
 .badge-hold  { background: rgba(152,162,179,.12); color: var(--muted); }
 
+/* Venue-protection badges (2026-10-06): OCO = exchange bracket resting,
+   MT5 SL/TP = attached at the broker, SW ONLY = journal levels that die
+   with the bot, NAKED = nothing at all. */
+.prot-badge {
+  display: inline-flex; align-items: center;
+  padding: 3px 8px; border-radius: 6px;
+  font-size: 10px; font-weight: 700; letter-spacing: .5px; white-space: nowrap;
+}
+.prot-venue { background: rgba(14,203,129,.14); color: var(--green); border: 1px solid rgba(14,203,129,.35); }
+.prot-soft  { background: rgba(255,170,0,.12);  color: #ffaa00;     border: 1px solid rgba(255,170,0,.35); }
+.prot-none  { background: rgba(246,70,93,.14);  color: var(--red);  border: 1px solid rgba(246,70,93,.35); }
+
+/* ── Real-time alert layer (2026-10-06) ────────────────────────────── */
+.alert-banner {
+  position: sticky; top: 0; z-index: 90;
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 10px 16px; margin-bottom: 4px;
+  background: rgba(246,70,93,.12); border: 1px solid rgba(246,70,93,.4);
+  border-left: 4px solid var(--red); border-radius: 10px;
+  color: var(--red); font-size: 13px; font-weight: 600;
+}
+.alert-banner.guard { background: rgba(255,170,0,.10); border-color: rgba(255,170,0,.45); border-left-color: #ffaa00; color: #ffaa00; }
+.alert-banner .ab-icon { font-size: 18px; line-height: 1.2; }
+.alert-banner .ab-body { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.alert-banner .ab-line b { font-weight: 800; }
+.alert-banner .ab-dismiss {
+  background: transparent; border: 1px solid currentColor; color: inherit;
+  border-radius: 6px; padding: 3px 10px; font-size: 11px; font-weight: 700;
+  cursor: pointer; opacity: .8;
+}
+.alert-banner .ab-dismiss:hover { opacity: 1; }
+
+.toast-host {
+  position: fixed; right: 18px; bottom: 18px; z-index: 95;
+  display: flex; flex-direction: column; gap: 8px; max-width: 380px;
+}
+.toast {
+  padding: 10px 14px; border-radius: 10px; font-size: 12.5px; font-weight: 600;
+  background: var(--surface-2, #171a22); color: var(--text, #e6e9f0);
+  border: 1px solid var(--border, #24262e);
+  box-shadow: 0 8px 24px rgba(0,0,0,.35);
+  animation: toast-in .25s ease;
+}
+.toast-warn { border-left: 4px solid #ffaa00; color: #ffcf7d; }
+.toast-info { border-left: 4px solid var(--green, #2ecc8f); }
+.toast.out { opacity: 0; transform: translateY(6px); transition: all .35s ease; }
+@keyframes toast-in { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: none; } }
+
 .sig-levels-row {
   display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px;
   font-family: "Consolas", "Courier New", monospace; font-size: 12px;
@@ -714,7 +793,7 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
 /* ── Orders view: profit-by-currency donut (dual: MT5 + Binance) ── */
 .dual-donut-wrap {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 12px;
   margin-bottom: 12px;
 }
@@ -735,6 +814,7 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
 }
 .dot-mt5 { background: var(--accent); box-shadow: 0 0 4px rgba(14,203,129,.5); }
 .dot-binance { background: var(--gold); box-shadow: 0 0 4px rgba(245,181,10,.5); }
+.dot-alpaca { background: #ffd03e; box-shadow: 0 0 4px rgba(255,208,62,.5); }
 .pnl-donut { height: 220px; min-height: 180px; }
 .pnl-breakdown {
   display: flex; flex-direction: column; gap: 6px;
@@ -746,6 +826,10 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
   border-bottom: 1px dashed var(--border);
 }
 .pnl-row:last-child { border-bottom: none; }
+
+/* Broker name text next to the letter tag (closed trades, breakdown list) */
+.lt-broker-name { font-size: 10.5px; color: var(--muted, #8b93a7); white-space: nowrap; }
+.closed-trade .lt-broker-name { width: auto; }
 .pnl-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
 .pnl-row .sym { width: 74px; font-weight: 600; }
 .pnl-bar-wrap {
@@ -769,6 +853,10 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
 .tag-binance {
   background: rgba(245,181,10,.12); color: var(--gold);
   border: 1px solid rgba(245,181,10,.3);
+}
+.tag-alpaca {
+  background: rgba(255,208,62,.12); color: #ffd03e;
+  border: 1px solid rgba(255,208,62,.3);
 }
 
 /* Why column tooltip */
@@ -975,6 +1063,17 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
 }
 .orders-table td.up { color: var(--green); font-weight: 600; }
 .orders-table td.down { color: var(--red); font-weight: 600; }
+/* Numeric columns align right, monospaced digits, consistent decimals */
+.orders-table th:nth-child(3), .orders-table th:nth-child(4),
+.orders-table th:nth-child(5), .orders-table th:nth-child(6),
+.orders-table th:nth-child(7), .orders-table th:nth-child(8) { text-align: right; }
+.orders-table td.num {
+  text-align: right;
+  font-family: var(--mono, monospace);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.orders-table td.time-cell { white-space: nowrap; font-size: 12px; }
 .orders-table td.why-cell {
   max-width: 300px;
   font-size: 12px;
@@ -984,10 +1083,60 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
   white-space: nowrap;
 }
 .orders-table td.spark-cell { padding: 4px 10px; }
+/* Wide journal table scrolls in its own lane — never drags the whole card */
+.crypto-table-card .card-head { flex-wrap: wrap; }
+.crypto-table-card .assets-head-right { white-space: nowrap; }
+/* Reconcile is a labeled pill, not the 34px icon square icon-btn defaults to */
+#btnReconcile {
+  width: auto;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.table-scroll .orders-table { min-width: 1080px; }
+.table-scroll .orders-table th {
+  position: sticky; top: 0;
+  background: var(--surface-1, var(--card2, #10151d));
+  z-index: 2;
+}
 .spark { display: block; }
+/* Professional stat-card strip for the journal summary */
 .journal-summary {
-  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
-  font-size: 13px; padding: 8px 2px 12px;
+  display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap;
+  padding: 12px 2px 14px;
+}
+.jstat {
+  display: flex; flex-direction: column; gap: 3px;
+  min-width: 118px;
+  padding: 8px 14px;
+  background: var(--surface, var(--card2, #141a24));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.jstat-label {
+  font-size: 10px; font-weight: 600;
+  letter-spacing: .8px; text-transform: uppercase;
+  color: var(--muted);
+}
+.jstat-value {
+  font-family: var(--mono, monospace);
+  font-size: 16px; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.jstat-value.up { color: var(--green); }
+.jstat-value.down { color: var(--red); }
+.jstat-reconcile {
+  display: none; /* reconcile moved to the card header (#btnReconcile) */
 }
 .journal-summary b.up { color: var(--green); }
 .journal-summary b.down { color: var(--red); }
@@ -1083,3 +1232,221 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
     transition-duration: .001ms !important;
   }
 }
+
+/* ── Watch-only rows (assets the system knows but the bot can't trade) ── */
+tr.watch-row { opacity: .55; }
+tr.watch-row:hover { opacity: .8; }
+.watch-badge {
+  font: 600 9px/1 var(--mono, monospace);
+  letter-spacing: .5px;
+  text-transform: uppercase;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 5px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+/* ── Connection diagnostics (broker health rows) ──────────────────── */
+.bh-list { display: flex; flex-direction: column; }
+.bh-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+  flex-wrap: wrap;
+}
+.bh-row:last-child { border-bottom: none; }
+.bh-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+.bh-ok { background: var(--green, #0ecb81); box-shadow: 0 0 6px rgba(14,203,129,.7); }
+.bh-bad { background: var(--red, #f6465d); box-shadow: 0 0 6px rgba(246,70,93,.7); }
+.bh-name { font-weight: 600; min-width: 130px; display: inline-flex; align-items: center; gap: 7px; }
+.bh-fp { font-family: var(--mono, monospace); color: var(--text); }
+.bh-lat { margin-left: auto; font-family: var(--mono, monospace); color: var(--muted); min-width: 64px; text-align: right; }
+.bh-rec { font-size: 12px; color: var(--muted); }
+.bh-rec-bad { color: var(--red, #f6465d); font-weight: 600; }
+.bh-rec-never { color: var(--gold, #f0b90b); }
+.bh-err { flex-basis: 100%; color: var(--red, #f6465d); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Forex view (FX mastery layer) ────────────────────────────────── */
+.fx-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .fx-grid { grid-template-columns: 1fr; } }
+.fx-sessions { display: flex; flex-wrap: wrap; gap: 8px; }
+.fx-session-pill { border: 1px solid rgba(255,255,255,.08); border-radius: 10px; padding: 6px 12px; font-size: 12px; background: rgba(255,255,255,.02); color: var(--muted, #8b93a7); }
+.fx-session-pill.active { border-color: var(--accent, #3b82f6); color: var(--text, #e8ecf3); background: rgba(59,130,246,.12); font-weight: 600; }
+.fx-usd { margin-top: 10px; font-size: 13px; }
+.fx-pos { color: var(--green, #22c55e); }
+.fx-neg { color: var(--red, #f6465d); }
+.fx-strength-body { display: flex; flex-direction: column; gap: 8px; }
+.fx-strength-row { display: grid; grid-template-columns: 44px 1fr 64px; align-items: center; gap: 10px; font-size: 13px; }
+.fx-bar { height: 8px; border-radius: 4px; background: rgba(255,255,255,.06); overflow: hidden; }
+.fx-bar-fill { height: 100%; border-radius: 4px; }
+.fx-bar-pos { background: var(--green, #22c55e); }
+.fx-bar-neg { background: var(--red, #f6465d); }
+.fx-warn { margin-top: 10px; font-size: 12px; color: var(--gold, #f0b90b); }
+
+/* ── Flow strip (2026-10-07): the trader's "is the bot doing anything" line.
+   Pinned under the topbar on every view — answers "orders are going or not
+   / is the loop alive" without hunting through cards. ── */
+.flow-strip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  max-width: 1560px;
+  margin: 10px auto 0;
+  padding: 0 20px;
+}
+.fs-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted, #8a94a6);
+  white-space: nowrap;
+}
+.fs-item b { color: var(--text, #e6e9f0); font-weight: 600; }
+.fs-item .fs-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted, #596070);
+  flex: none;
+}
+.fs-item .fs-dot.live { background: #2ecc8f; box-shadow: 0 0 6px rgba(46, 204, 143, .5); }
+.fs-item .fs-dot.stale { background: #f4a94a; }
+.fs-item .fs-dot.down { background: #ff5c5c; }
+.fs-jump {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: #38bdf8;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.fs-jump:hover { background: rgba(56, 189, 248, .12); }
+
+/* Backtest data-availability note (2026-10-07): shown when the engine had
+   to fall back to 1h candles (macro symbols) or found no data at all. */
+.bt-note {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border: 1px solid rgba(244, 169, 74, .35);
+  background: rgba(244, 169, 74, .08);
+  border-radius: 8px;
+  color: #f4a94a;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* ── Manual trading panel + per-row Close (2026-10-07) ──────────────
+   A trader must be able to ACT from the dashboard, not only watch the AI
+   trade. One row of fields, a side toggle, a dry-run gate, then Place.
+   Close lives on each open journal row (delegated click). ── */
+.manual-card { border-left: 2px solid rgba(14, 203, 129, .45); }
+.mt-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px 12px;
+  align-items: end;
+}
+.mt-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mt-field .muted { text-transform: none; letter-spacing: 0; font-size: 10px; }
+/* The asset field owns its own row; the five numeric controls then share the
+   row below instead of wrapping (one row = scannable in a glance). */
+.mt-field-wide { grid-column: 1 / -1; }
+.mt-field input[type="number"],
+.mt-field input[type="text"] {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  padding: 8px 10px;
+  outline: none;
+  transition: border-color .15s ease;
+}
+.mt-field input:hover { border-color: var(--border-strong); }
+.mt-field input:focus { border-color: var(--accent); }
+.mt-side {
+  display: flex;
+  gap: 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px;
+}
+.mt-side-btn {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 6px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.mt-side-btn:hover { color: var(--text); }
+.mt-side-btn.active[data-side="LONG"] { background: rgba(14, 203, 129, .16); color: var(--green); }
+.mt-side-btn.active[data-side="SHORT"] { background: rgba(246, 70, 93, .16); color: var(--red); }
+.mt-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+.mt-dry {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.mt-dry input { width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer; }
+.mt-msg { font-size: 12px; line-height: 1.4; }
+.mt-msg.mt-ok { color: var(--green); }
+.mt-msg.mt-err { color: var(--red); }
+.mt-note {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.mt-note b { color: var(--text); font-weight: 600; }
+
+/* Per-row exit — only rendered for filled/open positions. */
+.orders-table th:last-child, .orders-table td.act-cell { text-align: right; }
+.btn-close-row {
+  border: 1px solid rgba(246, 70, 93, .35);
+  background: rgba(246, 70, 93, .10);
+  color: var(--red);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .15s ease, transform .1s ease;
+}
+.btn-close-row:hover { background: rgba(246, 70, 93, .20); transform: translateY(-1px); }
+.btn-close-row:active { transform: translateY(0); }
+.btn-close-row:disabled { opacity: .55; cursor: default; transform: none; }
