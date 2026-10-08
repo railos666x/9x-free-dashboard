@@ -7,6 +7,72 @@ agent must be appended here.
 
 ---
 
+## 2026-10-08 (08:20 UTC) — "AI asks, I answer": side-flip bug fixed, AI opinions surfaced with Take this, wrong-side bracket refused client-side
+
+User question: "my manual i meant to cancel out ai trades or placing trades on
+signal of ai asking — trade is possible here?" Answer, from the code:
+- **Cancel out AI trades: YES, today.** The per-row `Close` button exits any
+  bot-opened position through `execution.close_position` (bracket stood down,
+  PnL realized, exit journaled as `manual`). The row does not care who opened it.
+- **Place on an AI signal: it was only half there.** The AI's opinion was fed
+  straight into execution with NO approval concept anywhere in the codebase, and
+  the opinions themselves were never surfaced — a trader could not see what the
+  AI wanted, let alone take it. That gap is now closed (below).
+
+### A side-flip bug found while answering it (REPRODUCED live)
+- The LONG/SHORT buttons sat inside a `<label>`. A label activates its FIRST
+  labelable descendant — the LONG button — so a click on the caption or any
+  label chrome fired a click on LONG. Reproduced in the live tab: select SHORT,
+  click the label area, and the panel silently went back to LONG.
+- In the user's own screenshot this is exactly the state on screen: a SHORT
+  level layout (entry 4,200 / SL 4,270) with **LONG highlighted** and a "Dry run
+  OK — SHORT" line above it. The server would have refused it (400), but on a
+  symbol where the levels are valid both ways it would have placed the WRONG
+  DIRECTION.
+- Fixes: the side control is no longer inside a `<label>` (now a `div` with a
+  caption and `role="radiogroup"`), one `_manSetSide()` owns the toggle + aria +
+  button label, and the Place button **names the side it will send**
+  ("Place SHORT order").
+- **Client-side bracket check** mirroring the server rule plus the half the
+  server does not check: a stop on the wrong side of the entry inverts the risk
+  of the trade, and a target behind the entry books a loss as a win. Both are now
+  refused before a request is made — verified: `posted: 0` requests, message
+  "A SHORT stop must sit ABOVE the entry — 4,100 is on the wrong side of 4,200.
+  Nothing sent."
+
+### AI signals — what the bot asked for ([backend/bot.py](backend/bot.py), [web/dashboard/dashboard.js](web/dashboard/dashboard.js))
+- `bot.run_once` now records every AI opinion of the cycle (`summary["opinions"]`,
+  plus `opinions_held` / `opinions_executed`) with the direction, confidence, the
+  levels the AI proposed, the 6-layer scores (confirm / DXY / SMC / regime /
+  session) and **the gate that decided its fate** (`data`, `loss_guard`,
+  `circuit_breaker`, `not_on_broker`, `no_short_on_spot`, `cross_source`, …).
+  It rides the existing summary, so `/api/bot/status` carries it with **no extra
+  LLM call**.
+- New "AI signals — what the bot asked for" card in the Orders view: one row per
+  opinion, the gate in plain words, and a **Take this** button that loads the AI's
+  own symbol, side and levels into the manual panel — the trader reviews and
+  presses Place, through the same execution path. Rows the bot already took are
+  dimmed and labelled "taken by the bot"; stale cycles (>2× loop cadence) get an
+  explicit warning, because an AI opinion from 40 minutes ago is not a signal.
+- Verified with AI-shaped data end-to-end: `XAU/USD ▲ LONG 78% entry 4,180 ·
+  SL 4,140 · TP 4,280 confirm 4 DXY 2 SMC 3 bullish london [data gate] Take this`;
+  the EUR/USD row (executed) got no Take button; clicking Take on the gold row
+  set picker=XAU/USD, side=LONG, label="Place LONG order", entry/SL/TP = the AI's
+  levels, with the message "Loaded the AI's LONG XAU/USD (confidence 78%) …".
+- **No execution-path change**: the bot still auto-executes exactly as before and
+  no config default moved. An approval gate (AI proposes → human confirms before
+  execution) is deliberately NOT switched on unilaterally — it would stop the bot
+  from trading, which is the owner's call.
+
+### Operational readout from the same cycle (dry run, no orders sent)
+- Loop LIVE, loss guard clear, circuit breaker level 1 (cautious, −25% risk,
+  3 consecutive losses), MT5 + Binance testnet + Alpaca all healthy.
+- **The AI had no opinion on any symbol this cycle**: 111 `no_signal_ai` (HOLD —
+  quiet tape) + 49 `not_on_broker`. The 49 are indices (DE40, JP225, UK100…),
+  exotic crosses (USD/CZK, USD/DKK, USD/HUF, USD/ILS) and US ETFs (SPY, QQQ, GLD,
+  SLV, TLT, IWM, DIA, HYG) — **not** gold or the majors, which are tradable.
+- Suite: **151 passed**; `node --check` clean; cache tag `?v=20261008g`.
+
 ## 2026-10-08 (07:35 UTC) — Donut hid a closed loss behind an open winner: realized and unrealized are never netted again
 
 User report: "closed show a losing trade but donut dont show it". Reproduced and

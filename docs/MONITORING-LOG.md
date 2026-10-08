@@ -1032,3 +1032,78 @@ nothing in the card pointed at −104.75.
   one was micro-slice readability). Both were "the chart disagreed with the list"
   class bugs, which is why the reconciliation line now spells out what the ring
   contains instead of leaving it to be inferred.
+
+---
+
+## 2026-10-08 08:20 UTC — "AI asks, I answer": side-flip bug fixed, AI opinions surfaced, wrong-side bracket refused
+
+### Question answered (and one half of it was missing)
+
+The user asked whether manual trading can cancel out AI trades or place trades on
+an AI signal. From the code:
+
+| Ask | State |
+|---|---|
+| Cancel/offset an AI trade | **Already possible** — the per-row Close button exits any bot-opened position via `execution.close_position` (bracket stood down, PnL realized, journaled as `manual`) |
+| Place a trade because the AI asked | **Half missing** — there is no approval concept anywhere in the codebase, and the AI's opinions were never surfaced, so the trader could not see what the AI wanted |
+
+### Bug reproduced while answering it: the side could flip itself
+
+The LONG/SHORT buttons lived inside a `<label>`, and a label activates its first
+labelable descendant — the LONG button. Reproduced in the live tab: select SHORT,
+click the label chrome, and the panel silently returned to LONG.
+
+The user's own screenshot is that exact state: a SHORT level layout (entry 4,200 /
+SL 4,270) with **LONG highlighted**, and "Dry run OK — SHORT" above it. The server
+would have rejected it with a 400, but on any symbol where the levels are valid
+both ways it would have placed the **wrong direction**.
+
+Fixed three ways: the control is out of the `<label>` (`div` + caption +
+`role="radiogroup"`), one `_manSetSide()` owns the toggle + aria + button label,
+and the Place button states the side it will send ("Place SHORT order"). Verified:
+after selecting SHORT, clicking the caption and elsewhere in the card leaves the
+side SHORT.
+
+### New: AI signals card (read-only, no execution-path change)
+
+`bot.run_once` now records every AI opinion of the cycle with the gate that
+decided its fate, and the Orders view renders it with a **Take this** button that
+loads the AI's symbol, side and levels into the manual panel for review. Rows the
+bot already took are dimmed ("taken by the bot"); cycles older than 2× the loop
+cadence display a staleness warning.
+
+Verified with AI-shaped data end-to-end (3 opinions, 1 taken / 2 held):
+`XAU/USD ▲ LONG 78% entry 4,180 · SL 4,140 · TP 4,280 confirm 4 DXY 2 SMC 3
+bullish london [data gate — candles stale or thin] Take this`. Clicking Take set
+picker=XAU/USD, side=LONG, button "Place LONG order", entry/SL/TP to the AI's own
+levels. The already-executed EUR/USD row correctly had no Take button.
+
+**Not enabled:** an approval gate that would hold the AI's orders for a human
+click. That stops the bot from trading, so it stays the owner's decision — the
+intelligence is surfaced, execution behaviour is untouched.
+
+### Risk controls tightened
+
+A stop on the wrong side of the entry inverts the risk of the trade and a target
+behind the entry books a loss as a win. Both are now refused **before** any
+request leaves the browser (the server only checked the stop):
+"A SHORT stop must sit ABOVE the entry — 4,100 is on the wrong side of 4,200.
+Nothing sent." — confirmed with a fetch counter: **0 requests posted**.
+
+### Cycle readout (dry run — no orders sent)
+
+- Loop LIVE · loss guard clear · circuit breaker level 1 (cautious, −25% risk,
+  3 consecutive losses) · MT5 (Exness-MT5Trial16) + Binance testnet + Alpaca
+  (PA3SN93M95YB) all healthy.
+- **The AI had no opinion on any symbol this cycle**: 111 `no_signal_ai` (HOLD on
+  a quiet tape) + 49 `not_on_broker` = the whole universe held in 0.01s from the
+  cached market analysis. Nothing was wrong; the tape was quiet.
+- The 49 untradable symbols are indices (AU200/AUD, DE40/EUR, JP225/JPY, UK100/GBP,
+  US30/USD, US500/USD…), exotic crosses (USD/CZK, USD/DKK, USD/HKD, USD/HUF,
+  USD/ILS) and US ETFs (SPY, QQQ, GLD, SLV, TLT, IWM, DIA, HYG). **Gold, oil and
+  the majors are NOT in that list** — XAU/USD, EUR/USD, GBP/JPY and WTI/USD are
+  tradable, so the gold/FX sleeve is unaffected.
+
+### Suite
+
+151 passed; `node --check` clean; cache tag `?v=20261008g`.

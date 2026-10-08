@@ -370,6 +370,7 @@ function renderBotStatus(s) {
     const ooEl = $("fsOpenOrders");
     if (ooEl) ooEl.textContent = String(s.open_orders ?? 0);
   }
+  renderAiSignals(s);
 
   const body = $("botStatusBody");
   if (!body) return;
@@ -1120,6 +1121,110 @@ function renderOrders(orders, summary) {
   }).join("");
 }
 
+/* ── AI signals: what the bot asked for this cycle ────────────────
+   The AI decides and the gates dispose. Every row is the AI's OWN opinion
+   for one symbol (direction, confidence, the levels it proposed, the
+   6-layer scores) plus the gate that decided its fate, so a trader can TAKE
+   a trade the AI asked for through the same manual/execution path. */
+const AI_GATE_LABELS = {
+  no_signal_ai: "AI had no opinion (HOLD)",
+  data: "data gate — candles stale or thin",
+  loss_guard: "loss guard blocked new entries",
+  circuit_breaker: "circuit breaker at full stop",
+  not_on_broker: "not tradable on this broker",
+  no_short_on_spot: "spot broker cannot short",
+  cross_source: "cross-source price disagreed",
+  intent: "intent re-gate failed",
+  session: "session filter",
+  caps: "exposure caps reached",
+  cooldown: "re-entry cooldown",
+  duplicate: "already open",
+};
+
+let _lastAiSignals = [];
+
+function _aiGateLabel(o) {
+  if (o.status === "executed") return "taken by the bot";
+  if (!o.gate) return "available now";
+  return AI_GATE_LABELS[o.gate] || o.gate;
+}
+
+function renderAiSignals(s) {
+  const box = $("aiSigBody");
+  const meta = $("aiSigMeta");
+  if (!box) return;
+  const c = s && s.last_cycle;
+  const ops = (c && Array.isArray(c.opinions)) ? c.opinions : null;
+  if (!ops) {
+    if (meta) meta.textContent = "no cycle summary yet";
+    box.innerHTML = '<div class="muted">Waiting for the bot to finish a cycle — the AI\'s opinions for every symbol appear here.</div>';
+    return;
+  }
+  _lastAiSignals = ops;
+  const age = s.last_run_at ? (Date.now() / 1000 - s.last_run_at) : Infinity;
+  const stale = age > 2 * (s.loop_seconds || 300);
+  if (meta) {
+    meta.textContent = ops.length
+      ? `${ops.length} opinion${ops.length === 1 ? "" : "s"} · ${c.opinions_executed || 0} taken · ${c.opinions_held || 0} held · as of ${_ago(s.last_run_at)}`
+      : `no AI opinion this cycle · as of ${_ago(s.last_run_at)}`;
+  }
+  if (!ops.length) {
+    box.innerHTML = '<div class="muted">The AI had no opinion above its confidence floor this cycle — quiet by design, nothing to take.</div>';
+    return;
+  }
+  box.innerHTML = (stale
+      ? `<div class="ai-sig-stale">This summary is ${_ago(s.last_run_at)} old — the proposed levels may have moved since. Run a cycle (Dry test) to refresh before taking one.</div>`
+      : "")
+    + ops.map((o, i) => {
+      const long = o.direction === "LONG";
+      const held = o.status !== "executed";
+      const lv = [
+        o.entry ? `entry ${fmtPrice(o.entry)}` : "market entry",
+        o.stop_loss ? `SL ${fmtPrice(o.stop_loss)}`
+          : (o.stop_loss_pct ? `SL ≈−${fmt(o.stop_loss_pct * 100, 1)}%` : "SL from ATR"),
+        o.take_profit ? `TP ${fmtPrice(o.take_profit)}`
+          : (o.take_profit_pct ? `TP ≈+${fmt(o.take_profit_pct * 100, 1)}%` : "TP from ATR"),
+      ].join(" · ");
+      const chips = [
+        o.confirm_score ? `confirm ${o.confirm_score}` : null,
+        o.dxy_score ? `DXY ${o.dxy_score}` : null,
+        o.smc_score ? `SMC ${o.smc_score}` : null,
+        o.regime || null, o.session || null,
+      ].filter(Boolean).map((t) => `<span class="ai-chip">${esc(t)}</span>`).join("");
+      const why = (o.reasons || []).slice(0, 2).map((r) => esc(String(r).slice(0, 80))).join(" · ");
+      const full = esc((o.reasons || []).join(" · "));
+      return `<div class="ai-sig-row${held ? "" : " ai-sig-done"}">
+        <span class="sym">${symOf(o.symbol)}</span>
+        <span class="signal-badge ${long ? "badge-long" : "badge-short"}">${long ? "▲" : "▼"} ${esc(o.direction)}</span>
+        <span class="ai-sig-conf" title="AI confidence">${fmt(o.confidence, 0)}%</span>
+        <span class="ai-sig-lv">${lv}</span>
+        <span class="ai-sig-chips">${chips}</span>
+        <span class="ai-sig-gate ${held ? "held" : "taken"}">${esc(_aiGateLabel(o))}</span>
+        ${held ? `<button type="button" class="btn-take" data-take="${i}" title="Load this trade into the manual panel">Take this</button>` : ""}
+        ${why ? `<span class="ai-sig-why muted" title="${full}">${why}</span>` : ""}
+      </div>`;
+    }).join("");
+}
+
+// Load an AI signal into the manual panel: same symbol, side and levels the AI
+// proposed. The trader still presses Place — the AI's opinion is an input to a
+// decision, not a licence to fire.
+function takeAiSignal(i) {
+  const o = _lastAiSignals[i];
+  if (!o) return;
+  const card = document.querySelector(".manual-card");
+  if (card) card.scrollIntoView({ block: "center", behavior: "smooth" });
+  if (manPicker) manPicker.select(o.symbol);
+  _manSetSide(o.direction);
+  const set = (id, v) => { const el = $(id); if (el) el.value = (v == null || v === "") ? "" : String(v); };
+  set("manEntry", o.entry);
+  set("manSL", o.stop_loss);
+  set("manTP", o.take_profit);
+  set("manQty", "");
+  _manSetMsg(`Loaded the AI's ${o.direction} ${symOf(o.symbol)} (confidence ${fmt(o.confidence, 0)}%)`
+    + `${o.entry ? ` at ${fmtPrice(o.entry)}` : " at market"} — check the levels, then place.`, "ok");
+}
+
 /* ── Manual trading ──────────────────────────────────────────────
    A trader must be able to ACT from the dashboard, not only watch the AI
    trade. POST /api/manual/order and POST /api/manual/close/{id} ride the
@@ -1177,14 +1282,38 @@ function _rowActionHtml(o) {
     title="Close ${esc(symOf(o.symbol))} #${o.id} at market through the bot's close path">Close</button>`;
 }
 
+/* One place that owns the selected side: the toggle, its aria state and the
+   Place button's own label move together. The button saying "Place SHORT
+   order" is the guard against the one bug that costs real money here — a
+   panel that LOOKS long while the request is short. */
+function _manSetSide(side) {
+  _manSide = side === "SHORT" ? "SHORT" : "LONG";
+  const wrap = $("manSide");
+  if (wrap) {
+    wrap.querySelectorAll(".mt-side-btn").forEach((x) => {
+      const on = x.dataset.side === _manSide;
+      x.classList.toggle("active", on);
+      x.setAttribute("aria-checked", on ? "true" : "false");
+    });
+  }
+  const lbl = $("manPlaceLabel");
+  if (lbl) lbl.textContent = `Place ${_manSide} order`;
+}
+
 function bindManualTrade() {
   const sideWrap = $("manSide");
   if (sideWrap) {
     sideWrap.addEventListener("click", (e) => {
       const b = e.target.closest(".mt-side-btn");
-      if (!b) return;
-      _manSide = b.dataset.side;
-      sideWrap.querySelectorAll(".mt-side-btn").forEach((x) => x.classList.toggle("active", x === b));
+      if (b) _manSetSide(b.dataset.side);
+    });
+  }
+  // "Take this" on an AI signal loads it into this panel.
+  const aiBody = $("aiSigBody");
+  if (aiBody) {
+    aiBody.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-take]");
+      if (b) takeAiSignal(Number(b.dataset.take));
     });
   }
   // Close buttons live inside rows that re-render every poll — delegate.
@@ -1218,6 +1347,29 @@ async function placeManualOrder() {
     takeProfit: _manNum("manTP"),
     dry,
   };
+  // Mirror the server's bracket rule BEFORE the round trip, and cover the
+  // half it does not check: a stop on the wrong side of the entry silently
+  // inverts the risk of the trade, and a take-profit behind the entry books
+  // a "win" at a loss. The button label and this check are the two places
+  // the side can be contradicted, and both are loud on purpose.
+  if (payload.entry && payload.stopLoss) {
+    const wrong = _manSide === "LONG" ? payload.stopLoss >= payload.entry
+                                       : payload.stopLoss <= payload.entry;
+    if (wrong) {
+      _manSetMsg(`A ${_manSide} stop must sit ${_manSide === "LONG" ? "BELOW" : "ABOVE"} the entry — `
+        + `${fmtPrice(payload.stopLoss)} is on the wrong side of ${fmtPrice(payload.entry)}. Nothing sent.`, "err");
+      return;
+    }
+  }
+  if (payload.entry && payload.takeProfit) {
+    const wrong = _manSide === "LONG" ? payload.takeProfit <= payload.entry
+                                       : payload.takeProfit >= payload.entry;
+    if (wrong) {
+      _manSetMsg(`A ${_manSide} target must sit ${_manSide === "LONG" ? "ABOVE" : "BELOW"} the entry — `
+        + `${fmtPrice(payload.takeProfit)} would bank a ${_manSide} loss as a win. Nothing sent.`, "err");
+      return;
+    }
+  }
   if (btn) { btn.disabled = true; }   // double-click must not double-place
   _manSetMsg(dry ? `Checking sizing for ${symOf(symbol)} (dry run)…` : `Placing ${_manSide} ${symOf(symbol)}…`);
   try {

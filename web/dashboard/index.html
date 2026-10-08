@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>cryptoautomation · Dashboard</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261008f" />
+<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261008g" />
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
@@ -418,6 +418,20 @@
           </section>
         </div>
 
+        <!-- ═══ AI signals: what the bot asked for this cycle ═══
+             The bot executes on its own; this card shows the AI's OWN
+             opinion per symbol and the gate that decided its fate, so a
+             trader can TAKE a trade the AI wanted but the gates held (or
+             one the bot already took, for reference) through exactly the
+             same execution path as any manual order. -->
+        <section class="card ai-signals-card" style="margin-top:16px;">
+          <div class="card-head">
+            <div class="card-title">AI signals — what the bot asked for</div>
+            <span class="muted" id="aiSigMeta">waiting for a cycle…</span>
+          </div>
+          <div id="aiSigBody" class="ai-sig-body"><div class="muted">No cycle summary yet.</div></div>
+        </section>
+
         <!-- ═══ Manual trading: place / close from the dashboard ═══
              Posts to /api/manual/order + /api/manual/close/{id}. Both ride
              the bot's own execution path server-side, so a manual order gets
@@ -442,12 +456,18 @@
                 <div class="ap-quick" id="manQuick"></div>
               </div>
             </label>
-            <label class="mt-field">Side
-              <div class="mt-side" id="manSide" role="group" aria-label="Order side">
-                <button type="button" class="mt-side-btn active" data-side="LONG">LONG</button>
-                <button type="button" class="mt-side-btn" data-side="SHORT">SHORT</button>
+            <!-- NOT a <label> (2026-10-08): a label activates its first
+                 labelable descendant, so clicking the "SIDE" caption or any
+                 label chrome fired a click on the LONG button and silently
+                 flipped the side back — reproduced live, and it is exactly
+                 the state a trader is about to place an order in. -->
+            <div class="mt-field">
+              <span class="mt-caption">Side</span>
+              <div class="mt-side" id="manSide" role="radiogroup" aria-label="Order side">
+                <button type="button" class="mt-side-btn active" data-side="LONG" role="radio" aria-checked="true">LONG</button>
+                <button type="button" class="mt-side-btn" data-side="SHORT" role="radio" aria-checked="false">SHORT</button>
               </div>
-            </label>
+            </div>
             <label class="mt-field">Qty <span class="muted">blank = risk size</span>
               <input id="manQty" type="number" min="0" step="any" placeholder="auto" inputmode="decimal" />
             </label>
@@ -465,8 +485,10 @@
             <label class="mt-dry" title="Preview the risk sizing and fees without sending anything to a broker">
               <input type="checkbox" id="manDry" /> Dry run (no broker order)
             </label>
+            <!-- The action names the side: the button can never disagree with
+                 the toggle about what is about to be sent. -->
             <button class="btn-warn" id="btnPlaceManual" onclick="placeManualOrder()">
-              <svg class="ic"><use href="#i-play"/></svg> Place order
+              <svg class="ic"><use href="#i-play"/></svg> <span id="manPlaceLabel">Place order</span>
             </button>
             <span class="mt-msg muted" id="manMsg" role="status" aria-live="polite"></span>
           </div>
@@ -718,6 +740,6 @@
   </div>
 </div>
 
-<script src="/dash-assets/dashboard.js?v=20261008f"></script>
+<script src="/dash-assets/dashboard.js?v=20261008g"></script>
 </body>
 </html>

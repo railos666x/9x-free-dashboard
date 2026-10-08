@@ -1473,6 +1473,55 @@ tr.watch-row:hover { opacity: .8; }
 }
 .mt-note b { color: var(--text); font-weight: 600; }
 
+/* ── AI signals: what the bot asked for ────────────────────────────
+   One row per AI opinion of the last cycle, with the gate that decided its
+   fate and a way to take the trade the AI wanted. */
+.mt-caption {
+  font-size: 11px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted);
+}
+.ai-sig-body { display: flex; flex-direction: column; gap: 8px; }
+.ai-sig-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-size: 12px;
+}
+.ai-sig-row.ai-sig-done { opacity: .6; }
+.ai-sig-row .sym { font-weight: 700; min-width: 58px; }
+.ai-sig-conf { font-weight: 700; font-variant-numeric: tabular-nums; }
+.ai-sig-lv { color: var(--muted); font-variant-numeric: tabular-nums; }
+.ai-sig-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.ai-chip {
+  font-size: 10px; padding: 1px 6px; border-radius: 5px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.ai-sig-gate {
+  font-size: 10.5px; padding: 2px 7px; border-radius: 6px;
+  border: 1px solid var(--border-strong); color: var(--muted);
+}
+.ai-sig-gate.held { border-color: rgba(244,169,74,.45); color: #f4a94a; }
+.ai-sig-gate.taken { border-color: rgba(14,203,129,.45); color: var(--green); }
+.ai-sig-why { flex-basis: 100%; font-size: 10.5px; line-height: 1.45; }
+.ai-sig-stale {
+  padding: 8px 12px; margin-bottom: 8px;
+  border: 1px solid rgba(244,169,74,.35);
+  background: rgba(244,169,74,.08);
+  border-radius: 8px; color: #f4a94a; font-size: 11.5px; line-height: 1.5;
+}
+.btn-take {
+  margin-left: auto;
+  border: 1px solid rgba(56,189,248,.45);
+  background: rgba(56,189,248,.12);
+  color: #38bdf8;
+  font-size: 11px; font-weight: 700; letter-spacing: .03em;
+  padding: 4px 10px; border-radius: 6px; cursor: pointer;
+  transition: background .15s ease;
+}
+.btn-take:hover { background: rgba(56,189,248,.22); }
+
 /* Per-row exit — only rendered for filled/open positions. */
 .orders-table th:last-child, .orders-table td.act-cell { text-align: right; }
 .btn-close-row {

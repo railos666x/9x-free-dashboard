@@ -127,6 +127,33 @@ def _ai_news_proposals(conn, symbols: list[str]) -> dict[str, Proposal]:
     return out
 
 
+def _opinion_row(proposal) -> dict:
+    """The AI's opinion on one symbol, in the shape the dashboard shows.
+
+    The bot executes on its own — there is no approval gate — so this is the
+    record of what the AI ASKED FOR and why the gates let it through or held
+    it. It is what the "AI signals" card reads, letting a trader take a trade
+    the AI wanted through the same manual/execution path.
+    """
+    return {
+        "symbol": proposal.symbol,
+        "direction": proposal.direction,
+        "confidence": round(float(proposal.confidence or 0), 1),
+        "entry": proposal.entry,
+        "stop_loss": proposal.stop_loss,
+        "take_profit": proposal.take_profit,
+        "stop_loss_pct": proposal.stop_loss_pct,
+        "take_profit_pct": proposal.take_profit_pct,
+        "reasons": list(proposal.reasons or [])[:6],
+        "regime": proposal.regime,
+        "session": proposal.session,
+        "confirm_score": proposal.confirm_score,
+        "dxy_score": proposal.dxy_score,
+        "smc_score": proposal.smc_score,
+        "ts": proposal.ts,
+    }
+
+
 def run_once(conn, symbols: list[str] | None = None,
              dry_run: bool = False, verbose: bool = False) -> dict:
     """One full bot cycle. Returns a summary dict."""
@@ -237,8 +264,15 @@ def run_once(conn, symbols: list[str] | None = None,
         for c in _currencies(o["symbol"]):
             _cur_counts[c] = _cur_counts.get(c, 0) + 1
 
+    # The AI's opinions for this cycle, collected as we walk the universe.
+    # Attached to the summary (which /api/bot/status already returns) so the
+    # dashboard can offer "the AI asked for this" without a second LLM run.
+    _opinions: list[dict] = []
+
     for symbol in sorted(wanted):
         proposal = proposals.get(symbol)
+        if proposal is not None:
+            _opinions.append(_opinion_row(proposal))
         if loss_guard["blocked"]:
             summary["held"].append({"symbol": symbol, "reason": "loss_guard",
                                     "detail": loss_guard["reason"]})
@@ -416,6 +450,27 @@ def run_once(conn, symbols: list[str] | None = None,
             # One broker hiccup in the monitor must never kill the cycle.
             summary["errors"].append({"symbol": "*",
                                       "error": f"sl/tp monitor: {e}"})
+
+    # ── What the AI asked for, and the gate that decided its fate ───────
+    # `executed` is a checked fact; anything else carries the reason the loop
+    # recorded in `held` (loss_guard / data / no_signal_ai / not_on_broker /
+    # cross_source / intent / no_short_on_spot / caps…) so the trader can see
+    # whether a signal was taken, blocked, or simply still available.
+    _executed = {e.get("symbol") for e in summary["executed"] if e.get("symbol")}
+    _held = {h.get("symbol"): h for h in summary["held"] if h.get("symbol")}
+    for o in _opinions:
+        if o["symbol"] in _executed:
+            o["status"] = "executed"
+            o["gate"] = None
+        else:
+            h = _held.get(o["symbol"]) or {}
+            o["status"] = "held"
+            o["gate"] = h.get("reason")
+            detail = h.get("detail")
+            o["gate_detail"] = detail if isinstance(detail, (str, dict, list)) else None
+    summary["opinions"] = _opinions
+    summary["opinions_held"] = sum(1 for o in _opinions if o["status"] == "held")
+    summary["opinions_executed"] = sum(1 for o in _opinions if o["status"] == "executed")
 
     summary["elapsed_s"] = round(time.time() - t0, 2)
     return summary
