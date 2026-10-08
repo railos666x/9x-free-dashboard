@@ -7,6 +7,61 @@ agent must be appended here.
 
 ---
 
+## 2026-10-08 (07:35 UTC) — Donut hid a closed loss behind an open winner: realized and unrealized are never netted again
+
+User report: "closed show a losing trade but donut dont show it". Reproduced and
+root-caused in the live tab.
+
+**The bug** — `_synthDonutSummary()` summed realized + unrealized into ONE
+`pnl` per symbol (`e.pnl = e.realized + e.unrealized`) and the ring plotted that
+net. With the live book that produced:
+- Every closed trade (today): ETH/USDT **+$29.83**, BTC/USDT **−$104.75**
+- Open: BTC/USDT floating **+$826.57**
+- Donut: **one green slice, BTC +$721.82 = 96%** — and NO red anywhere. The loss
+  the user could see in the list did not exist on the chart, in the legend, or
+  in any total. BTC's `share` was computed from the net, so even a search for
+  "−104.75" found nothing.
+
+**The fix** ([web/dashboard/dashboard.js](web/dashboard/dashboard.js))
+- `_synthDonutSummary()` now emits up to two independently-signed **components**
+  per symbol (`realized`, `unrealized`) and never netts opposing signs into a
+  slice. A loss is always drawn as a loss. The per-symbol NET is still returned
+  as `by_symbol` — it is the honest portfolio figure, it is just not what the
+  ring plots.
+- New `_compName()` labels components consistently everywhere: the open leg
+  reads `BTC · open`, the closed one simply `BTC`, so a symbol appearing twice is
+  obviously two different things.
+- The legend lists every component with its own sign, share and a
+  `CLOSED`/`OPEN` tag; a reconciliation line under it states what the ring
+  contains ("kept apart, never netted, so a loss cannot hide behind a winner").
+- The color map key is now `broker:symbol:kind` (a closed and an open slice in
+  the same symbol are different slices and must not share a shade).
+- In-ring labels are now **percent only** and only when a slice has room
+  (≥9%). Names inside the ring collided with each other and printed red-on-red
+  (a real screenshot artifact) — the legend carries names, values and shares,
+  and the tooltip has the rest. Label contrast is now decided per data item
+  (`_txtColorFor(sliceColor)`); a series-level color callback was not honoured
+  for pie labels here.
+
+**KPI strip (borrowed from the attached reference design)**
+- The reference portfolio dashboard the user shared headlines its profit card
+  with **Realized / Unrealized / Total** as three separate figures. That is the
+  structure this chart was missing, so the donut card now opens with three tiles:
+  `Realized −$74.93 (closed in today)` · `Unrealized +$826.57 (open right now)` ·
+  `Net PnL +$751.64 (realized + open)`. Even with a positive net, a losing
+  realized total is impossible to miss. (The rest of that mock is a light-theme
+  layout for a different product; the dark dashboard was deliberately kept.)
+
+**Verified live** (`?v=20261008f`, Today preset)
+- Ring slices: `BTC · open $826.63 #16a34a`, **`BTC $104.75 #dc2626`**,
+  `ETH $29.83 #22c55e`.
+- Legend: `BTC · open OPEN +$826.57 86%`, `BTC CLOSED −$104.75 10.9%`,
+  `ETH CLOSED +$29.83 3.1%` — the two closed rows add up to the Realized tile
+  (−104.75 + 29.83 = −74.92 ⇒ −$74.93) and both match "Every closed trade".
+- 7d preset: 3 losing slices now render red (ETH −$126.05, BTC −$7.75,
+  EUR/USD −$3.97) with Realized +$21.12 / Unrealized +$826.57 / Net +$847.69.
+- `node --check` clean; suite **151 passed**; cache tag `?v=20261008f`.
+
 ## 2026-10-08 (06:50 UTC) — Manual trading from the dashboard (place AND close), gold/FX reachable in the backtest, suite green at 151
 
 Standing user complaint: "you cant trade on dashboard with surface level ui … a

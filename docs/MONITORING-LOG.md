@@ -969,3 +969,66 @@ appends the 61 collected macro symbols so gold/FX are searchable in every picker
   exactly once, and in any case the server collapses same-minute re-posts of one
   manual intent (minute-bucketed hash), so it is a browser-automation artifact
   rather than a double-order path.
+
+---
+
+## 2026-10-08 07:35 UTC — donut accountability fix: a closed loss can no longer hide behind an open winner
+
+### The report and the reproduction
+
+User: "closed show a losing trade but donut dont show it". Reproduced in the live
+tab with the real book (Today preset):
+
+| Panel | Before the fix |
+|---|---|
+| Every closed trade | ETH/USDT **+29.83**, BTC/USDT **−104.75** |
+| Live trades | BTC/USDT floating **+826.57** (open) |
+| Donut ring | **one green slice: BTC +721.82 = 96%** — no red at all |
+| Breakdown list | 2 rows, both positive (`BTC +$722`, `ETH +$30`) |
+
+The loss was arithmetically present in the DB and in the closed-trades panel, and
+nowhere on the chart: `_synthDonutSummary()` set `pnl = realized + unrealized` per
+symbol, so the open leg's floating gain cancelled the closed leg's realized loss
+before anything was drawn. `share` was computed from that net too, which is why
+nothing in the card pointed at −104.75.
+
+### The fix
+
+- Realized and unrealized are now separate, independently-signed **components**
+  (up to two per symbol) and are never netted into one slice. The per-symbol net
+  is still available as `by_symbol` for the portfolio view — it just is not what
+  the ring plots.
+- Component names are consistent everywhere: `BTC · open` vs `BTC`.
+- The legend lists every component with sign, share and a `CLOSED` / `OPEN` tag,
+  plus a line explaining that the ring never netts a loss against a winner.
+- Colour keys include the component kind so two BTC slices cannot share a shade.
+- In-ring labels are percent-only (≥9% slices). The old name+percent labels
+  collided and rendered red-on-red on the loss slice; per-item label colour now
+  follows the slice shade (`_txtColorFor`), because a series-level colour callback
+  was not honoured for pie labels here.
+- The card opens with three headline tiles — **Realized / Unrealized / Net PnL** —
+  taken from the reference portfolio design the user attached, which headlines
+  exactly those three figures separately. A negative realized total is now
+  impossible to miss even when the net is positive.
+
+### Live verification (`?v=20261008f`)
+
+- Ring slices: `BTC · open $826.63 #16a34a`, **`BTC $104.75 #dc2626`**,
+  `ETH $29.83 #22c55e`.
+- Tiles: `Realized −$74.93 · Unrealized +$826.63 · Net +$751.70`.
+- Legend: `BTC · open OPEN +$826.57 86%` / `BTC CLOSED −$104.75 10.9%` /
+  `ETH CLOSED +$29.83 3.1%`. The two CLOSED rows sum to the Realized tile
+  (−104.75 + 29.83 = −74.92) and match the closed-trades panel line for line.
+- 7d preset: three losing slices render red (ETH −$126.05 11.2%, BTC −$7.75 0.7%,
+  EUR/USD −$3.97 0.4%) with Realized +$21.12 / Unrealized +$826.57 / Net +$847.69.
+- `node --check` clean; python suite **151 passed**; cache tag bumped to
+  `?v=20261008f`.
+
+### Anomalies
+
+- none in the trading data — this cycle changed presentation only, no order
+  path, sizing or protection logic was touched.
+- Note for the record: this is the second donut defect of the session (an earlier
+  one was micro-slice readability). Both were "the chart disagreed with the list"
+  class bugs, which is why the reconciliation line now spells out what the ring
+  contains instead of leaving it to be inferred.

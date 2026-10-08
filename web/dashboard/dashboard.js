@@ -1379,6 +1379,7 @@ function _renderOneDonut(chart, el, rows, total, label, colorOf) {
     if (small.length > 1 && big.length) {
       vis = big.concat({
         symbol: `other:${small.length}`,
+        name: `Other \u00d7${small.length}`,
         pnl: small.reduce((a, r) => a + r.pnl, 0),
         _otherCount: small.length,
       });
@@ -1398,13 +1399,13 @@ function _renderOneDonut(chart, el, rows, total, label, colorOf) {
       text: `${total >= 0 ? "+" : "\u2212"}$${fmt(Math.abs(total), 0)}`,
       // Single-slice ring: the only currency's name belongs in the center
       // (an "X 100%" label inside a full circle is noise).
-      subtext: vis.length === 1 ? `${symOf(vis[0].symbol)} \u00b7 ${label}` : label,
+      subtext: vis.length === 1 ? `${vis[0].name || _compName(vis[0])} \u00b7 ${label}` : label,
       left: "center", top: "38%",
       textStyle: { color: totalCls, fontSize: 20, fontWeight: 700 },
       subtextStyle: { color: "#8a94a6", fontSize: 10 },
     },
     series: [{
-      type: "pie", radius: ["48%", "68%"], center: ["50%", "50%"],
+      type: "pie", radius: ["44%", "70%"], center: ["50%", "50%"],
       avoidLabelOverlap: true,
       minAngle: 2, // keep sub-2% slivers visible instead of vanishing hairlines
       // A one-slice pie is a full circle — a border paints an ugly seam
@@ -1416,29 +1417,38 @@ function _renderOneDonut(chart, el, rows, total, label, colorOf) {
       // the breakdown list below, which doubles as the legend.
       label: {
         position: "inside", fontSize: 11, fontWeight: 600,
-        color: (p) => _txtColorFor(p.data && p.data.itemStyle && p.data.itemStyle.color),
+        color: "#ffffff",   // per-slice override lives on the data item
         // Dark outline separates the label from its slice whatever the
         // shade — red-on-red / navy-on-green unreadable cases (screenshot
         // 2026-10-06) are impossible with a border.
         textBorderColor: "#121223", textBorderWidth: 2,
+        // Percent ONLY, and only when the slice has room (2026-10-08). Names
+        // inside the ring collided with each other and with their own slice
+        // (a red "BTC 11%" on the red loss slice was unreadable) — the legend
+        // below carries every name, value and share, and the tooltip has the
+        // rest. A small slice simply stays a clean colour.
         formatter: (p) => {
-          if (p.percent < 7 || p.percent >= 99.5) return "";  // full-circle: name is in the center
-          const few = (p.data && p.data._many === false);
-          return few ? `${p.name} ${Math.round(p.percent)}%` : `${Math.round(p.percent)}%`;
+          if (p.percent < 9 || p.percent >= 99.5) return "";  // full-circle: name is in the center
+          return `${Math.round(p.percent)}%`;
         },
       },
       labelLine: { show: false },
-      data: vis.map((r) => ({
-        name: r._otherCount ? `Other ×${r._otherCount}` : symOf(r.symbol),
-        value: Math.abs(r.pnl),
-        pnl: r.pnl,
-        _many: vis.length > 4, // few slices → roomy enough for name+%; many → % only
-        itemStyle: {
-          // "Other" gets a quiet grey — it is aggregation, not a position.
-          color: r._otherCount ? "#3a4150"
-            : (colorOf && colorOf(symOf(r.symbol))) || (r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c"),
-        },
-      })),
+      data: vis.map((r) => {
+        // "Other" gets a quiet grey — it is aggregation, not a position.
+        const col = r._otherCount ? "#3a4150"
+          : (colorOf && colorOf(symOf(r.symbol), r.kind)) || (r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c");
+        return {
+          name: r.name || _compName(r),
+          value: Math.abs(r.pnl),
+          pnl: r.pnl,
+          itemStyle: { color: col },
+          // Per-item label colour: a series-level color callback is not
+          // honoured for pie labels here, so a red slice kept painting its
+          // percent red-on-red (screenshot 2026-10-08). The shade decides
+          // contrast, not the series.
+          label: { color: _txtColorFor(col) },
+        };
+      }),
     }],
   }, true);
   return chart;
@@ -1446,40 +1456,75 @@ function _renderOneDonut(chart, el, rows, total, label, colorOf) {
 
 // Build the donut summary from two fetches: closed trades already windowed
 // by exit time (realized) + all rows (open rows contribute unrealized).
-// Mirrors the backend's per-symbol math, so with no period filter this
-// reproduces the server's summary block exactly.
+//
+// Realized and unrealized are NEVER netted into one slice (2026-10-08).
+// The old version summed them per symbol (`pnl = realized + unrealized`), so
+// an open winner silently erased a closed loser: live, BTC's realized
+// -$104.75 sat behind the open leg's +$826.57 floating gain and the ring
+// showed a single green +$721.82 slice — a loss visible in "Every closed
+// trade" existed nowhere on the chart. Each symbol now contributes up to
+// two independently-signed components, so a loss is always drawn as a loss.
 function _synthDonutSummary(closedRows, allRows) {
-  const bySym = {};
-  const entry = (sym, source) => bySym[sym] || (bySym[sym] = {
-    symbol: sym, pnl: 0, realized: 0, unrealized: 0, market_value: 0, share: 0, source: source || "",
-  });
+  const comps = new Map();   // "SYM|kind" → component row
+  const touch = (sym, kind, source) => {
+    const key = `${sym}|${kind}`;
+    let r = comps.get(key);
+    if (!r) {
+      r = { symbol: sym, kind, pnl: 0, share: 0, n: 0, source: source || "", market_value: 0 };
+      comps.set(key, r);
+    }
+    if (source && !r.source) r.source = source;
+    return r;
+  };
   for (const r of allRows) {
     if (r.status !== "filled" && r.status !== "open") continue;
-    const e = entry(r.symbol, r.source);
-    e.unrealized += Number(r.unrealized_pnl || 0);
-    e.market_value = Math.max(e.market_value, Number(r.market_value || 0));
+    const u = Number(r.unrealized_pnl || 0);
+    if (Math.abs(u) < 0.005) continue;    // nothing floating → no slice
+    const row = touch(r.symbol, "unrealized", r.source);
+    row.pnl += u;
+    row.n += 1;
+    row.market_value = Math.max(row.market_value, Number(r.market_value || 0));
   }
   for (const r of closedRows) {
-    const e = entry(r.symbol, r.source);
-    e.realized += Number(r.pnl || 0);
+    const v = Number(r.pnl || 0);
+    if (Math.abs(v) < 0.005) continue;    // scratch trades stay off the ring
+    const row = touch(r.symbol, "realized", r.source);
+    row.pnl += v;
+    row.n += 1;
   }
-  const rows = [];
-  let realized = 0, unrealized = 0, gross = 0;
-  for (const e of Object.values(bySym)) {
-    e.pnl = e.realized + e.unrealized;
-    if (Math.abs(e.pnl) < 0.005) continue;  // same noise floor as renderPnlDonut
-    realized += e.realized; unrealized += e.unrealized; gross += Math.abs(e.pnl);
-    rows.push(e);
-  }
-  for (const e of rows) e.share = Math.round(Math.abs(e.pnl) / (gross || 1) * 1000) / 10;
+  const rows = [...comps.values()];
+  const gross = rows.reduce((a, r) => a + Math.abs(r.pnl), 0);
+  for (const r of rows) r.share = Math.round(Math.abs(r.pnl) / (gross || 1) * 1000) / 10;
   rows.sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl));
+  const sumKind = (kind) => Math.round(rows.filter((r) => r.kind === kind)
+    .reduce((a, r) => a + r.pnl, 0) * 100) / 100;
+  const realized = sumKind("realized");
+  const unrealized = sumKind("unrealized");
+  // Per-symbol NET is kept as well — that is the honest portfolio view, but
+  // it is never what the ring plots.
+  const bySym = {};
+  for (const r of rows) {
+    const e = bySym[r.symbol] || (bySym[r.symbol] = {
+      symbol: r.symbol, pnl: 0, realized: 0, unrealized: 0, source: r.source,
+    });
+    e.pnl += r.pnl;
+    e[r.kind] += r.pnl;
+  }
   return {
     orders: allRows.length,
-    realized_pnl: Math.round(realized * 100) / 100,
-    unrealized_pnl: Math.round(unrealized * 100) / 100,
+    realized_pnl: realized,
+    unrealized_pnl: unrealized,
     total_pnl: Math.round((realized + unrealized) * 100) / 100,
-    by_symbol: rows,
+    components: rows,
+    by_symbol: Object.values(bySym).sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl)),
   };
+}
+
+// One label per component everywhere (ring, tooltip, legend) so the pieces
+// are always distinguishable: two positions in BTC are two rows, and the
+// open one says so.
+function _compName(r) {
+  return r.kind === "unrealized" ? `${symOf(r.symbol)} \u00b7 open` : symOf(r.symbol);
 }
 
 function renderPnlDonut(summary) {
@@ -1487,17 +1532,14 @@ function renderPnlDonut(summary) {
   const meta = $("pnlDonutMeta");
   if (!summary) return;
 
-  const allRows = (summary.by_symbol || []).filter((r) => Math.abs(r.pnl) > 0.005);
+  const allRows = (summary.components || []).filter((r) => Math.abs(r.pnl) > 0.005);
   const total = summary.total_pnl || 0;
+  const realized = summary.realized_pnl || 0;
+  const unreal = summary.unrealized_pnl || 0;
+  const signed = (v, d = 2) => `${v > 0 ? "+" : v < 0 ? "\u2212" : ""}$${fmt(Math.abs(v), d)}`;
+  const cls = (v) => (v > 0 ? "up" : v < 0 ? "down" : "");
 
-  if (meta) {
-    const unreal = summary.unrealized_pnl || 0;
-    meta.textContent = allRows.length
-      ? `${allRows.length} currencies \u00b7 realized ${summary.realized_pnl > 0 ? "+" : ""}$${fmt(summary.realized_pnl, 2)}`
-        + ` \u00b7 unrealized ${unreal > 0 ? "+" : ""}$${fmt(unreal, 2)}`
-        + ` \u00b7 ${_periodLabel()}`
-      : "";
-  }
+  if (meta) meta.textContent = allRows.length ? `\u00b7 ${_periodLabel()}` : "";
 
   if (!allRows.length) {
     if (list) list.innerHTML = '<div class="muted">No realized or unrealized PnL yet \u2014 dry/live test trades to populate the donut.</div>';
@@ -1517,41 +1559,64 @@ function renderPnlDonut(summary) {
   const totals = {};
   for (const b of Object.keys(byBroker)) totals[b] = byBroker[b].reduce((a, r) => a + r.pnl, 0);
 
-  // One consistent shade per currency per broker donut, so the breakdown
-  // list dots double as the donut legend.
+  // One consistent shade per component per broker donut, so the legend dots
+  // double as the ring's key (the key includes the kind — a closed and an
+  // open position in the same symbol are different slices).
   const colorMap = {};
   const counters = {};
   for (const r of allRows) {
     const b = _brokerOf(r);
     const c = counters[b] || (counters[b] = { g: 0, r: 0 });
     const i = r.pnl >= 0 ? c.g++ : c.r++;
-    colorMap[`${b}:${symOf(r.symbol)}`] = _pnlShade(i, r.pnl);
+    colorMap[`${b}:${symOf(r.symbol)}:${r.kind}`] = _pnlShade(i, r.pnl);
   }
-  const colorFor = (b, sym) => colorMap[`${b}:${sym}`] || null;
+  const colorFor = (b, sym, kind) => colorMap[`${b}:${sym}:${kind}`] || null;
 
   for (const b of _brokerList()) {
     const el = $(`pnlDonut_${b.key}`);
     if (!el) continue;  // pane not rendered yet (pre-registry fallback HTML)
     const existing = pnlCharts.get(b.key);
-    pnlCharts.set(b.key, _renderOneDonut(existing, el, byBroker[b.key] || [], totals[b.key] || 0, `${b.name} PnL`, (sym) => colorFor(b.key, sym)));
+    pnlCharts.set(b.key, _renderOneDonut(existing, el, byBroker[b.key] || [], totals[b.key] || 0, `${b.name} PnL`, (sym, kind) => colorFor(b.key, sym, kind)));
   }
 
+  // KPI strip above the rings: the two figures can never hide inside each
+  // other again — a losing realized total shows here even when the period
+  // net is positive (the reference design's headline tiles, same idea).
   if (list) {
-    list.innerHTML = allRows.map((r) => {
+    list.innerHTML = "";
+    const kpis = document.createElement("div");
+    kpis.className = "pnl-kpis";
+    kpis.innerHTML =
+      `<div class="pnl-kpi"><span class="pnl-kpi-label">Realized</span>`
+      + `<span class="pnl-kpi-val ${cls(realized)}">${signed(realized)}</span>`
+      + `<span class="pnl-kpi-sub">closed in ${_periodLabel()}</span></div>`
+      + `<div class="pnl-kpi"><span class="pnl-kpi-label">Unrealized</span>`
+      + `<span class="pnl-kpi-val ${cls(unreal)}">${signed(unreal)}</span>`
+      + `<span class="pnl-kpi-sub">open right now</span></div>`
+      + `<div class="pnl-kpi"><span class="pnl-kpi-label">Net PnL</span>`
+      + `<span class="pnl-kpi-val ${cls(total)}">${signed(total)}</span>`
+      + `<span class="pnl-kpi-sub">realized + open</span></div>`;
+    list.appendChild(kpis);
+    const legend = document.createElement("div");
+    legend.className = "pnl-legend";
+    legend.innerHTML = allRows.map((r) => {
       const pnlCls = r.pnl >= 0 ? "up" : "down";
-      const sign = r.pnl >= 0 ? "+" : "";
+      const sign = r.pnl >= 0 ? "+" : "\u2212";
       const broker = _brokerOf(r);
       const brokerTag = _brokerTagHtml(broker);
       return `<div class="pnl-row">
-        <span class="pnl-dot" style="background:${colorFor(_brokerOf(r), symOf(r.symbol)) || (r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c")}"></span>
+        <span class="pnl-dot" style="background:${colorFor(broker, symOf(r.symbol), r.kind) || (r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c")}"></span>
         ${brokerTag}
-        <span class="sym">${symOf(r.symbol)}</span>
+        <span class="sym">${_compName(r)}</span>
+        <span class="pnl-kind pnl-kind-${r.kind}">${r.kind === "unrealized" ? "open" : "closed"}</span>
         <span class="pnl-bar-wrap"><span class="pnl-bar" style="width:${Math.min(r.share, 100)}%;background:${r.pnl >= 0 ? "#2ecc8f" : "#ff5c5c"}"></span></span>
-        <span class="pnl-val ${pnlCls}">${sign}$${fmt(r.pnl, 0)}</span>
+        <span class="pnl-val ${pnlCls}">${sign}$${fmt(Math.abs(r.pnl), 2)}</span>
         <span class="muted">${r.share}%</span>
-        <span class="muted pnl-sub">${r.market_value > 0 ? "mkt $" + fmt(r.market_value, 0) : ""}</span>
+        <span class="muted pnl-sub">${r.n > 1 ? `${r.n} trades` : ""}</span>
       </div>`;
-    }).join("");
+    }).join("")
+      + `<div class="pnl-recon muted">Ring = every closed trade in ${_periodLabel()} (green win / red loss) plus each open position's floating PnL \u2014 kept apart, never netted, so a loss cannot hide behind a winner.</div>`;
+    list.appendChild(legend);
   }
 }
 

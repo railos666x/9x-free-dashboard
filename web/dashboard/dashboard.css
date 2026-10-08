@@ -830,8 +830,48 @@ button.btn-primary, button.btn-warn { display: inline-flex; align-items: center;
 /* Broker name text next to the letter tag (closed trades, breakdown list) */
 .lt-broker-name { font-size: 10.5px; color: var(--muted, #8b93a7); white-space: nowrap; }
 .closed-trade .lt-broker-name { width: auto; }
+/* Headline figures above the rings (2026-10-08). Realized and unrealized
+   are separate numbers on purpose: netting them is what let a closed loss
+   vanish behind an open winner's floating gain. */
+.pnl-kpis {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.pnl-kpi {
+  display: flex; flex-direction: column; gap: 1px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+.pnl-kpi-label {
+  font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted);
+}
+.pnl-kpi-val {
+  font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+.pnl-kpi-val.up { color: var(--green); }
+.pnl-kpi-val.down { color: var(--red); }
+.pnl-kpi-sub { font-size: 10px; color: var(--faint); }
+.pnl-legend { display: flex; flex-direction: column; gap: 6px; }
+/* closed vs open tag — says WHY a symbol appears twice (a closed leg and a
+   live one are different rows, never one netted slice). */
+.pnl-kind {
+  font-size: 9px; font-weight: 700; letter-spacing: .05em;
+  text-transform: uppercase; padding: 1px 6px; border-radius: 5px;
+  border: 1px solid var(--border); color: var(--muted); flex: none;
+}
+.pnl-kind-unrealized { border-color: rgba(76,154,255,.45); color: var(--info); }
+.pnl-kind-realized { border-color: var(--border-strong); }
+.pnl-recon {
+  font-size: 10.5px; line-height: 1.5;
+  padding-top: 6px; border-top: 1px solid var(--border);
+}
 .pnl-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
-.pnl-row .sym { width: 74px; font-weight: 600; }
+.pnl-row .sym { width: 96px; font-weight: 600; }
 .pnl-bar-wrap {
   flex: 1; height: 7px; border-radius: 4px;
   background: rgba(255,255,255,.06); overflow: hidden;
