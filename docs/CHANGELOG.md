@@ -2481,3 +2481,39 @@ trade should be placed on an acc not just marking". Also reported the
 - Python runtime check after the system update: the project venv is
   self-contained (own 3.12.10 interpreter, all imports OK) — unaffected
   by the system Python 3.12.7 the server does not use.
+
+## 2026-10-10 (10:00 UTC) — Account-mode chips + cutover guide + fundability fail-open fix
+
+Delivered the follow-up suggestions after the paper purge:
+
+### Account chips on every view ([dashboard.js](web/dashboard/dashboard.js), [dashboard.css](web/dashboard/dashboard.css), [execution.py](backend/execution.py))
+- Each account card now carries `mode` (demo | real) read from the venue's own
+  API: MT5 `trade_mode`, Binance `BINANCE_BASE` (testnet vs api), Alpaca
+  base URL. The flow strip renders one chip per account — amber `demo`,
+  green `real`, red when unreachable — per view, next to the loop state.
+- Verified live: `Exness · MT5 · demo` | `Binance · unreachable` | `Alpaca (paper) · demo`
+  (Binance currently serves **451 geo-block** even on testnet — see below).
+  Cached 60s so polling doesn't hammer signed calls.
+
+### A real bug the end-to-end test exposed ([execution.py](backend/execution.py))
+- `fundability`'s contract says `"hold"` = balance endpoint unavailable →
+  fail-open, but `execute_intent` checked `if fund:` — `"hold"` is truthy,
+  so a latent path could REFUSE every order on a metadata hiccup. Fixed
+  (`fund != "hold"` guards the refusal); the provably-unfundable reason
+  string still blocks as before.
+- End-to-end manual order then ran the REAL path: Binance returned 451
+  "restricted location" (not a code issue — network/geo), the journal row
+  (#439) recorded the venue's actual error with no fake fill. This is the
+  intended behaviour: real orders on real endpoints, failures surface as
+  the broker's own reason.
+- MT5 order attempt reached the venue too and returned `retcode 10027 —
+  AutoTrading disabled by client`: the terminal's AutoTrading button is
+  OFF. Both findings are documented in the new guide.
+
+### New: REAL-MONEY-CUTOVER guide ([docs/REAL-MONEY-CUTOVER.md](docs/REAL-MONEY-CUTOVER.md))
+- Current connectivity table with evidence; safety-rail checklist first
+  (ARBITRATION_MIN_SOURCES=2, loss caps); per-venue steps for MT5 (login +
+  AutoTrading ON + gold's 1-oz min-lot note), Binance (live keys +
+  `BINANCE_BASE` swap; 451 geo-block flagged), Alpaca (live keys +
+  `ALPACA_PAPER=false`); first-week checklist; what NOT to touch.
+- Suite: **151 passed, 0 failed**; `node --check` clean; cache `?v=20261010b`.

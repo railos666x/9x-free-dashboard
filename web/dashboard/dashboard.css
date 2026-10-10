@@ -1357,6 +1357,35 @@ tr.watch-row:hover { opacity: .8; }
 .fs-item .fs-dot.live { background: #2ecc8f; box-shadow: 0 0 6px rgba(46, 204, 143, .5); }
 .fs-item .fs-dot.stale { background: #f4a94a; }
 .fs-item .fs-dot.down { background: #ff5c5c; }
+
+/* Account-mode chips (2026-10-10): which venue receives the orders, and
+   whether it is a demo/testnet account or real money — as reported by the
+   venue itself. Amber = demo (practice money), green = real. */
+.acct-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border, #24262e);
+  cursor: default;
+}
+.acct-chip.acct-demo {
+  color: #f4a94a;
+  border-color: rgba(244, 169, 74, .35);
+  background: rgba(244, 169, 74, .08);
+}
+.acct-chip.acct-real {
+  color: #2ecc8f;
+  border-color: rgba(46, 204, 143, .35);
+  background: rgba(46, 204, 143, .08);
+}
+.acct-chip.acct-warn {
+  color: #ff5c5c;
+  border-color: rgba(255, 92, 92, .35);
+  background: rgba(255, 92, 92, .08);
+}
 .fs-jump {
   margin-left: auto;
   border: none;

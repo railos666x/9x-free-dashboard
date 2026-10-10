@@ -2242,7 +2242,7 @@ def execute_intent(conn, intent, qty: float | None = None,
         fund = rb.fundability(
             intent.symbol, "BUY" if intent.direction == "LONG" else "SELL",
             size, order.get("entry"))
-        if fund:
+        if fund and fund != "hold":   # "hold" = endpoint unavailable → fail-open per contract
             return {"order": None, "duplicate": False, "dry_run": dry_run,
                     "error": fund}
 
@@ -3263,6 +3263,7 @@ def _mt5_account_card() -> dict:
     return {
         "broker": "mt5",
         "name": f"Exness · MT5",
+        "mode": mode.lower(),            # demo | contest | real — drives the header banner
         "account_type": f"{mode} · 1:{i.get('leverage') or '—'}",
         "currency": i.get("currency") or "USD",
         "balance": i.get("balance"),
@@ -3294,6 +3295,7 @@ def _binance_account_card() -> dict:
     return {
         "broker": "binance",
         "name": "Binance Spot (testnet)",
+        "mode": "demo" if "testnet" in BINANCE_BASE else "real",
         "account_type": "Spot · exec API",
         "currency": "USDT",
         "balance": free + locked,
@@ -3317,6 +3319,7 @@ def _alpaca_account_card() -> dict:
     return {
         "broker": "alpaca",
         "name": "Alpaca (paper)",
+        "mode": "demo" if "paper" in b.base else "real",
         "account_type": str(d.get("status") or "—"),
         "currency": d.get("currency") or "USD",
         "balance": float(d.get("equity") or 0),

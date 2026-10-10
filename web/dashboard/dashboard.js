@@ -326,6 +326,39 @@ async function loadBotStatus() {
   }
 }
 
+/* ── Account-mode chips in the flow strip (2026-10-10) ─────────────────
+   Where the orders ACTUALLY land, straight from each venue's own account
+   API — demo vs real is read from the broker, never assumed. Real accounts
+   get a green chip; demo/testnet amber so there is never any doubt. */
+let __acctCache = { at: 0, html: "" };
+
+async function _renderAccountModeChips() {
+  const el = $("fsAccountsItems");
+  if (!el) return;
+  const now = Date.now();
+  if (__acctCache.html && now - __acctCache.at < 60000) {
+    el.innerHTML = __acctCache.html;
+    return;
+  }
+  try {
+    const d = await api("/api/broker-accounts");
+    const html = (d.accounts || []).map((a) => {
+      const mode = (a.mode || "").toLowerCase();
+      const real = mode === "real";
+      const label = a.error ? `${a.name || a.broker} · unreachable`
+        : `${a.name || a.broker} · ${mode || "?"}`;
+      const cls = a.error ? "acct-warn" : real ? "acct-real" : "acct-demo";
+      const tip = a.error ? a.error
+        : `Balance ${fmt(a.balance, 2)} ${a.currency || ""} — ${a.account_type || ""}`;
+      return `<span class="acct-chip ${cls}" title="${esc(tip)}">${esc(label)}</span>`;
+    }).join(" ");
+    __acctCache = { at: now, html };
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = '<span class="acct-chip acct-warn" title="Account info unavailable">accounts: ?</span>';
+  }
+}
+
 function renderBotStatus(s) {
   /* ── Trader flow strip (2026-10-07): answers "is the bot doing anything"
      on every view — loop state, age of the last cycle, what it did, how
@@ -370,6 +403,7 @@ function renderBotStatus(s) {
     const ooEl = $("fsOpenOrders");
     if (ooEl) ooEl.textContent = String(s.open_orders ?? 0);
   }
+  _renderAccountModeChips(s);
   renderAiSignals(s);
 
   const body = $("botStatusBody");

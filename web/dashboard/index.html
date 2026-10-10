@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>cryptoautomation · Dashboard</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261010a" />
+<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261010b" />
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
@@ -62,6 +62,9 @@
     <span class="fs-item">Last cycle <b id="fsCycleAge">—</b></span>
     <span class="fs-item">Actions <b id="fsCycleActions">—</b></span>
     <span class="fs-item">Open orders <b id="fsOpenOrders">—</b></span>
+    <!-- Where the orders actually land: one chip per connected account,
+         rendered real/demo by the server's own account data — never assumable. -->
+    <span class="fs-item fs-accounts" id="fsAccounts" title="The accounts orders are placed on, straight from the venue's own account API"><b id="fsAccountsItems">…</b></span>
     <button class="fs-jump" onclick="switchView('orders')">Open Orders view →</button>
   </div>
 
@@ -744,6 +747,6 @@
   </div>
 </div>
 
-<script src="/dash-assets/dashboard.js?v=20261010a"></script>
+<script src="/dash-assets/dashboard.js?v=20261010b"></script>
 </body>
 </html>
