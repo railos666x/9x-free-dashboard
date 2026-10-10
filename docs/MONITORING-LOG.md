@@ -1152,3 +1152,85 @@ This is the third "the page disagreed with itself" defect of the session (donut
 vs closed-trades list, donut label collision, now balance vs balance). All three
 were label/derivation problems rather than data problems, which suggests the next
 useful hardening is a self-reconciliation pass over the headline figures.
+
+---
+
+## Digest 2026-10-10 06:45 UTC
+
+### AI-only closed-trade performance
+
+| Window | n | Win% | Net PnL | Expectancy |
+|---|---|---|---|---|
+| 7d | 6 | 33.3% | -262.09 | -43.68 |
+| 30d | 62 | 59.7% | +1099.16 | +17.73 |
+
+### Exit-reason economics (all-time AI-only)
+
+| Exit | n | Wins | PnL |
+|---|---|---|---|
+| time_decay_exit | 46 | 32 | +1360.04 |
+| tp | 5 | 5 | +781.99 |
+| manual_cleanup | 2 | 2 | +10.94 |
+| broker_closed | 18 | 8 | -42.27 |
+| sl | 12 | 2 | -295.97 |
+
+### Open basket — floating P/L
+
+- MT5 (0 legs): total +0.00
+- Binance journal legs (2): total +837.02
+  - #415 BTC/USDT LONG fill=100.0 mark=82865.56 upl=+827.66 tp=105000 sl=99000
+  - #438 BTC/USDT SHORT fill=83103.27 mark=82864.01 upl=+9.37 tp=78917.383 sl=85147.703
+
+### Guards
+
+- loss_guard: blocked=False daily=0.0% drawdown=0.0%
+
+### Costs (30d journal fees, AI-only)
+
+- fees journaled: +3.17
+
+### Costs by venue (7d, closed round trips)
+
+| Venue | n | Fees | Slip* | Total cost | Gross PnL | Net PnL | Cost drag |
+|---|---|---|---|---|---|---|---|
+| binance | 5 | 3.17 | 1.22 | 4.38 | -118.33 | -122.71 | n/a |
+| mt5 | 3 | 0.00 | 8.08 | 8.08 | +4.10 | -3.97 | 196.8% |
+
+\* slip = journaled slippage_cost — measured |fill − ref| where a pre-order reference exists, else venue bps × notional. MT5 fees are usually 0 (cost inside the spread).
+
+### Run window (journal id > 400)
+
+- journal rows: 19 (closed: 10, dry_run: 6, error: 1, filled: 2)
+- window closed: n=10 wr=50.0% net=-81.45 PF=+0.72
+
+### Win-rate trajectory (all journal closes)
+
+| Window | n | Win% | Net PnL | Avg win | Avg loss | PF |
+|---|---|---|---|---|---|---|
+| all-time | 94 | 54.3% | +839.27 | +51.68 | -41.77 | +1.47 |
+| last-50 | 50 | 64.0% | +1079.57 | +53.15 | -34.52 | +2.74 |
+| last-20 | 20 | 65.0% | -8.37 | +23.94 | -45.66 | +0.97 |
+| last-10 | 10 | 50.0% | -81.45 | +40.87 | -57.16 | +0.72 |
+
+- rolling-10 buckets: 10 50 60 50 50 60 70 70 80 — first-half 42.5% → last-half 66.0% (improving)
+- path to 70%: last-20 wr=65% — need 1 more win(s) inside a rolling 20
+
+### Per-symbol (7d, min 2 closed)
+
+| Symbol | n | Win% | Net PnL |
+|---|---|---|---|
+| BTC/USDT | 3 | 67% | +4.45 |
+| EUR/USD | 3 | 33% | -3.97 |
+| ETH/USDT | 2 | 50% | -127.16 |
+
+### FX (forex sleeve)
+
+- session: Tokyo + Sydney (liquidity 55%), next: london in 1h — WEEKEND, FX closed
+- open FX exposure: none
+- FX closed (7d): n=3 wins=1 net=-3.97
+
+### Anomalies
+
+- [!] AI-only 7d win rate 33.3% < 50%
+- [!] cost drag: mt5 round-trip costs 8.08 = 197% of gross +4.10 this week
+- [!] FX 7d win rate 33% < 45%

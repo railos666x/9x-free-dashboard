@@ -205,8 +205,8 @@ def run_once(conn, symbols: list[str] | None = None,
     cb_state = circuit_breaker.current_risk_state(conn)
     summary["circuit_breaker"] = cb_state
 
-    # ── AI mode: live (real MT5 trades) or test (paper trades in DB) ──
-    ai_mode = config.AI_MODE  # "live" or "test" (default)
+    # ── Account identity (which broker the orders land on) ──
+    ai_mode = config.AI_MODE
     summary["ai_mode"] = ai_mode
 
     # Get trading universe from token registry (single source of truth)
@@ -366,60 +366,38 @@ def run_once(conn, symbols: list[str] | None = None,
                                    "cap": config.MAX_PER_CURRENCY}})
                     continue
 
-            # ── Dual-mode execution ───────────────────────────────────
-            # AI_MODE=test → paper trade in test_trades table (no broker)
-            # AI_MODE=live → real MT5/Exness trade via execution.execute_intent
-            if ai_mode == "test":
-                import test_ai
-                result = test_ai.record_paper_trade(
-                    conn, proposal, intent, dry_run=dry_run)
-                if result.get("duplicate"):
-                    summary["held"].append({"symbol": symbol, "reason": "duplicate"})
-                    continue
-                trade = result.get("trade") or {}
+            # ── Execution ─────────────────────────────────────────────
+            # Paper mode is GONE (owner, 2026-10-10: "every trade should be
+            # placed on an acc not just marking"). Every AI proposal goes
+            # through execution.execute_intent, which places a REAL order on
+            # the configured account (MT5 / Binance / Alpaca — demo accounts
+            # until real credentials exist). There is no journal-only book:
+            # a row in the journal exists only because an order was sent.
+            result = execution.execute_intent(
+                conn, intent, dry_run=dry_run)
+            if result.get("duplicate"):
+                summary["held"].append({"symbol": symbol, "reason": "duplicate"})
+                continue
+            order = result.get("order") or {}
+            status = order.get("status", "?")
+            if status == "error":
+                summary["errors"].append({"symbol": symbol,
+                                          "error": order.get("error")})
+            else:
                 summary["executed"].append({
                     "symbol": symbol,
                     "direction": intent.direction,
-                    "qty": trade.get("entry_price", 0),
-                    "status": "test_trade",
+                    "qty": order.get("qty"),
+                    "status": status,
                     "sources": intent.sources,
                     "reasons": intent.reasons or [],
                     "confirm_score": proposal.confirm_score,
                     "dxy_score": proposal.dxy_score,
                     "smc_score": proposal.smc_score,
                     "regime": proposal.regime,
-                    "session": proposal.session})
-                if verbose:
-                    print(f"  {symbol}: TEST {intent.direction} "
-                          f"tc={proposal.confirm_score} dxy={proposal.dxy_score} "
-                          f"smc={proposal.smc_score} regime={proposal.regime}")
-            else:
-                # Live mode — apply circuit breaker risk multiplier to sizing
-                result = execution.execute_intent(
-                    conn, intent, dry_run=dry_run)
-                if result.get("duplicate"):
-                    summary["held"].append({"symbol": symbol, "reason": "duplicate"})
-                    continue
-                order = result.get("order") or {}
-                status = order.get("status", "?")
-                if status == "error":
-                    summary["errors"].append({"symbol": symbol,
-                                              "error": order.get("error")})
-                else:
-                    summary["executed"].append({
-                        "symbol": symbol,
-                        "direction": intent.direction,
-                        "qty": order.get("qty"),
-                        "status": status,
-                        "sources": intent.sources,
-                        "reasons": intent.reasons or [],
-                        "confirm_score": proposal.confirm_score,
-                        "dxy_score": proposal.dxy_score,
-                        "smc_score": proposal.smc_score,
-                        "regime": proposal.regime,
-                        "session": proposal.session,
-                        "cb_level": cb_state["level"],
-                        "cb_mult": cb_state["risk_multiplier"]})
+                    "session": proposal.session,
+                    "cb_level": cb_state["level"],
+                    "cb_mult": cb_state["risk_multiplier"]})
                 if verbose:
                     print(f"  {symbol}: {intent.direction} qty={order.get('qty')} "
                           f"status={status} src={intent.sources} "

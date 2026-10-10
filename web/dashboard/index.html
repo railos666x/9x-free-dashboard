@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>cryptoautomation · Dashboard</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261008i" />
+<link rel="stylesheet" href="/dash-assets/dashboard.css?v=20261010a" />
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
@@ -487,8 +487,8 @@
             </label>
           </div>
           <div class="mt-actions">
-            <label class="mt-dry" title="Preview the risk sizing and fees without sending anything to a broker">
-              <input type="checkbox" id="manDry" /> Dry run (no broker order)
+            <label class="mt-dry" title="Preview the risk sizing and fees — nothing is sent to the broker, and no trade row is created">
+              <input type="checkbox" id="manDry" /> Check sizing only (no order)
             </label>
             <!-- The action names the side: the button can never disagree with
                  the toggle about what is about to be sent. -->
@@ -510,8 +510,7 @@
             <div class="card-title">Trade journal</div>
             <div class="assets-head-right">
               <span class="signal-badge badge-hold" id="botModeBadge" title="Bot run mode (set by the Auto loop control)">AUTO: ?</span>
-              <button class="btn-primary" id="btnRunBotDry" onclick="runBotCycle(true)"><svg class="ic"><use href="#i-flask"/></svg> Dry test</button>
-              <button class="btn-warn" id="btnRunBotLive" onclick="runBotCycle(false)"><svg class="ic"><use href="#i-play"/></svg> Live test</button>
+              <button class="btn-warn" id="btnRunBotLive" onclick="runBotCycle()"><svg class="ic"><use href="#i-play"/></svg> Run cycle now</button>
               <button class="icon-btn" id="btnReconcile" onclick="reconcileBroker()" title="Sync journal statuses with the broker">⟳ Reconcile</button>
             </div>
           </div>
@@ -552,7 +551,7 @@
         </div>
       </section>
 
-      <!-- ═══════════ View: AI Test (paper-trading + confirmation pipeline) ═══════════ -->
+      <!-- ═══════════ View: AI Test (shadow book + confirmation pipeline) ═══════════ -->
       <section class="view" id="view-aitest">
         <!-- AI Confirmation Pipeline Status -->
         <section class="card bots-card">
@@ -582,10 +581,10 @@
           </section>
         </div>
 
-        <!-- Test Trades Table -->
+        <!-- Shadow book (analysis-only — real orders live in the Orders journal) -->
         <section class="card crypto-table-card" style="margin-top:16px;">
           <div class="card-head">
-            <div class="card-title">AI Paper Trades</div>
+            <div class="card-title">AI Shadow Book <span class="muted">analysis-only — no orders sent</span></div>
             <div class="assets-head-right">
               <span class="signal-badge" id="testTradeModeBadge">MODE: ?</span>
               <span class="muted" id="testTradeStats"></span>
@@ -745,6 +744,6 @@
   </div>
 </div>
 
-<script src="/dash-assets/dashboard.js?v=20261008i"></script>
+<script src="/dash-assets/dashboard.js?v=20261010a"></script>
 </body>
 </html>

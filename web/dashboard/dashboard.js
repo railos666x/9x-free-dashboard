@@ -336,7 +336,7 @@ function renderBotStatus(s) {
     const dot = $("fsLoopDot");
     const loopRunning = !!s.auto_loop_running;
     const loopLive = !!s.auto_loop_live;
-    let loopTxt = loopRunning ? (loopLive ? "LIVE (paper)" : "dry-run") : "STOPPED";
+    let loopTxt = loopRunning ? (loopLive ? "LIVE · demo accs" : "dry-run") : "STOPPED";
     let dotCls = "fs-dot";
     const ranAt = s.last_run_at ? s.last_run_at * 1000 : 0;
     const age = ranAt ? (Date.now() - ranAt) / 1000 : Infinity;
@@ -387,7 +387,7 @@ function renderBotStatus(s) {
   if (meta && lastMode) meta.textContent += ` · mode: ${lastMode}`;
   const brokerLabel = s.broker === "alpaca"
     ? `alpaca${s.alpaca_paper ? " (paper)" : " (LIVE)"}`
-    : esc(s.broker || "paper");
+    : esc(s.broker || "hybrid");
   const gateMin = s.arbitration_min_sources ?? 2;
   const gateLabel = gateMin === 1
     ? `test mode (single source, conf≥${s.arbitration_min_confidence ?? 45})`
@@ -397,7 +397,7 @@ function renderBotStatus(s) {
   const loopLive = !!s.auto_loop_live;
   const loopLabel = !s.auto_loop
     ? "off (BOT_AUTO_LOOP=false)"
-    : loopRunning ? (loopLive ? "running · LIVE (paper)" : "running · dry-run") : "stopped";
+    : loopRunning ? (loopLive ? "running · LIVE · demo accs" : "running · dry-run") : "stopped";
   const llmLbl = s.llm_providers == null ? "—"
     : s.llm_providers <= 0 ? "rule-based (add LLM key)"
     : `active (${s.llm_providers} provider${s.llm_providers > 1 ? "s" : ""})`;
@@ -424,7 +424,7 @@ function renderBotStatus(s) {
   // Auto-loop badge + Start/Stop button.
   const loopBadge = $("botLoopBadge");
   if (loopBadge) {
-    loopBadge.textContent = loopRunning ? (loopLive ? "LIVE (paper)" : "DRY-RUN") : "OFF";
+    loopBadge.textContent = loopRunning ? (loopLive ? "LIVE · REALORDERS" : "DRY-RUN") : "OFF";
     loopBadge.className = "signal-badge " + (loopRunning && loopLive ? "badge-long" : "badge-hold");
   }
   const toggle = $("btnToggleLoop");
@@ -439,12 +439,10 @@ function renderBotStatus(s) {
     modeBadge.textContent = loopRunning ? (loopLive ? "AUTO: LIVE" : "AUTO: DRY") : "AUTO: OFF";
     modeBadge.className = "signal-badge " + (loopRunning && loopLive ? "badge-long" : "badge-hold");
     modeBadge.title = loopRunning
-      ? (loopLive ? "Bot loop is running LIVE on the paper broker" : "Bot loop is running in dry-run (journals only)")
-      : "Bot loop is stopped — Dry/Live test run one manual cycle";
+      ? (loopLive ? "Bot loop is running LIVE — every trade is a real order on the configured account (demo accounts until real credentials exist)" : "Bot loop is running in dry-run (previews only — no orders)")
+      : "Bot loop is stopped — Run cycle now sends one manual cycle";
   }
-  const dryBtn = $("btnRunBotDry");
   const liveBtn = $("btnRunBotLive");
-  if (dryBtn) dryBtn.classList.toggle("mode-active", loopRunning && !loopLive);
   if (liveBtn) liveBtn.classList.toggle("mode-active", loopRunning && loopLive);
   // Source-A picker: synced with the server, and locked while the loop runs.
   const sel = $("botSourceSelect");
@@ -453,7 +451,7 @@ function renderBotStatus(s) {
   if (sel) sel.value = s.signal_source_a || "ai_news";
   if (applyBtn) applyBtn.disabled = loopRunning;
   if (srcMsg) srcMsg.innerHTML = loopRunning ? `${icon("lock", "ic-sm")} stop the loop to change source` : "";
-  let cycleHtml = '<div class="muted">No cycle run yet — press “Dry test” or “Live test”.</div>';
+  const cycleHtml = '<div class="muted">No cycle run yet — press “Run cycle now”.</div>';
   const c = s.last_cycle;
   if (c && c.blocked) {
     cycleHtml = `<div class="bot-cycle" style="color:var(--red,#ff5c5c);">${icon("alert")} ${esc(c.block_reason || "Live run blocked")}</div>`;
@@ -1173,7 +1171,7 @@ function renderAiSignals(s) {
     return;
   }
   box.innerHTML = (stale
-      ? `<div class="ai-sig-stale">This summary is ${_ago(s.last_run_at)} old — the proposed levels may have moved since. Run a cycle (Dry test) to refresh before taking one.</div>`
+      ? `<div class="ai-sig-stale">This summary is ${_ago(s.last_run_at)} old — the proposed levels may have moved since. Run a cycle to refresh before taking one.</div>`
       : "")
     + ops.map((o, i) => {
       const long = o.direction === "LONG";
@@ -1370,21 +1368,20 @@ async function placeManualOrder() {
       return;
     }
   }
-  if (btn) { btn.disabled = true; }   // double-click must not double-place
-  _manSetMsg(dry ? `Checking sizing for ${symOf(symbol)} (dry run)…` : `Placing ${_manSide} ${symOf(symbol)}…`);
+  if (btn) { btn.disabled = true; }   // double-click must not double-place    _manSetMsg(dry ? `Checking sizing for ${symOf(symbol)} (no order — preview only)…` : `Placing ${_manSide} ${symOf(symbol)} on the account…`);
   try {
     const res = await _manPost("/api/manual/order", payload);
     const o = res.order || {};
     const ref = o.id == null ? "" : ` #${o.id}`;   // dry-run previews have no row id
     _manSetMsg(
-      `${dry ? "Dry run OK" : "Order placed"} —${ref || ""} `
+      `${dry ? "Sizing preview" : "Order placed on the account"} —${ref || ""} `
       + `${symOf(o.symbol || symbol)} ${o.side || _manSide} qty ${fmt(o.qty, 4)} @ ${fmtPrice(o.entry || o.fill_price)}`
       + (o.stop_loss ? ` · SL ${fmtPrice(o.stop_loss)}` : "")
       + (o.take_profit ? ` · TP ${fmtPrice(o.take_profit)}` : "")
       + (res.duplicate ? " · already placed in this minute — not duplicated" : "")
-      + (dry ? " · nothing sent to a broker" : ""),
+      + (dry ? " · nothing sent to a broker, no trade row" : ""),
       "ok");
-    toast(`${dry ? "Dry run" : "Order placed"}: ${symOf(o.symbol || symbol)} ${o.side || _manSide}${ref}`, "info");
+    toast(`${dry ? "Sizing preview" : "Order placed"}: ${symOf(o.symbol || symbol)} ${o.side || _manSide}${ref}`, "info");
     loadOrders();
     loadLiveTrades();
   } catch (e) {
@@ -1852,35 +1849,31 @@ async function applyBotSource() {
   }
 }
 
-async function runBotCycle(dryRun) {
-  const id = dryRun ? "btnRunBotDry" : "btnRunBotLive";
-  const btn = $(id);
+async function runBotCycle() {
+  const btn = $("btnRunBotLive");
   if (!btn) return;
-  if (!dryRun) {
-    const st = window.__botStatus || {};
-    if (st.live_single_source_blocked) {
-      alert(
-        "Live test blocked by the kill-switch: the agreement gate is in " +
-        "single-source test mode (ARBITRATION_MIN_SOURCES=1). Set " +
-        "ALLOW_LIVE_SINGLE_SOURCE=true in .env to allow, or use " +
-        "ARBITRATION_MIN_SOURCES=2 for the production gate."
-      );
-      return;
-    }
-    const ok = confirm(
-      "Live test: this submits REAL orders to the configured broker " +
-      `(${st.broker || "paper"}${st.alpaca_paper ? " paper" : ""}). ` +
-      "Continue?"
+  const st = window.__botStatus || {};
+  if (st.live_single_source_blocked) {
+    alert(
+      "Blocked by the kill-switch: the agreement gate is in " +
+      "single-source test mode (ARBITRATION_MIN_SOURCES=1). Set " +
+      "ALLOW_LIVE_SINGLE_SOURCE=true in .env to allow, or use " +
+      "ARBITRATION_MIN_SOURCES=2 for the production gate."
     );
-    if (!ok) return;
+    return;
   }
+  const ok = confirm(
+    "Run one cycle: every signal the AI agrees to will be placed as a REAL " +
+    `order on the configured account (${st.broker || "hybrid"}). Continue?`
+  );
+  if (!ok) return;
   btn.disabled = true;
   const label = btn.innerHTML;                       // keep the icon — restore with innerHTML
-  btn.innerHTML = dryRun ? "Running…" : "Placing orders…";
+  btn.innerHTML = "Sending orders…";
   try {
     await api("/api/bot/run", {
       method: "POST",
-      body: JSON.stringify({ dry_run: !!dryRun }),
+      body: JSON.stringify({ dry_run: false }),
       timeout: 180000,
     });
     await Promise.all([loadBotStatus(), loadOrders()]);
@@ -3234,7 +3227,7 @@ function renderTestTrades(d) {
   if (stats) stats.textContent = `${s.total || 0} trades | PnL: ${fmt(s.total_pnl, 2)}`;
   const trades = d.trades || [];
   if (!trades.length) {
-    body.innerHTML = '<tr><td colspan="14" class="muted">No test trades yet. Start the bot in test mode (AI_MODE=test).</td></tr>';
+    body.innerHTML = '<tr><td colspan="14" class="muted">No shadow-book rows yet. (These are ANALYSIS-ONLY rows: they simulate how the AI&#39;s calls would have done — the real orders are in the Orders journal.)</td></tr>';
     return;
   }
   body.innerHTML = trades.slice(0, 50).map((t) => {

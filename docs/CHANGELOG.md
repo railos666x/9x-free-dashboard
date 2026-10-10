@@ -2427,3 +2427,57 @@ cards are), not the Dashboard. The Signals view is now stacked:
 - Backfilled the open BTC position: entry 62,981.83, SL 62,666.92, TP
   63,611.65. Orders chart (and journal) now show all three levels.
 - Server restarted on :8501.
+
+## 2026-10-10 (08:15 UTC) — Paper is gone: every order lands on an account; single Run button; new-user clarity pass
+
+User: "remove paper thing completely we will trade using accs" and
+"make sure dashboards dont place trades just to show on dashboard — every
+trade should be placed on an acc not just marking". Also reported the
+"Dry test / Live test / LIVE (PAPER)" cluster as confusing.
+
+### What changed ([backend/bot.py](backend/bot.py), [backend/execution.py](backend/execution.py))
+- The `AI_MODE=test` branch is DELETED. `bot.run_once` sends every AI
+  proposal through `execution.execute_intent` — the same path as `live` —
+  so a journal row can only exist because an order was actually SENT to
+  MT5 / Binance / Alpaca. The `test_trades` paper book no longer receives
+  trades from the loop (it remains as the gov-shadow evaluation book only,
+  and is labelled analysis-only in the UI).
+- `get_broker()` no longer accepts `EXECUTION_BROKER=paper`: unknown/absent
+  broker = loud BrokerError, never a silent simulated book. The PaperBroker
+  class survives ONLY as a white-box test double constructed directly in
+  tests (see below) — config can never route production orders to it.
+- `dry_run=True` remains as a sizing PREVIEW (returns levels + fees,
+  never journals a trade row, never touches a broker) — it is now labelled
+  "Check sizing only (no order)" in the panel.
+
+### Dashboard simplification ([web/dashboard/index.html](web/dashboard/index.html), [web/dashboard/dashboard.js](web/dashboard/dashboard.js))
+- "Dry test" button REMOVED; "Live test" became **Run cycle now** and its
+  confirm dialog says plainly that every signal the AI agrees to becomes a
+  real order on the configured account.
+- "LIVE (PAPER)" → **LIVE · REALORDERS** (auto-loop badge), the header strip
+  says `LIVE · demo accs` (accounts are demo until real credentials exist),
+  and the mode tooltip explains exactly where orders land. `broker` fallback
+  label is `hybrid`, not the fantasy default `paper`.
+- Manual panel: "Dry run (no broker order)" → **"Check sizing only (no order)"**
+  with matching result wording; the shadow-book card is titled
+  "AI Shadow Book — analysis-only, no orders sent".
+- Verified live: cycle ran clean (0 executed on a quiet tape, 160 held,
+  0 errors), positions empty, `?v=20261010a` bundle served.
+
+### Account reality (checked before promising "live")
+- MT5 terminal: login 472561011, server **Exness-MT5Trial16**, trade_mode=DEMO.
+- Binance exec keys validate ONLY on testnet.binance.vision (live 401).
+- Alpaca keys are prefix-PKEH compute-mode paper keys (live 401).
+- So "LIVE" here means real orders on real API endpoints of DEMO accounts —
+  swapping in real credentials needs no code change, just .env + MT5 login.
+
+### Tests
+- test_execution.py's white-box paper tests now construct PaperBroker
+  directly and route get_broker at it only while EXECUTION_BROKER=paper;
+  the Alpaca metadata-failure regression test restores the REAL get_broker
+  and asserts hold-all still works (it caught the first draft of this change
+  — the patch broke broker selection).
+- Full suite: **151 passed, 0 failed**; `node --check` clean.
+- Python runtime check after the system update: the project venv is
+  self-contained (own 3.12.10 interpreter, all imports OK) — unaffected
+  by the system Python 3.12.7 the server does not use.

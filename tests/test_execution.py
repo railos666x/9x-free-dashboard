@@ -54,6 +54,14 @@ def _intent(direction="LONG", entry=50290.0, stop=49800.0, tp=51200.0,
 
 def main():
     errors = []
+    # Paper is no longer config-selectable (get_broker refuses "paper" now);
+    # while EXECUTION_BROKER stays "paper" these white-box tests route
+    # get_broker at the direct PaperBroker construction. Any test that needs
+    # the REAL selection (e.g. the Alpaca-failure test below) restores the
+    # original first.
+    import execution as _ex
+    _orig_get_broker = _ex.get_broker
+    _ex.get_broker = lambda: _ex.PaperBroker()
 
     print("1. Testing paper broker fill math...")
     try:
@@ -61,8 +69,8 @@ def main():
         import risk
 
         conn = _fresh_db()
-        _config.EXECUTION_BROKER = "paper"
-        broker = execution.get_broker()
+        _config.EXECUTION_BROKER = "paper"   # class is white-box-only now
+        broker = execution.PaperBroker()     # direct construction — get_broker refuses paper
         assert broker.name == "paper"
 
         result = execution.execute_intent(conn, _intent())
@@ -258,6 +266,9 @@ def main():
         # Regression: when Alpaca's /v2/assets metadata call fails, the bot
         # must HOLD every symbol — NOT fall back to all 87 and fire orders
         # that 422 at the broker (the morning's 37 ERROR rows).
+        # Restore the real get_broker first: this test exercises the actual
+        # broker selection, not the white-box PaperBroker override.
+        execution.get_broker = _orig_get_broker
         _config.EXECUTION_BROKER = "alpaca"
         _config.ALPACA_API_KEY = "fake-key"
         _config.ALPACA_SECRET_KEY = "fake-secret"
@@ -273,12 +284,12 @@ def main():
             execution.requests.get = orig_get
         assert out == set(), f"must hold ALL symbols on failure, got {len(out)}"
 
-        # Paper broker is untouched: everything tradable, no network.
-        _config.EXECUTION_BROKER = "paper"
+        # Non-Alpaca brokers trade the whole universe without a metadata call.
+        _config.EXECUTION_BROKER = "mt5"
         execution._assets_cache = {"at": 0.0, "tradable": None}
         all_syms = execution.broker_supported_symbols()
-        assert all_syms == set(_config.TRADABLE_UNIVERSE), "paper broker trades everything"
-        print(f"   ✅ Alpaca failure → empty set ({len(out)} held); paper → all {len(all_syms)} symbols")
+        assert all_syms == set(_config.EXNESS_SYMBOLS), "mt5 → the mapped Exness universe"
+        print(f"   ✅ Alpaca failure → empty set ({len(out)} held); mt5 → all {len(all_syms)} symbols")
 
         # Success path: the crypto assets API + the US Bitcoin ETFs (they're
         # equity assets, invisible to the crypto asset_class query) are both

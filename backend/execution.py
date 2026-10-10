@@ -1690,9 +1690,10 @@ class HybridBroker(Broker):
 
 def get_broker() -> Broker:
     """The configured broker — the only gateway the executor talks to.
-    Every trade MUST land on a real broker we have access to (hybrid /
-    mt5 / binance / alpaca). An unknown EXECUTION_BROKER value now fails
-    loudly instead of silently falling back to the fake PaperBroker."""
+    Paper is NOT selectable here (owner, 2026-10-10: every trade must land
+    on a real account endpoint). The PaperBroker class survives ONLY for
+    white-box unit tests that instantiate it directly — config can never
+    route production orders through it."""
     mode = config.EXECUTION_BROKER
     if mode == "alpaca":
         return AlpacaBroker()
@@ -1702,13 +1703,10 @@ def get_broker() -> Broker:
         return MT5Broker()
     if mode == "hybrid":
         return HybridBroker()
-    if mode == "paper":
-        # Explicit only. Nothing may reach the simulated book by accident.
-        return PaperBroker()
     raise BrokerError(
         f"EXECUTION_BROKER={mode!r} is not a real broker. "
-        "Valid: hybrid, mt5, binance, alpaca (or explicit 'paper' for dry tests). "
-        "Set it in .env — refusing to fall back to a simulated broker.")
+        "Valid: hybrid, mt5, binance, alpaca. "
+        "Set it in .env — refusing to fall back to a simulated book.")
 
 
 # ----------------------------------------------------------------------
