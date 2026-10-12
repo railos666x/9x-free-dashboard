@@ -246,6 +246,13 @@ def fetch_headlines(conn, limit: int = 25) -> list[dict]:
             "published_at": str(it.get("published_at", "") or "")[:16],
             "age_hours": age,
             "title_with_age": str(it.get("title", "") or "") + age_tag,
+            # 2026-10-12: the corroboration gate (news_noise.corroboration_stats)
+            # reads r["score"] — without this the stored sentiment was invisible
+            # to the gate, EVERY single-outlet headline scored 0.00 and the
+            # "one clearly strong story" escape hatch could never fire. FX/oil
+            # signals (WTI +70 conf 0.7!) died here while crypto kept trading.
+            "sentiment_score": float(it.get("sentiment_score") or 0.0),
+            "score": float(it.get("sentiment_score") or 0.0),
         })
     return out
 
@@ -699,7 +706,14 @@ def signal_for(conn, symbol: str) -> dict:
         hints = _HINTS.get(symbol)
         if hints:
             try:
-                _hh = fetch_headlines(conn, limit=15)
+                # 2026-10-12: the 15-headline window made the multi-outlet
+                # gate nearly unpassable for macro assets — the top-15 was
+                # mostly crypto so an oil story saw 1 outlet and every
+                # WTI/BRENT/+70-conf signal died on "single-outlet noise".
+                # The gate needs the WHOLE fresh pool (the same 80-row
+                # window fetch_headlines reads for analysis) so two real
+                # outlets within NEWS_MAX_AGE_HOURS can corroborate.
+                _hh = fetch_headlines(conn, limit=80)
                 news_stats = news_noise.corroboration_stats(_hh, hints)
                 _ok, _why = news_noise.corroboration_ok(
                     news_stats, config.NEWS_MIN_DISTINCT_OUTLETS,

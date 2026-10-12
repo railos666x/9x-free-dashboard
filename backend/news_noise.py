@@ -94,7 +94,9 @@ def corroboration_stats(rows: list[dict], hints: list[str]) -> dict:
         stories += 1
         outlets.add(_norm_source(r.get("source", "")))
         try:
-            s = float(r.get("score") or 0.0)
+            # Accept either key: LLM rows carry "score", DB-derived rows
+            # (fetch_headlines) carry "sentiment_score" (2026-10-12).
+            s = float(r.get("score") or r.get("sentiment_score") or 0.0)
         except (TypeError, ValueError):
             s = 0.0
         signed += s
