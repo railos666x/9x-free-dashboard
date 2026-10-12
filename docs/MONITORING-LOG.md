@@ -1234,3 +1234,83 @@ useful hardening is a self-reconciliation pass over the headline figures.
 - [!] AI-only 7d win rate 33.3% < 50%
 - [!] cost drag: mt5 round-trip costs 8.08 = 197% of gross +4.10 this week
 - [!] FX 7d win rate 33% < 45%
+
+---
+
+## Digest 2026-10-12 10:36 UTC
+
+### AI-only closed-trade performance
+
+| Window | n | Win% | Net PnL | Expectancy |
+|---|---|---|---|---|
+| 7d | 4 | 25.0% | -107.86 | -26.97 |
+| 30d | 55 | 61.8% | +1083.98 | +19.71 |
+
+### Exit-reason economics (all-time AI-only)
+
+| Exit | n | Wins | PnL |
+|---|---|---|---|
+| time_decay_exit | 47 | 33 | +1368.22 |
+| tp | 5 | 5 | +781.99 |
+| manual_cleanup | 2 | 2 | +10.94 |
+| broker_closed | 18 | 8 | -42.27 |
+| sl | 12 | 2 | -295.97 |
+
+### Open basket — floating P/L
+
+- MT5 (0 legs): total +0.00
+- Binance journal legs: none open
+
+### Guards
+
+- loss_guard: blocked=False daily=0.0% drawdown=0.0%
+
+### Costs (30d journal fees, AI-only)
+
+- fees journaled: +3.17
+
+### Costs by venue (7d, closed round trips)
+
+| Venue | n | Fees | Slip* | Total cost | Gross PnL | Net PnL | Cost drag |
+|---|---|---|---|---|---|---|---|
+| binance | 6 | 3.17 | 1.54 | 4.71 | -109.82 | -114.53 | n/a |
+| mt5 | 3 | 0.00 | 8.08 | 8.08 | +4.10 | -3.97 | 196.8% |
+
+\* slip = journaled slippage_cost — measured |fill − ref| where a pre-order reference exists, else venue bps × notional. MT5 fees are usually 0 (cost inside the spread).
+
+### Run window (journal id > 400)
+
+- journal rows: 22 (cancelled: 1, closed: 11, dry_run: 6, error: 4)
+- window closed: n=11 wr=54.5% net=-73.27 PF=+0.74
+
+### Win-rate trajectory (all journal closes)
+
+| Window | n | Win% | Net PnL | Avg win | Avg loss | PF |
+|---|---|---|---|---|---|---|
+| all-time | 95 | 54.7% | +847.45 | +50.84 | -41.77 | +1.47 |
+| last-50 | 50 | 64.0% | +1086.54 | +53.37 | -34.52 | +2.75 |
+| last-20 | 20 | 65.0% | -3.36 | +24.33 | -45.66 | +0.99 |
+| last-10 | 10 | 60.0% | -60.51 | +35.42 | -68.26 | +0.78 |
+
+- rolling-10 buckets: 10 50 60 50 50 60 70 70 80 — first-half 42.5% → last-half 66.0% (improving)
+- path to 70%: last-20 wr=65% — need 1 more win(s) inside a rolling 20
+
+### Per-symbol (7d, min 2 closed)
+
+| Symbol | n | Win% | Net PnL |
+|---|---|---|---|
+| BTC/USDT | 4 | 75% | +12.63 |
+| EUR/USD | 3 | 33% | -3.97 |
+| ETH/USDT | 2 | 50% | -127.16 |
+
+### FX (forex sleeve)
+
+- session: London (liquidity 90%), next: overlap in 3h
+- open FX exposure: none
+- FX closed (7d): n=3 wins=1 net=-3.97
+
+### Anomalies
+
+- [!] AI-only 7d win rate 25.0% < 50%
+- [!] cost drag: mt5 round-trip costs 8.08 = 197% of gross +4.10 this week
+- [!] FX 7d win rate 33% < 45%
